@@ -14,7 +14,8 @@ Plugin id: `c51.meetings` (ids starting with `omarchy.` are rejected by the host
 | `manifest.json` | — | schemaVersion 1, kinds `["service","overlay","bar-widget"]` |
 | `Service.qml` | `service` | the brain: fetch loop, 1 Hz wall-clock tick, firing, inhibitor, IPC |
 | `Alert.qml` | `overlay` | the fullscreen alert surface |
-| `Widget.qml` | `bar-widget` | next-meeting text in the bar |
+| `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
+| `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
 | `bin/meetings-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
 | `config.example.json` | — | copied to `~/.config/omarchy/meetings.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
@@ -25,7 +26,7 @@ No symlinks anywhere in the plugin dir (the validator refuses them).
 
 ## Invariants (one rule, every file)
 
-Four questions every file has to answer the same way. They are written out once, here, because a
+Five questions every file has to answer the same way. They are written out once, here, because a
 consumer that answers one of them on its own silently disagrees with the other two.
 
 1. **Next event** = the first event in `start` order with `max(end, start) > now` — *not over yet*,
@@ -42,6 +43,19 @@ consumer that answers one of them on its own silently disagrees with the other t
 4. **All-day events never take the alert path.** An all-day entry has no meaningful start moment,
    so the service skips it when firing regardless of `skip_all_day`; that option only decides
    whether all-day entries reach the cache and the widget at all.
+5. **The cache is the agenda, not a list of alert candidates.** Since schema 2 it holds the whole
+   two-day agenda — events that are already over, and declined ones (flagged, not dropped) — because
+   the popup shows them. The invariant the fetcher used to enforce for everyone therefore moved into
+   `Service.qml` as exactly one predicate, `isAlertable(entry, atSec)`: not all-day, not already
+   ended, inside the grace window, and not declined while `skip_declined` is on. `skip_declined`
+   keeps its meaning that way — on (the default) a declined meeting never blanks the screen but is
+   still listed, struck through, in the agenda; off, a declined meeting is treated like any other. Every alert-side path goes through it — `dueEvent`,
+   `requeueUnshown`, `updateInhibit`, `nextAlertableEvent`, and `dropCancelledAlerts` (where
+   "present in the cache" becomes "present **and** still alertable", so declining a meeting still
+   withdraws its queued alert). Nothing else may iterate the event list to decide whether to alert.
+   `meetings status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
+   a wrong decision is diagnosable instead of invisible. `declined` is eds-only: the `ics` and
+   `demo` backends always write `false`, which is correct rather than a bug.
 
 ## Config — `~/.config/omarchy/meetings.json`
 
@@ -94,6 +108,13 @@ Semantics:
   dismiss (see the overlay contract).
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
 - `fetch_interval_seconds` — how often the QML service runs the fetcher (local read).
+- `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it. The
+  fetcher's window is `[local midnight today, local midnight the day after tomorrow)`, widened to
+  cover `now - grace_seconds … now + lookahead_minutes` so the alert horizon can only grow. Compute
+  the day boundaries with `datetime.date` arithmetic plus naive `.timestamp()`, **never**
+  `midnight + N * 86400`: Europe/Berlin has a 25 h and a 23 h day each year, and the naive form was
+  measured to move the agenda end by ±1 h — losing tomorrow's late meetings, or leaking a
+  day-after-tomorrow meeting into the "Morgen" section.
 
 ## Event cache — `$XDG_RUNTIME_DIR/omarchy-meetings/events.json`
 
@@ -102,7 +123,7 @@ dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
 
 ```json
 {
-  "schema": 1,
+  "schema": 2,
   "backend": "eds",
   "status": "ok",
   "error": "",
@@ -111,7 +132,7 @@ dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
   "refreshed_at": 1757499900,
   "events": [
     { "id": "9f2c…", "title": "Standup", "start": 1757503200, "end": 1757505000,
-      "all_day": false, "url": "https://meet.google.com/abc-defg-hij",
+      "all_day": false, "declined": false, "url": "https://meet.google.com/abc-defg-hij",
       "calendar": "Work", "location": "" }
   ]
 }
@@ -217,7 +238,7 @@ Payload:
 ```json
 { "title": "…", "start": 1757503200, "end": 1757505000, "url": "…", "calendar": "…",
   "location": "…", "auto_dismiss": 90,
-  "colors": { "running": "#FF9500", "upcoming": "#00BEFF" }, "test": false }
+  "colors": { "running": "#FF9500", "upcoming": "#00BEFF" }, "queued": 0, "test": false }
 ```
 
 Requirements:
@@ -258,10 +279,18 @@ Requirements:
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
   at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
   collapses to zero width when there is nothing (if `hide_when_empty`).
-- Left click → join the meeting URL when there is one. Every other click (left without a URL,
-  right, middle) → refresh. **No click opens the fullscreen alert**: it exists to interrupt someone
-  who is not looking at the bar, so whoever just clicked it has already seen the meeting. `preview`
-  remains an IPC diagnostic only.
+- Left click → toggle the agenda popup. Right and middle click → refresh. **No click opens the
+  fullscreen alert**: it exists to interrupt someone who is not looking at the bar, so whoever just
+  clicked it has already seen the meeting. `preview` remains an IPC diagnostic only. Joining moved
+  into the popup (a row click, and a footer action).
+- The widget hosts the popup and must satisfy the bar's panel contract, or the bar can neither route
+  hotkeys to it nor light the open-panel indicator: expose `opened`, `open()`, `close()`,
+  `toggle()`, `closeForPopoutSwitch()`, `popoutSwitchClosing` and `openPanelIndicatorWidth`, and make
+  the `KeyboardPanel`'s `owner` the `BarWidget` root — not the popup object.
+- The widget keeps reading the cache and the config; the popup renders what it is handed. `events`
+  is the full agenda, while the bar label, its colour, the tooltip and "next meeting" all come from
+  an alertable-filtered view of it (no declined, no all-day, not over), so their meaning is
+  unchanged. The parser's event cap rises to 256 — a two-day agenda no longer fits in 64.
 - Shows a clear degraded state when the cache is missing or `status != "ok"` (e.g. a dim `󰃭 —`),
   never an empty crash, never a QML binding loop.
 - A non-empty cache `warning` (or an `error` on an otherwise `"ok"` cache) adds a calm `󰀦` marker
@@ -271,6 +300,49 @@ Requirements:
   `end` to `start`, and picks the next event with `max(end, start) > now`.
 - Host injects `bar`, `moduleName`, `settings` into bar widgets; read the reference widgets under
   `/usr/share/omarchy/shell/plugins/bar/` for the exact contract and styling conventions.
+
+## Popup contract — `Popup.qml`
+
+Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `anchorItem`,
+`hostWidget` and the data. The popup renders; the host acts. It calls back only through the host
+(`hostWidget.join(url)`, `hostWidget.requestRefresh()`, `hostWidget.openUrl(url)`,
+`hostWidget.close()`), so exactly one file talks to the outside world.
+
+- The surface is `Ui.KeyboardPanel` (from `qs.Ui`) anchored to the widget's `WidgetButton`. It owns
+  the card, border, padding, fade, outside-click and per-output dismissal and the focus prime —
+  write none of that. Do **not** add a `panel` kind to the manifest: `shell.qml` collapses a
+  plugin's kinds to one loader, `panel` beats `overlay`, and the fullscreen alert would never load
+  again.
+- Body: `PanelKeyCatcher` → `Flickable` (clip, `StopAtBounds`, `interactive: contentHeight > height`)
+  → `Column { spacing: Style.space(14) }` of: `PanelHero` (next meeting, countdown, refresh action),
+  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT.` section, the same for `MORGEN`,
+  the degraded/empty message, `PanelSeparator`, the footer action rows.
+- Rows are `CursorSurface`, and the panel owns the cursor state (`cursorActive`, `focusSection`,
+  `selectedIndex`); a row must never colour itself from `containsMouse`, or mouse and keyboard show
+  two highlights at once. Row states: finished → 45 % opacity, running → `current` + bold + the
+  running colour, declined → `font.strikeout` (lowercase "o"; it leaves `implicitWidth` untouched).
+- The timeline strip carries **no hour numbers**, and that is a deliberate scar rather than an
+  omission: any `Text` in that axis row — even a constant string with no geometry of its own — put
+  the shell into a polish loop, one core pinned and gigabytes of growth for as long as the popup was
+  open, with no binding-loop warning from Qt. Bisected on this machine: the notches in the lane row
+  are fine, a `Rectangle` in the axis row is fine, a `Text` there is not, and neither an integer
+  `Repeater` model, nor removing the self-referential `x` binding, nor replacing every sibling
+  anchor with explicit geometry changed it. Root cause not established. The notches carry the hour
+  grid and every row shows its own times, so the axis was dropped instead of shipped as a
+  desktop-freezing decoration. Do not re-add it without reproducing the measurement.
+- The timeline strip is otherwise the one element with no first-party equivalent; build it from
+  in-tree idioms:
+  the clock's track/fill with the `Style.cornerRadius > 0 ? height / 2 : 0` guard (this theme is
+  square), `PanelSlider`'s fraction-positioned ticks, greedy lane packing capped at 3 lanes, and a
+  now-marker in `Style.selectedStateColor(fg, Color.accent)` — theme chrome, so the plugin's two
+  colours keep meaning "meeting state".
+- Every `Text` sets `textFormat: Text.PlainText`: meeting titles are untrusted third-party input.
+  Nerd-font glyphs sit in a fixed-width centred `Item` (single-cell advance, up to 15 px of paint).
+- German strings need an explicit locale — the system locale is en_US:
+  `d.toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")` → `Do., 10. Sept.`.
+- Sizes come from `Style.space()` / `Style.font.*` only, never a bare pixel number. Width
+  `fittedContentWidth(Style.space(380))` like every anchored first-party panel, height
+  `fittedContentHeight(column.implicitHeight, Style.space(560))`.
 
 ## Service contract — `Service.qml`
 
@@ -442,10 +514,15 @@ Verified API recipe — follow it exactly:
   path that actually carries the Meet link here. The DESCRIPTION regex stays as the fallback for
   accounts or events that lack it, and `--diagnose` reports which path matched (path name only,
   never the URL).
-- `skip_declined`: drop events where the account's own `ATTENDEE` `PARTSTAT` is `DECLINED`.
+- Declined invitations are **flagged, not dropped**: the account's own `ATTENDEE` `PARTSTAT` becomes
+  `declined: true` on the event, so the agenda can strike it through. Whether it may alert is the
+  alert side's decision (`skip_declined`, see invariant 5). Only the exact string `DECLINED` sets
+  the flag — an empty `PARTSTAT` means "not an attendee" or "no answer recorded", never "declined".
   Verified against real data on 2026-09-10: the account identity resolves from
-  `Collection.get_identity()`, and a declined invitation was correctly absent from the cache while
-  the three accepted events in the same window were present.
+  `Collection.get_identity()` (1 identity, 1 Google collection root, 2 enabled calendars), and the
+  `PARTSTAT` read is correct — over a 65 h window it returned ACCEPTED 7, DECLINED 1, and empty for
+  2 occurrences where the user is not in the attendee list at all. Under schema 1 that one declined
+  occurrence was dropped from the cache; since schema 2 it is present with `declined: true`.
 
 ### backend `ics`
 

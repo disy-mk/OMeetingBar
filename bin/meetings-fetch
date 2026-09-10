@@ -24,10 +24,11 @@ never fire. Every later run merges the marker back in until it ages out.
 Always run with /usr/bin/python3, never a bare `python3`: mise/pyenv shims do not
 carry the `gi` bindings the eds backend needs.
 
-Privacy: the cache carries id/title/start/end/all_day/url/calendar/location and
-nothing else -- no attendees, no description, no organizer. Nothing but counts
-and error text reaches stdout or the journal, and ICS feed URLs are treated as
-secrets (they are bearer tokens: never logged, never quoted in an error).
+Privacy: the cache carries id/title/start/end/all_day/declined/url/calendar/
+location and nothing else -- no attendees, no description, no organizer. Nothing
+but counts and error text reaches stdout or the journal, and ICS feed URLs are
+treated as secrets (they are bearer tokens: never logged, never quoted in an
+error).
 """
 import argparse
 import configparser
@@ -43,7 +44,11 @@ import time
 import urllib.error
 import urllib.request
 
-SCHEMA_VERSION = 1
+# 2: the cache is the whole two-day agenda, not a list of alert candidates --
+# finished occurrences stay in it and a declined one is flagged instead of
+# dropped (invariant 5). No consumer validates the number, so it is free
+# documentation of which shape a cache file has.
+SCHEMA_VERSION = 2
 BACKENDS = ("eds", "ics", "demo")
 
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/meetings.json")
@@ -244,10 +249,16 @@ def event_id(uid, start_epoch):
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
-def make_event(uid, title, start, end, all_day, url, calendar, location, join_path):
+def make_event(uid, title, start, end, all_day, url, calendar, location, join_path,
+               declined=False):
     """One cache entry. `_join_path` records which URL rule matched; every
     underscore key is stripped again before the cache is written -- it exists
-    only so --diagnose can name the path without printing the URL."""
+    only so --diagnose can name the path without printing the URL.
+
+    `declined` defaults to False because only the eds backend can know it: it
+    needs the account's own ATTENDEE line, which neither the ics feed nor the
+    demo schedule has, so those two always write False (that is correct, not a
+    missing feature)."""
     start = int(start)
     end = int(end) if end is not None else start
     if end < start:
@@ -258,6 +269,7 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
         "start": start,
         "end": end,
         "all_day": bool(all_day),
+        "declined": bool(declined),
         "url": url or "",
         "calendar": _short(calendar or "", 120),
         "location": _short(location or "", 200),
@@ -299,12 +311,23 @@ def pick_join_url(conference, x_google_conference, location, description):
 
 
 def apply_filters(events, config, now, window_end):
-    """Drop what the user does not want to be alerted about, de-duplicate by id
-    (the same meeting can sit in two subscribed calendars) and sort by start."""
+    """Drop what the user never wants to SEE, de-duplicate by id (the same
+    meeting can sit in two subscribed calendars) and sort by start.
+
+    Only the four "I never want this in my agenda" options filter here --
+    skip_all_day, calendars_exclude, title_blocklist, min_duration_minutes --
+    because since schema 2 the cache is the agenda the popup renders, not a list
+    of alert candidates (invariant 5). An occurrence that is already over stays
+    in it (the popup lists it, dimmed), and a declined one is flagged by
+    make_event instead of dropped. Whether an event may blank the screen is
+    Service.qml's single isAlertable() decision, nothing else's.
+
+    `now` is therefore no longer read; it stays in the signature because the
+    diagnose path and merge_inject call this with the same four arguments.
+    """
     blocked = [term.lower() for term in config["title_blocklist"] if term.strip()]
     excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
     min_seconds = config["min_duration_minutes"] * 60
-    grace = max(config["grace_seconds"], 0)
 
     kept = []
     seen = set()
@@ -317,12 +340,10 @@ def apply_filters(events, config, now, window_end):
             continue
         if min_seconds and (event["end"] - event["start"]) < min_seconds:
             continue
-        if event["start"] > window_end:
-            continue
-        # Keep a meeting that is running right now, and one that started while we
-        # were suspended: Service.qml still alerts up to grace_seconds after the
-        # start, and it can only do that if the occurrence is in the cache.
-        if event["end"] <= now and (now - event["start"]) > grace:
+        # window_end is EXCLUSIVE: it is the local midnight that starts the day
+        # after tomorrow, so an event beginning exactly at 00:00 that day belongs
+        # to the next agenda, not to this one's "Morgen" section.
+        if event["start"] >= window_end:
             continue
         if event["id"] in seen:
             continue
@@ -364,6 +385,10 @@ def previous_events(cache):
             "start": start,
             "end": _int(item.get("end"), start),
             "all_day": bool(item.get("all_day")),
+            # Load-bearing: without this key a backend failure would rebuild a
+            # declined meeting as a normal one and blank the screen for a
+            # meeting the user has already said no to.
+            "declined": bool(item.get("declined")),
             "url": str(item.get("url") or ""),
             "calendar": str(item.get("calendar") or ""),
             "location": str(item.get("location") or ""),
@@ -827,18 +852,22 @@ def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, 
     get_dtstart() still reads the recurrence master's original date (a
     birthday's 1988, not this year's), which is why only the instance times the
     callback handed over are used."""
-    if identities and attendee_partstat(icomp, ical, identities) == "DECLINED":
-        return None
     start = ical_time_to_epoch(instance_start, ical)
     if start is None:
         return None
     texts = component_texts(icomp, ical)
     url, path = pick_join_url(texts["conference"], texts["x_google_conference"],
                               texts["location"], texts["description"])
+    # A decline is a FLAG, not a drop (invariant 5): the agenda strikes such a
+    # meeting through, and skip_declined only decides on the alert side whether
+    # it may blank the screen. Only the exact string DECLINED counts --
+    # attendee_partstat returns "" both for "the user is not in the attendee
+    # list" and for "no PARTSTAT recorded", and neither of those is a decline.
+    declined = bool(identities) and attendee_partstat(icomp, ical, identities) == "DECLINED"
     return make_event(texts["uid"], texts["title"], start,
                       ical_time_to_epoch(instance_end, ical),
                       bool(_call(instance_start, "is_date", False)),
-                      url, calendar_name, texts["location"], path)
+                      url, calendar_name, texts["location"], path, declined=declined)
 
 
 def generate_instances(client, ical, glib, window_start, window_end, calendar_name, identities):
@@ -962,7 +991,11 @@ def read_eds(config, now, window_start, window_end, cache, force_refresh):
                            "Kalender in GNOME Online Accounts einschalten: %s" % GOA_DIALOG)
 
     warnings = []
-    identities = account_identities(roots) if config["skip_declined"] else set()
+    # Resolved regardless of skip_declined: the identities feed the `declined`
+    # flag, which is calendar data the popup renders either way, and no longer a
+    # filter over the cache. The warning below stays tied to skip_declined,
+    # because that is the option a missing own address renders ineffective.
+    identities = account_identities(roots)
     if config["skip_declined"] and not identities:
         # Without an own address there is nothing to compare ATTENDEE against, so
         # the filter silently does nothing and declined meetings still raise a
@@ -1031,8 +1064,31 @@ def fetch(config, backend, args, now, window_start, window_end, cache):
 
 
 def window_for(config, now):
-    """The query window starts BEFORE now on purpose -- see apply_filters."""
-    return now - max(config["grace_seconds"], 0), now + config["lookahead_minutes"] * 60
+    """-> (start, end) for the agenda: [local midnight today, local midnight the
+    day after tomorrow), so the popup can show today from 00:00 and all of
+    tomorrow. The end is EXCLUSIVE (see apply_filters).
+
+    The boundaries are computed with datetime.date arithmetic plus a naive
+    .timestamp() (the _local_epoch idiom), never as `midnight + N * 86400`:
+    Europe/Berlin has a 25 h day (2026-10-25) and a 23 h day (2026-03-29), and
+    the arithmetic form was measured to put the end an hour off on both -- one
+    hour of tomorrow's late meetings lost in one direction, a day-after-tomorrow
+    meeting leaking into the "Morgen" section in the other.
+
+    lookahead_minutes and grace_seconds can only ever EXTEND this window, never
+    shorten it: the alert horizon must not shrink below the agenda just because
+    someone configured a small lookahead.
+    """
+    today = datetime.date.fromtimestamp(now)
+    start = _local_epoch(today, 0, 0)
+    end = _local_epoch(today + datetime.timedelta(days=2), 0, 0)
+    # max(0, ...) is not cosmetic: a grace_seconds larger than the current epoch
+    # drives the lower bound negative, and libecal then ABORTS the query on an
+    # assertion instead of raising — generate_instances gets 0 instances with an
+    # empty error string, so the run would write a cheerful `status: "ok"` with
+    # an empty agenda and no alerts at all.
+    return (max(0, min(start, now - max(config["grace_seconds"], 0))),
+            max(end, now + config["lookahead_minutes"] * 60))
 
 
 # --- diagnose ---------------------------------------------------------------

@@ -44,7 +44,7 @@ Item {
   // Only ever hand a real web URL to the browser launcher. Calendar bodies are
   // third-party data, so a file:// or javascript: "join link" is dropped
   // instead of launched.
-  readonly property string joinUrl: /^https?:\/\/\S+$/.test(root.url) ? root.url : ""
+    readonly property string joinUrl: /^https:\/\/[^\s]+$/i.test(root.url) ? root.url : ""
 
   // ---------------------------------------------------------- clock
   //

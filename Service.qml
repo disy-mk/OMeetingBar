@@ -63,6 +63,9 @@ Item {
     sound: "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
     notify: true,
     wake_display: true,
+    // On (the default) a declined meeting never blanks the screen; it stays in
+    // the agenda, struck through. Off, it is treated like any other meeting.
+    skip_declined: true,
     // The two states the whole plugin colour-codes: a meeting that has started
     // and one that has not. Both the bar entry and the fullscreen alert use
     // these, so the colour means the same thing wherever it shows up.
@@ -88,6 +91,7 @@ Item {
   readonly property string upcomingColor: colorConfig("upcoming", "#00BEFF")
   readonly property bool notifyEnabled: boolConfig("notify")
   readonly property bool wakeDisplayEnabled: boolConfig("wake_display")
+  readonly property bool skipDeclined: boolConfig("skip_declined")
 
   property var events: []
   property bool cacheLoaded: false
@@ -214,7 +218,12 @@ Item {
   // rather than reach QML as an invalid colour, which paints black.
   function colorConfig(key, fallback) {
     var group = configValue("colors")
-    var value = Util.isPlainObject(group) ? group[key] : undefined
+    // Inline rather than Util.isPlainObject(): this file imports no qs.Commons,
+    // so that call threw "ReferenceError: Util is not defined" on every config
+    // read and both colours stayed empty, which silently dropped a configured
+    // colours block from the alert payload. Same test as applyConfig() above.
+    var plain = group !== null && typeof group === "object" && !Array.isArray(group)
+    var value = plain ? group[key] : undefined
     if (value === undefined || value === null) return fallback
     var text = String(value).trim()
     return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
@@ -274,6 +283,10 @@ Item {
         // missing or broken end falls back to the start, never to start+30min.
         end: isFinite(end) && end > start ? end : start,
         allDay: entry.all_day === true,
+        // Flagged, not dropped, since schema 2: the popup lists a declined
+        // meeting struck through, and isAlertable() alone decides whether it
+        // may still reach the screen.
+        declined: entry.declined === true,
         url: url,
         calendar: String(entry.calendar === undefined || entry.calendar === null ? "" : entry.calendar),
         location: String(entry.location === undefined || entry.location === null ? "" : entry.location)
@@ -346,9 +359,10 @@ Item {
   }
 
   // A meeting the next fetch no longer knows (cancelled, or moved out of the
-  // window) must not still blank the screen. Only a healthy, fresh cache is
-  // allowed to say that: an error or stale cache is missing events for its own
-  // reasons and would withdraw alerts that are still due.
+  // window) — or one it now reports as declined — must not still blank the
+  // screen. Only a healthy, fresh cache is allowed to say that: an error or
+  // stale cache is missing events for its own reasons and would withdraw
+  // alerts that are still due.
   function dropCancelledAlerts() {
     if (root.cacheStatus !== "ok" || root.cacheStale) return
     if (root.alertQueue.length === 0) return
@@ -356,7 +370,12 @@ Item {
     for (var i = root.alertQueue.length - 1; i >= 0; i--) {
       var pending = root.alertQueue[i]
       if (pending.shownAt > 0) continue
-      if (eventIndexOf(pending.id) !== -1) continue
+      // "Still in the cache" stopped being enough at schema 2: a declined or
+      // finished meeting is retained for the agenda, so the presence test that
+      // makes declining a queued meeting withdraw its alert has to be "present
+      // AND still alertable" or it silently stops working.
+      var index = eventIndexOf(pending.id)
+      if (index !== -1 && isAlertable(root.events[index], atSec)) continue
       setAlertState(pending.id, { failed: atSec })
       dequeueAlert(i)
       saveState()
@@ -681,13 +700,45 @@ Item {
     return null
   }
 
-  // The next event the alert path would act on: same rule, minus all-day
-  // events, which never fire the fullscreen alert.
+  // The one gate on the alert side (invariant 5). Since schema 2 the cache is
+  // the whole agenda: it keeps meetings that are already over and meetings the
+  // user declined, because the popup lists them. Everything that can put the
+  // fullscreen alert on screen — or hold the idle inhibitor for one — asks this
+  // and decides nothing for itself. The forward bound deliberately stays with
+  // the callers: the alert leads by alert_lead_seconds and the inhibitor by
+  // inhibit_lead_seconds, so there is no single "how early" to put in here.
+  function isAlertable(entry, atSec) {
+    if (!entry || typeof entry !== "object") return false
+    // An all-day event has no meaningful start moment, so it never fires the
+    // blanking alert — whatever skip_all_day says, and even though the widget
+    // may still show it. Otherwise a whole-day entry blanks every monitor at
+    // one minute to midnight.
+    if (entry.allDay) return false
+    // Over is over (invariant 1). The agenda keeps finished meetings, and a
+    // short one that ended a minute ago is still inside its grace window, so
+    // without this it would blank every monitor after the fact.
+    // The length test matters: a zero-length occurrence (end == start, the
+    // invariant-2 fallback for a missing or broken `end`) would otherwise be
+    // unalertable from its own start second onward, silently reducing
+    // grace_seconds to 0 for that class — a suspend across the start moment
+    // would lose the alert entirely. For those, the grace check below bounds it.
+    if (entry.end > entry.start && entry.end <= atSec) return false
+    // Missed by more than the grace window — suspended or locked for too long
+    // — is too late to be worth a screen.
+    if (atSec - entry.start > root.graceSeconds) return false
+    // "No" means no: a declined meeting stays in the agenda, struck through,
+    // but never interrupts while skip_declined is on.
+    if (entry.declined === true && root.skipDeclined) return false
+    return true
+  }
+
+  // The next event the alert path would act on. Not a filter on nextEvent():
+  // the agenda also holds finished and declined meetings, and neither can ever
+  // reach the screen, so `armed` and `meetings preview` ask isAlertable()
+  // instead of re-deriving half of the rule here.
   function nextAlertableEvent(atSec) {
     for (var i = 0; i < root.events.length; i++) {
-      var entry = root.events[i]
-      if (entry.allDay) continue
-      if (entry.end > atSec) return entry
+      if (isAlertable(root.events[i], atSec)) return root.events[i]
     }
     return null
   }
@@ -695,15 +746,13 @@ Item {
   function dueEvent(atSec) {
     for (var i = 0; i < root.events.length; i++) {
       var entry = root.events[i]
-      // An all-day event has no meaningful start moment, so it never fires the
-      // blanking alert — whatever skip_all_day says, and even though the widget
-      // may still show it. Otherwise a whole-day entry blanks every monitor at
-      // one minute to midnight.
-      if (entry.allDay) continue
       // Ascending by start, so once one is beyond the lead nothing after it can
-      // be due either.
+      // be due either. Sound even though isAlertable() may reject entries
+      // before this one: rejecting them never moves a later start earlier.
       if (entry.start - atSec > root.alertLeadSeconds) return null
-      if (atSec - entry.start > root.graceSeconds) continue
+      // Every other reason not to fire is in the one predicate: all-day,
+      // already over, past the grace window, declined.
+      if (!isAlertable(entry, atSec)) continue
       if (isNotified(entry.id)) continue
       return entry
     }
@@ -767,6 +816,10 @@ Item {
       location: entry.location,
       auto_dismiss: root.autoDismissSeconds,
       colors: ({ running: root.runningColor, upcoming: root.upcomingColor }),
+      // Alert.qml renders a "one more alert waits behind this" hint from this;
+      // without it that line was unreachable in exactly the two-meetings-while-
+      // locked case the queue exists for.
+      queued: Math.max(0, root.alertQueue.length - 1),
       test: isTest === true
     }
     // True means the host accepted the summon, not that anything is on screen.
@@ -826,9 +879,10 @@ Item {
   function requeueUnshown(atSec) {
     for (var i = 0; i < root.events.length; i++) {
       var entry = root.events[i]
-      if (entry.allDay) continue
       if (entry.start - atSec > root.alertLeadSeconds) break
-      if (atSec - entry.start > root.graceSeconds) continue
+      // Re-arming is an alert too: a meeting that ended, or that was declined
+      // while it sat unshown, must not come back to the screen.
+      if (!isAlertable(entry, atSec)) continue
       if (!isNotified(entry.id) || isShown(entry.id) || isFailed(entry.id)) continue
       if (queueIndexOf(entry.id) !== -1) continue
       if (!enqueueAlert(entry, atSec)) continue
@@ -931,11 +985,12 @@ Item {
     var wanted = false
     for (var i = 0; i < root.events.length; i++) {
       var entry = root.events[i]
-      // Same rule as the alert: an all-day event never arms the inhibitor,
-      // which would otherwise hold the session awake from 23:55 every day.
-      if (entry.allDay) continue
       if (entry.start - atSec > root.inhibitLeadSeconds) break
-      if (atSec - entry.start > root.graceSeconds) continue
+      // Exactly the alert's rule, or the inhibitor promises a screen the alert
+      // will never draw: no all-day entry holds the session awake from 23:55
+      // every day, and nothing keeps the machine up for a meeting that is over
+      // or that the user said no to.
+      if (!isAlertable(entry, atSec)) continue
       wanted = true
       break
     }
@@ -1019,6 +1074,10 @@ Item {
       inSeconds: entry.start - atSec,
       endsInSeconds: entry.end - atSec,
       allDay: entry.allDay,
+      // The two facts the agenda added to the cache, so "why did it alert" and
+      // "why did it not" are answerable from `meetings status` alone.
+      declined: entry.declined === true,
+      ended: entry.end <= atSec,
       hasUrl: entry.url !== "",
       calendar: entry.calendar,
       notified: state !== null && state.notified > 0,
@@ -1069,6 +1128,10 @@ Item {
     var atSec = Math.floor(Date.now() / 1000)
     var upcoming = nextEvent(atSec)
     var alertable = nextAlertableEvent(atSec)
+    var alertableCount = 0
+    for (var i = 0; i < root.events.length; i++) {
+      if (isAlertable(root.events[i], atSec)) alertableCount += 1
+    }
     var head = root.alertQueue.length > 0 ? root.alertQueue[0] : null
     return JSON.stringify({
       pluginId: root.pluginId(),
@@ -1082,9 +1145,15 @@ Item {
       cacheStale: root.cacheStale,
       cacheAgeSeconds: root.cacheGeneratedAt > 0 ? atSec - root.cacheGeneratedAt : -1,
       refreshedAgeSeconds: root.cacheRefreshedAt > 0 ? atSec - root.cacheRefreshedAt : -1,
-      eventCount: root.events.length,
-      // `next` is the widget's definition (end > now); `nextAlertable` is the
-      // same minus all-day, i.e. what the alert path would actually fire on.
+      // agendaCount is the whole cache — the agenda the popup draws, finished
+      // and declined meetings included. eventCount keeps the meaning it had
+      // while the cache was alert candidates only: how many of them the alert
+      // path can still act on. The pair is what makes the guard visible.
+      agendaCount: root.events.length,
+      eventCount: alertableCount,
+      // `next` is the shared definition (end > now, invariant 1);
+      // `nextAlertable` is the alert view, i.e. what the alert path would
+      // actually fire on.
       next: upcoming === null ? null : eventJson(upcoming, atSec),
       nextAlertable: alertable === null ? null : eventJson(alertable, atSec),
       armed: root.armed,
