@@ -258,7 +258,10 @@ Requirements:
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
   at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
   collapses to zero width when there is nothing (if `hide_when_empty`).
-- Click → join the meeting URL when there is one, otherwise `preview` the alert.
+- Left click → join the meeting URL when there is one. Every other click (left without a URL,
+  right, middle) → refresh. **No click opens the fullscreen alert**: it exists to interrupt someone
+  who is not looking at the bar, so whoever just clicked it has already seen the meeting. `preview`
+  remains an IPC diagnostic only.
 - Shows a clear degraded state when the cache is missing or `status != "ok"` (e.g. a dim `󰃭 —`),
   never an empty crash, never a QML binding loop.
 - A non-empty cache `warning` (or an `error` on an otherwise `"ok"` cache) adds a calm `󰀦` marker

@@ -2,7 +2,9 @@
 
 Ein MeetingBar-Ersatz für Omarchy. Zwei Dinge:
 
-- ein **Bar-Widget**, das den nächsten Google-Kalender-Termin zeigt (`󰃭 14:00 Standup · 12m`),
+- ein **Bar-Widget**, das den nächsten Google-Kalender-Termin zeigt (`󰃭 14:00 Standup · 12m`) —
+  Linksklick öffnet den Meeting-Link, jeder andere Klick holt die Termine neu; **kein** Klick löst
+  den Vollbild-Alarm aus (mehr dazu im Mouseover-Tooltip),
 - ein **Vollbild-Alarm**, der kurz vor dem Start den Bildschirm zumacht.
 
 Der Vollbild-Alarm ist der eigentliche Zweck. Gewöhnliche Benachrichtigungen werden
@@ -157,7 +159,7 @@ sondern zu den eingebauten Standards (und einer Zeile im Journal).
 | `min_duration_minutes` | `0` | Termine kürzer als das ignorieren. `0` = keine Untergrenze. |
 | `title_blocklist` | `[]` | Titel-Fragmente, die einen Termin ausschließen. |
 | `calendars_exclude` | `[]` | Kalendernamen, die nicht berücksichtigt werden. |
-| `widget.warn_minutes` | `15` | Ab so vielen Minuten vor Start färbt sich der Bar-Eintrag in die Warnfarbe des Themes. |
+| `widget.warn_minutes` | `15` | Ab so vielen Minuten vor Start leuchtet der Bar-Eintrag in voller Stärke; davor mit 75 % Alpha. Die *Farbe* selbst sagt nur, ob das Meeting läuft (`colors.running`) oder ansteht (`colors.upcoming`). |
 | `widget.max_title_chars` | `28` | Titel in der Bar kürzen. |
 | `widget.hide_when_empty` | `true` | Ohne anstehenden Termin auf Breite 0 zusammenfallen. |
 

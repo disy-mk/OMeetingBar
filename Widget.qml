@@ -11,16 +11,12 @@ import qs.Ui
 // Service.qml, so the bar keeps painting while the service is reloading and
 // says so honestly when there is nothing to read.
 //
-// Left click joins the meeting when the cache carries a URL and otherwise
-// previews the fullscreen alert, right click always previews it, middle click
-// asks for a fresh fetch.
+// Left click joins the meeting when the cache carries a URL; every other click
+// asks for a fresh fetch. Nothing here opens the fullscreen alert — that alert
+// is for someone who is not looking at the bar.
 BarWidget {
   id: root
   moduleName: "c51.meetings"
-
-  // The host injects moduleName; the literal is the fallback for the bare
-  // instantiation the bar-widget contract allows.
-  readonly property string pluginId: moduleName || "c51.meetings"
 
   // ---- Paths. The cache is on tmpfs on purpose, so it is legitimately
   //      absent after a reboot until the first fetch lands.
@@ -42,11 +38,6 @@ BarWidget {
   readonly property int warnMinutes: numberOption("warn_minutes", fileWidget.warn_minutes, 15, 0, 1440)
   readonly property int maxTitleChars: numberOption("max_title_chars", fileWidget.max_title_chars, 28, 4, 200)
   readonly property bool hideWhenEmpty: boolOption("hide_when_empty", fileWidget.hide_when_empty, true)
-  readonly property int autoDismissSeconds: {
-    var n = Number(fileConfig.auto_dismiss_seconds)
-    return isFinite(n) && n >= 0 ? Math.round(n) : 90
-  }
-
   // ---- Cache state. "unknown" until the first read resolves, so a present
   //      cache never flashes the placeholder on startup.
   property string cacheState: "unknown"
@@ -151,8 +142,8 @@ BarWidget {
     }
 
     lines.push(nextEvent.url !== ""
-      ? "Links: Meeting öffnen · Rechts: Vorschau · Mitte: aktualisieren"
-      : "Links: Alarm-Vorschau · Mitte: aktualisieren")
+      ? "Links: Meeting öffnen · Rechts/Mitte: aktualisieren"
+      : "Klick: aktualisieren")
     return lines.join("\n")
   }
 
@@ -344,30 +335,6 @@ BarWidget {
     Quickshell.execDetached(["omarchy-shell", "meetings", "refresh"])
   }
 
-  // The plugin declares the overlay kind, so shell.summon routes the payload
-  // to Alert.qml instead of back into this widget, and nothing is marked as
-  // fired — which is exactly what a preview is. The IPC call is the fallback
-  // for a widget instantiated without the bar facade.
-  function previewAlert() {
-    if (!hasEvent) {
-      requestRefresh()
-      return
-    }
-    var payload = {
-      title: nextEvent.title,
-      start: nextEvent.start,
-      end: nextEvent.end,
-      url: nextEvent.url,
-      calendar: nextEvent.calendar,
-      location: nextEvent.location,
-      auto_dismiss: autoDismissSeconds,
-      test: false
-    }
-    if (bar && bar.shell && typeof bar.shell.summon === "function"
-      && bar.shell.summon(pluginId, JSON.stringify(payload))) return
-    Quickshell.execDetached(["omarchy-shell", "meetings", "preview"])
-  }
-
   SystemClock {
     id: wallClock
     precision: SystemClock.Seconds
@@ -435,11 +402,12 @@ BarWidget {
     horizontalMargin: 8.75
     verticalPadding: 8.75
 
+    // No click opens the fullscreen alert. Triggering it by hand is pointless:
+    // the alert exists to interrupt someone who is NOT looking at the bar, and
+    // whoever just clicked the bar has already seen the meeting. `preview`
+    // stays available over IPC as a diagnostic.
     onPressed: function(b) {
-      if (b === Qt.MiddleButton) root.requestRefresh()
-      else if (b === Qt.RightButton) root.previewAlert()
-      else if (root.hasEvent && root.nextEvent.url !== "") root.join(root.nextEvent.url)
-      else if (root.hasEvent) root.previewAlert()
+      if (b === Qt.LeftButton && root.hasEvent && root.nextEvent.url !== "") root.join(root.nextEvent.url)
       else root.requestRefresh()
     }
   }
