@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "id": "c51.meetings",
+  "name": "Meetings",
+  "version": "0.1.0",
+  "author": "c51",
+  "description": "MeetingBar-Ersatz für Omarchy: das nächste Google-Kalender-Meeting in der Bar und ein Vollbild-Alarm kurz vor dem Start.",
+  "kinds": [
+    "service",
+    "overlay",
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "service": "Service.qml",
+    "overlay": "Alert.qml",
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "Meetings",
+    "description": "Nächster Termin in der Bar. Klick öffnet den Meeting-Link, sonst eine Vorschau des Alarms.",
+    "category": "Time",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "warn_minutes": 15,
+      "max_title_chars": 28,
+      "hide_when_empty": true
+    },
+    "schema": [
+      {
+        "key": "warn_minutes",
+        "type": "integer",
+        "label": "Warnfarbe ab (Minuten)",
+        "description": "So lange vor dem Start wechselt der Bar-Eintrag auf die Warnfarbe des Themes.",
+        "min": 0,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 15
+      },
+      {
+        "key": "max_title_chars",
+        "type": "integer",
+        "label": "Maximale Titellänge (Zeichen)",
+        "description": "Längere Meeting-Titel werden in der Bar gekürzt.",
+        "min": 8,
+        "max": 120,
+        "step": 1,
+        "defaultValue": 28
+      },
+      {
+        "key": "hide_when_empty",
+        "type": "boolean",
+        "label": "Ausblenden, wenn kein Termin ansteht",
+        "description": "Aus: der Eintrag bleibt sichtbar und zeigt einen Platzhalter.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

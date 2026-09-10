@@ -1,0 +1,24 @@
+{
+  "backend": "eds",
+  "ics_urls": [],
+  "lookahead_minutes": 720,
+  "refresh_seconds": 300,
+  "fetch_interval_seconds": 60,
+  "alert_lead_seconds": 60,
+  "auto_dismiss_seconds": 90,
+  "inhibit_lead_seconds": 600,
+  "grace_seconds": 300,
+  "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+  "notify": true,
+  "wake_display": true,
+  "skip_all_day": true,
+  "skip_declined": true,
+  "min_duration_minutes": 0,
+  "title_blocklist": [],
+  "calendars_exclude": [],
+  "widget": {
+    "warn_minutes": 15,
+    "max_title_chars": 28,
+    "hide_when_empty": true
+  }
+}

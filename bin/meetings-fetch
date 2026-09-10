@@ -1,0 +1,1344 @@
+#!/usr/bin/python3
+"""Event source for the omarchy shell plugin `c51.meetings`.
+
+Reads the user's calendar and writes the event cache the QML side polls:
+`$XDG_RUNTIME_DIR/omarchy-meetings/events.json`, mode 0600, replaced atomically.
+
+Three backends:
+
+  eds   default. GNOME Online Accounts + Evolution Data Server, i.e. no OAuth of
+        our own: GOA already holds an approved Google login for this machine and
+        EDS already syncs the events, so this only reads what is there.
+  ics   documented backstop. Google regenerates the private ICS feed only about
+        once a day, so it can miss a meeting that was moved this morning. Never
+        make this the default.
+  demo  synthetic events, standard library only, so the whole alert path can be
+        tested before a Google account exists.
+
+`--in-seconds N` additionally arms a test event in a second file next to the
+cache, `inject.json` (same 0600/atomic treatment): the QML service re-runs this
+script with NO arguments every fetch_interval_seconds, so an event that lived
+only in one run's output was overwritten within a minute and the alert could
+never fire. Every later run merges the marker back in until it ages out.
+
+Always run with /usr/bin/python3, never a bare `python3`: mise/pyenv shims do not
+carry the `gi` bindings the eds backend needs.
+
+Privacy: the cache carries id/title/start/end/all_day/url/calendar/location and
+nothing else -- no attendees, no description, no organizer. Nothing but counts
+and error text reaches stdout or the journal, and ICS feed URLs are treated as
+secrets (they are bearer tokens: never logged, never quoted in an error).
+"""
+import argparse
+import configparser
+import datetime
+import hashlib
+import html
+import json
+import os
+import re
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+SCHEMA_VERSION = 1
+BACKENDS = ("eds", "ics", "demo")
+
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/meetings.json")
+CACHE_BASENAME = "events.json"
+GOA_ACCOUNTS_PATH = os.path.expanduser("~/.config/goa-1.0/accounts.conf")
+
+# Only the keys this script actually needs; the QML reads the rest of the same
+# file itself. Types here double as the validator in load_config().
+DEFAULTS = {
+    "backend": "eds",
+    "ics_urls": [],
+    "lookahead_minutes": 720,
+    "refresh_seconds": 300,
+    "alert_lead_seconds": 60,
+    "grace_seconds": 300,
+    "skip_all_day": True,
+    "skip_declined": True,
+    "min_duration_minutes": 0,
+    "title_blocklist": [],
+    "calendars_exclude": [],
+}
+
+CONNECT_TIMEOUT_SECONDS = 30
+ICS_TIMEOUT_SECONDS = 20
+MAX_ICS_BYTES = 8 * 1024 * 1024
+MAX_DIAGNOSE_EVENTS = 5
+# ECal.Client.generate_instances_sync takes the window at face value, so an
+# absurd lookahead_minutes really does ask EDS to expand recurrences into the
+# year 1.9 million. 30 days is far past anything the widget or the alert can use.
+MAX_LOOKAHEAD_MINUTES = 30 * 24 * 60
+
+# Exactly the three packages README.md and install.sh name, in the same order,
+# so the sentence the user reads here is the command they can paste.
+# gnome-online-accounts-gtk is the GOA dialog on this machine and a separate
+# package from the gnome-online-accounts library, so it has to be listed.
+EDS_PACKAGES = ("sudo pacman -S --needed gnome-online-accounts "
+                "gnome-online-accounts-gtk evolution-data-server")
+GOA_DIALOG = "gnome-online-accounts-gtk"
+ICS_PACKAGES = "sudo pacman -S python-icalendar python-recurring-ical-events"
+
+# Namespace -> versions to try, most likely first. Arch ships ICalGLib 4.0 ONLY,
+# and it comes from libical, not from evolution-data-server:
+#   pacman -Fq ICalGLib-4.0.typelib -> extra/libical   (3.0 matches nothing)
+#   pacman -Fl libical | grep typelib -> ICal-4.0, ICalGLib-4.0
+# so 4.0 is probed first; 3.0 stays only as a fallback for an older libical.
+EDS_NAMESPACES = (
+    ("EDataServer", ("1.2",)),
+    ("ECal", ("2.0",)),
+    ("ICalGLib", ("4.0", "3.0")),
+)
+
+# Which pacman package actually ships a namespace's typelib, so a missing one is
+# blamed on the right package (evolution-data-server depends on libical, so the
+# install command stays the same either way).
+TYPELIB_PACKAGES = {"ICalGLib": "libical"}
+DEFAULT_TYPELIB_PACKAGE = "evolution-data-server"
+
+
+def typelib_package(namespace):
+    return TYPELIB_PACKAGES.get(namespace, DEFAULT_TYPELIB_PACKAGE)
+
+
+# Hosts, not free-form URLs: the authority must be one of the conferencing
+# providers, so a stray link in a description cannot be mistaken for a room.
+JOIN_URL_RE = re.compile(
+    r"https://(?:[A-Za-z0-9-]+\.)*"
+    r"(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|webex\.com)"
+    r"(?:/[^\s<>\"']*)?",
+    re.IGNORECASE,
+)
+URL_TRAILING_JUNK = ".,;:!?)]}>\"'"
+
+
+class BackendError(Exception):
+    """A backend could not produce a trustworthy event list. Carries a message
+    meant for the user's screen, so it must stay free of URLs and tokens."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+# --- small shared helpers ---------------------------------------------------
+
+
+def _int(value, default=0):
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+
+def _short(value, limit=140):
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _call(obj, name, default=None):
+    """Call a zero-argument getter that may not exist in the installed typelib
+    version. Never raises: a missing property is not a reason to lose an event."""
+    function = getattr(obj, name, None)
+    if function is None:
+        return default
+    try:
+        return function()
+    except Exception:
+        return default
+
+
+def _strip_mailto(value):
+    value = (value or "").strip()
+    return value[7:] if value[:7].lower() == "mailto:" else value
+
+
+def human_delta(seconds):
+    seconds = int(seconds)
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    if seconds < 60:
+        return "%s%d s" % (sign, seconds)
+    if seconds < 3600:
+        return "%s%d min %d s" % (sign, seconds // 60, seconds % 60)
+    if seconds < 86400:
+        return "%s%d h %d min" % (sign, seconds // 3600, (seconds % 3600) // 60)
+    return "%s%d d %d h" % (sign, seconds // 86400, (seconds % 86400) // 3600)
+
+
+def runtime_dir():
+    base = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    return os.path.join(base, "omarchy-meetings")
+
+
+# --- configuration ----------------------------------------------------------
+
+
+def load_config(path):
+    """-> (config, warning). Never raises. A missing file is normal; a broken
+    one falls back to the documented defaults and returns a warning that ends
+    up in the cache's `warning` field, so the user can actually see it."""
+    config = dict(DEFAULTS)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return config, ""
+    except (OSError, ValueError) as exc:
+        return config, ("Konfiguration %s ist nicht lesbar (%s) – "
+                        "es gelten Standardwerte." % (path, _short(exc, 80)))
+    if not isinstance(raw, dict):
+        return config, ("Konfiguration %s ist kein JSON-Objekt – "
+                        "es gelten Standardwerte." % path)
+
+    rejected = []
+    for key, default in DEFAULTS.items():
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(default, bool):
+            valid = isinstance(value, bool)
+        elif isinstance(default, int):
+            valid = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        elif isinstance(default, list):
+            valid = isinstance(value, list) and all(isinstance(item, str) for item in value)
+        else:
+            valid = isinstance(value, str)
+        if valid:
+            config[key] = value
+        else:
+            rejected.append(key)
+
+    if config["backend"] not in BACKENDS:
+        rejected.append("backend")
+        config["backend"] = DEFAULTS["backend"]
+
+    warnings = []
+    if rejected:
+        warnings.append("Ungültige Werte in %s: %s – dort gelten Standardwerte."
+                        % (path, ", ".join(sorted(set(rejected)))))
+    if config["lookahead_minutes"] > MAX_LOOKAHEAD_MINUTES:
+        warnings.append("lookahead_minutes ist auf %d min (30 Tage) begrenzt."
+                        % MAX_LOOKAHEAD_MINUTES)
+        config["lookahead_minutes"] = MAX_LOOKAHEAD_MINUTES
+    return config, " ".join(warnings)
+
+
+# --- event construction (pure) ----------------------------------------------
+
+
+def event_id(uid, start_epoch):
+    """sha1(uid + "@" + instance_start)[:16]. Must be byte-identical for the
+    same occurrence on every run, otherwise Service.qml re-fires the alert."""
+    key = "%s@%d" % (uid or "", int(start_epoch))
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+
+def make_event(uid, title, start, end, all_day, url, calendar, location, join_path):
+    """One cache entry. `_join_path` records which URL rule matched; every
+    underscore key is stripped again before the cache is written -- it exists
+    only so --diagnose can name the path without printing the URL."""
+    start = int(start)
+    end = int(end) if end is not None else start
+    if end < start:
+        end = start
+    return {
+        "id": event_id(uid, start),
+        "title": _short(title or "(ohne Titel)", 200),
+        "start": start,
+        "end": end,
+        "all_day": bool(all_day),
+        "url": url or "",
+        "calendar": _short(calendar or "", 120),
+        "location": _short(location or "", 200),
+        "_join_path": join_path,
+    }
+
+
+def clean_url(value):
+    """https-only, trailing sentence punctuation removed. Descriptions wrap
+    links in prose, so "…/abc-defg-hij." must not become part of the room id."""
+    value = (value or "").strip().rstrip(URL_TRAILING_JUNK)
+    return value if value[:8].lower() == "https://" else ""
+
+
+def pick_join_url(conference, x_google_conference, location, description):
+    """-> (url, path). Precedence per spec: RFC 7986 CONFERENCE, then
+    X-GOOGLE-CONFERENCE, then a provider-host regex over LOCATION, then over
+    DESCRIPTION. The iCalendar URL property is deliberately not consulted: for
+    Google events it is the calendar web page, not the meeting room.
+
+    Pure -- no gi, no I/O -- so the precedence can be reasoned about on its own.
+    """
+    for value, path in ((conference, "conference"),
+                        (x_google_conference, "x-google-conference")):
+        url = clean_url(value)
+        if url:
+            return url, path
+    # In practice this is the path that fires: whether Google's CalDAV emits the
+    # two properties above is unverified, and the invite body always has the link.
+    # Descriptions arrive HTML-escaped, so &amp; has to be undone before matching
+    # or a Zoom link loses its ?pwd= parameter.
+    for text, path in ((location, "location-regex"), (description, "description-regex")):
+        match = JOIN_URL_RE.search(html.unescape(text or ""))
+        if match:
+            url = clean_url(match.group(0))
+            if url:
+                return url, path
+    return "", "none"
+
+
+def apply_filters(events, config, now, window_end):
+    """Drop what the user does not want to be alerted about, de-duplicate by id
+    (the same meeting can sit in two subscribed calendars) and sort by start."""
+    blocked = [term.lower() for term in config["title_blocklist"] if term.strip()]
+    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+    min_seconds = config["min_duration_minutes"] * 60
+    grace = max(config["grace_seconds"], 0)
+
+    kept = []
+    seen = set()
+    for event in events:
+        if config["skip_all_day"] and event["all_day"]:
+            continue
+        if event["calendar"].strip().lower() in excluded:
+            continue
+        if any(term in event["title"].lower() for term in blocked):
+            continue
+        if min_seconds and (event["end"] - event["start"]) < min_seconds:
+            continue
+        if event["start"] > window_end:
+            continue
+        # Keep a meeting that is running right now, and one that started while we
+        # were suspended: Service.qml still alerts up to grace_seconds after the
+        # start, and it can only do that if the occurrence is in the cache.
+        if event["end"] <= now and (now - event["start"]) > grace:
+            continue
+        if event["id"] in seen:
+            continue
+        seen.add(event["id"])
+        kept.append(event)
+
+    kept.sort(key=lambda event: (event["start"], event["id"]))
+    return kept
+
+
+# --- cache I/O --------------------------------------------------------------
+
+
+def load_cache(path):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def previous_events(cache):
+    """Last known good list, re-validated field by field: a corrupt cache must
+    not be laundered into a fresh cache carrying our name."""
+    raw = cache.get("events")
+    if not isinstance(raw, list):
+        return []
+    kept = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        start = _int(item.get("start"), None)
+        if start is None or not isinstance(item.get("id"), str):
+            continue
+        kept.append({
+            "id": item["id"],
+            "title": str(item.get("title") or ""),
+            "start": start,
+            "end": _int(item.get("end"), start),
+            "all_day": bool(item.get("all_day")),
+            "url": str(item.get("url") or ""),
+            "calendar": str(item.get("calendar") or ""),
+            "location": str(item.get("location") or ""),
+        })
+    kept.sort(key=lambda event: (event["start"], event["id"]))
+    return kept
+
+
+def build_payload(backend, status, error, warning, events, refreshed_at, stale, now):
+    """`error` belongs to status "error" alone. `warning` is the separate channel
+    for "usable but degraded" -- a partial calendar failure, a rejected config
+    value, a test event outside the window -- and stays "" when there is none, so
+    a consumer can treat any non-empty warning as something to surface."""
+    payload = {
+        "schema": SCHEMA_VERSION,
+        "backend": backend,
+        "status": status,
+        "error": error,
+        "warning": warning,
+        "generated_at": int(now),
+        "refreshed_at": int(refreshed_at or 0),
+        "events": [{key: value for key, value in event.items() if not key.startswith("_")}
+                   for event in events],
+    }
+    if stale:
+        payload["stale"] = True
+    return payload
+
+
+def write_cache(path, payload, prefix=".events-"):
+    """0600 file in a 0700 directory, swapped in with os.replace so a reader
+    never sees a half-written cache. The directory lives on tmpfs on purpose.
+    Also used for the inject marker, which needs the same treatment."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    descriptor, tmp_path = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        _unlink(tmp_path)
+        raise
+
+
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+# --- injected test event (--in-seconds) -------------------------------------
+
+INJECT_BASENAME = "inject.json"
+INJECT_UID = "c51-meetings-inject"
+INJECT_TITLE = "TEST-Termin (c51.meetings)"
+INJECT_CALENDAR = "Test"
+INJECT_LOCATION = "Arbeitszimmer"
+INJECT_URL = "https://meet.google.com/tst-test-tst"
+INJECT_DURATION_SECONDS = 1800
+
+
+def inject_path_for(out_path):
+    """The marker sits next to the cache, so --out moves both together."""
+    return os.path.join(os.path.dirname(out_path) or ".", INJECT_BASENAME)
+
+
+def write_inject(path, now, in_seconds):
+    """Arm the test event. Three properties are load-bearing, because this is the
+    only way to test the real alert path end to end:
+
+    * `--in-seconds N` means exactly N seconds -- start is now + N, no grid
+      snapping, so the alert lands at N - alert_lead_seconds;
+    * the arming is PERSISTED. Service.qml re-runs this script with no arguments
+      every fetch_interval_seconds, and such a run rewrites the cache; an event
+      that existed only in one run's output was gone within a minute and could
+      never fire. Every later run merges this marker back in instead.
+    * the id is written once and read back unchanged, so it stays stable across
+      runs without being recomputed from the clock (a moving id re-fires the
+      alert on every fetch).
+
+    A second --in-seconds simply replaces the file, so re-arming with a different
+    lead works.
+    """
+    start = int(now) + int(in_seconds)
+    write_cache(path, {
+        "id": event_id(INJECT_UID, start),
+        "title": INJECT_TITLE,
+        "start": start,
+        "end": start + INJECT_DURATION_SECONDS,
+        "url": INJECT_URL,
+    }, prefix=".inject-")
+
+
+def load_inject(path, now, grace):
+    """-> the armed test event, or None. The marker is deleted once its start is
+    older than the grace window: Service.qml cannot alert on it anymore, so it
+    is spent and must not resurface in a later session. `end` is taken from the
+    file as written -- no consumer invents a duration."""
+    marker = load_cache(path)  # same tolerant JSON reader as the cache
+    start = _int(marker.get("start"), None)
+    if start is None:
+        _unlink(path)  # absent or unusable -- either way there is nothing to inject
+        return None
+    if now - start > max(grace, 0):
+        _unlink(path)
+        return None
+    event = make_event(INJECT_UID, str(marker.get("title") or INJECT_TITLE), start,
+                       _int(marker.get("end"), start), False,
+                       clean_url(str(marker.get("url") or "")), INJECT_CALENDAR,
+                       INJECT_LOCATION, "inject")
+    if isinstance(marker.get("id"), str) and marker["id"]:
+        event["id"] = marker["id"]
+    return event
+
+
+def merge_inject(events, injected, config, now, window_end):
+    """-> (events, warning). Merged on EVERY run and on every code path, the
+    error one included: on a machine without EDS a plain run ends in the
+    BackendError branch, and the test alert has to survive that too. A stale
+    cache can already carry the previous run's copy, hence the de-dup by id."""
+    events = [event for event in events if event["id"] != injected["id"]]
+    survivors = apply_filters([injected], config, now, window_end)
+    events = sorted(events + survivors, key=lambda event: (event["start"], event["id"]))
+    if survivors:
+        return events, ""
+    return events, ("Der Testtermin aus --in-seconds liegt außerhalb von "
+                    "lookahead_minutes/grace_seconds und wird nicht ausgeliefert.")
+
+
+# --- backend: demo ----------------------------------------------------------
+
+DEMO_CALENDAR = "Demo"
+
+# days from today, (hour, minute), minutes, title, link text, location, all-day.
+# The link is handed to pick_join_url as if it were the invite body, so the demo
+# exercises the same extraction path the real backends use.
+DEMO_SCHEDULE = (
+    (0, (9, 30), 15, "Daily Standup", "Beitreten: https://meet.google.com/aaa-bbbb-ccc", "", False),
+    (0, (14, 0), 60, "Sprint Review", "Video: https://meet.google.com/ddd-eeee-fff", "", False),
+    (0, (16, 30), 30, "1:1 mit der Teamleitung", "", "Besprechungsraum 2", False),
+    (0, (0, 0), 1440, "Urlaub (Kollegin)", "", "", True),
+    (1, (11, 0), 45, "Kundencall", "https://example.zoom.us/j/1234567890", "", False),
+)
+
+
+def _local_epoch(day, hour, minute):
+    """Local wall clock -> unix seconds. Naive datetime.timestamp() resolves
+    through the system zone, which is exactly what "09:30 on that day" means."""
+    return int(datetime.datetime(day.year, day.month, day.day, hour, minute).timestamp())
+
+
+def demo_events(now):
+    """The synthetic schedule only. The --in-seconds test event is not a demo
+    event any longer: it is a marker file that every backend merges in."""
+    events = []
+    today = datetime.date.fromtimestamp(now)
+    for offset, (hour, minute), minutes, title, link, location, all_day in DEMO_SCHEDULE:
+        day = today + datetime.timedelta(days=offset)
+        start = _local_epoch(day, hour, minute)
+        url, path = pick_join_url("", "", location, link)
+        # The uid is date-free: the start already varies per day, and the id
+        # mixes both, so ids stay stable within a day and differ across days.
+        uid = "c51-meetings-demo-%s" % re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        events.append(make_event(uid, title, start, start + minutes * 60, all_day,
+                                 url, DEMO_CALENDAR, location, path))
+    return events
+
+
+# --- backend: ics (backstop) ------------------------------------------------
+
+
+class HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow a redirect that leaves https -- the feed URL is a bearer
+    token and must never be replayed over plaintext."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if newurl[:8].lower() != "https://":
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _network_detail(exc):
+    """A short, URL-free description of a fetch failure. urllib puts the URL on
+    HTTPError.url and sometimes into str(); only the status/errno is quoted."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return "HTTP %s" % exc.code
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        detail = getattr(reason, "strerror", None) or type(reason).__name__
+        return "Netzwerkfehler (%s)" % _short(detail, 60)
+    return type(exc).__name__
+
+
+def _http_get_ics(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "omarchy-c51-meetings/1"})
+    opener = urllib.request.build_opener(HttpsOnlyRedirectHandler)
+    with opener.open(request, timeout=ICS_TIMEOUT_SECONDS) as response:
+        payload = response.read(MAX_ICS_BYTES + 1)
+    if len(payload) > MAX_ICS_BYTES:
+        raise ValueError("feed larger than %d bytes" % MAX_ICS_BYTES)
+    return payload.decode("utf-8", "replace")
+
+
+def _ics_property(component, key):
+    value = component.get(key)
+    if isinstance(value, list):
+        value = value[0] if value else None
+    return value
+
+
+def _ics_text(component, key):
+    value = _ics_property(component, key)
+    return "" if value is None else str(value)
+
+
+def _dt_to_epoch(value):
+    """datetime/date -> unix seconds.
+
+    Order matters: datetime is a subclass of date. An aware datetime carries its
+    own offset; a naive one is floating local time; a bare date is an all-day
+    entry and resolves to LOCAL midnight, because "all day on the 11th" means
+    midnight where the user is, not midnight UTC.
+    """
+    if isinstance(value, datetime.datetime):
+        return int(value.timestamp())
+    if isinstance(value, datetime.date):
+        return int(datetime.datetime(value.year, value.month, value.day).timestamp())
+    return None
+
+
+def ics_component_to_event(component, calendar_name):
+    """Pure: takes an already-parsed component, returns a cache entry or None."""
+    start_value = getattr(_ics_property(component, "DTSTART"), "dt", None)
+    start = _dt_to_epoch(start_value)
+    if start is None:
+        return None
+    end_value = getattr(_ics_property(component, "DTEND"), "dt", None)
+    end = _dt_to_epoch(end_value)
+    all_day = isinstance(start_value, datetime.date) and not isinstance(start_value, datetime.datetime)
+    location = _ics_text(component, "LOCATION")
+    url, path = pick_join_url(_ics_text(component, "CONFERENCE"),
+                              _ics_text(component, "X-GOOGLE-CONFERENCE"),
+                              location, _ics_text(component, "DESCRIPTION"))
+    return make_event(_ics_text(component, "UID"), _ics_text(component, "SUMMARY"),
+                      start, end, all_day, url, calendar_name, location, path)
+
+
+def read_ics(config, window_start, window_end):
+    """-> (events, failure). Raises BackendError when nothing could be read; a
+    non-empty `failure` means some feeds were unreadable (D2: with nothing left
+    after filtering the caller turns that into status "error").
+    Feed URLs are secrets: failures are reported by list position only."""
+    urls = [url.strip() for url in config["ics_urls"] if isinstance(url, str) and url.strip()]
+    if not urls:
+        raise BackendError(
+            "Backend 'ics' ist aktiv, aber 'ics_urls' ist leer. Privaten iCal-Link "
+            "aus Google Kalender dort eintragen – oder besser \"backend\": \"eds\" nutzen.")
+    try:
+        import icalendar
+        import recurring_ical_events
+    except ImportError as exc:
+        raise BackendError(
+            "Python-Pakete für das ICS-Backend fehlen (%s). Installieren: %s – "
+            "oder \"backend\": \"eds\" nutzen."
+            % (getattr(exc, "name", None) or "icalendar", ICS_PACKAGES)) from None
+
+    utc = datetime.timezone.utc
+    from_time = datetime.datetime.fromtimestamp(window_start, tz=utc)
+    to_time = datetime.datetime.fromtimestamp(window_end, tz=utc)
+
+    events = []
+    failures = []
+    for index, url in enumerate(urls, start=1):
+        if url[:8].lower() != "https://":
+            failures.append("Quelle %d: nur https ist erlaubt" % index)
+            continue
+        try:
+            text = _http_get_ics(url)
+        except Exception as exc:
+            failures.append("Quelle %d: %s" % (index, _network_detail(exc)))
+            continue
+        try:
+            calendar = icalendar.Calendar.from_ical(text)
+            name = _ics_text(calendar, "X-WR-CALNAME") or "ICS %d" % index
+            for component in recurring_ical_events.of(calendar).between(from_time, to_time):
+                event = ics_component_to_event(component, name)
+                if event is not None:
+                    events.append(event)
+        except Exception as exc:
+            failures.append("Quelle %d: nicht auswertbar (%s)" % (index, type(exc).__name__))
+
+    if failures and not events:
+        raise BackendError("Kein ICS-Feed lesbar – " + "; ".join(failures))
+    return events, ("ICS-Probleme: " + "; ".join(failures)) if failures else ""
+
+
+# --- backend: eds (default) -------------------------------------------------
+
+
+def import_eds():
+    """-> (EDataServer, ECal, ICalGLib, GLib), or BackendError naming the package
+    to install. Every gi call is guarded: on a machine without
+    evolution-data-server none of these typelibs exist, and the plugin has to
+    show one useful sentence instead of a traceback."""
+    try:
+        import gi
+    except ImportError:
+        raise BackendError("Python-Modul 'gi' fehlt – installieren: "
+                           "sudo pacman -S python-gobject") from None
+
+    missing = []
+    for namespace, versions in EDS_NAMESPACES:
+        for version in versions:
+            try:
+                gi.require_version(namespace, version)
+                break
+            except (ValueError, AttributeError):
+                continue
+        else:
+            missing.append(namespace)
+    if missing:
+        packages = sorted({typelib_package(namespace) for namespace in missing})
+        raise BackendError(
+            "Kalender-Bibliotheken fehlen: %s (aus %s). Installieren, dann ein "
+            "Google-Konto in GNOME Online Accounts anlegen (%s): %s"
+            % (", ".join("%s-Typelib" % namespace for namespace in missing),
+               ", ".join(packages), GOA_DIALOG, EDS_PACKAGES))
+
+    try:
+        from gi.repository import ECal, EDataServer, GLib, ICalGLib
+    except (ImportError, ValueError) as exc:
+        raise BackendError(
+            "evolution-data-server ist nicht nutzbar (%s). Installieren: %s"
+            % (_short(exc, 80), EDS_PACKAGES)) from None
+    return EDataServer, ECal, ICalGLib, GLib
+
+
+def ical_time_to_epoch(value, ical):
+    """ICalGLib.Time -> unix seconds (UTC). Three traps live in here.
+
+    1. as_timet() does NOT apply the timezone the time carries -- it reads the
+       wall-clock digits as if they were already UTC. A 14:00 Europe/Berlin
+       meeting therefore comes back as 14:00Z, two hours early in summer.
+       convert_to_zone(UTC) rewrites the digits to real UTC first, and only then
+       is as_timet() correct.
+    2. A time with no zone that is not marked UTC is floating local time. There
+       is nothing to convert it to, so its digits are resolved through the system
+       zone instead -- as_timet() would again read them as UTC.
+    3. An all-day event is a pure date (is_date() -> True). The user means
+       "midnight where I am", so it resolves through the local zone as well.
+    """
+    if value is None or _call(value, "is_null_time", False):
+        return None
+    year = _call(value, "get_year", 0)
+    month = _call(value, "get_month", 0)
+    day = _call(value, "get_day", 0)
+    if not (year and month and day):
+        return None
+
+    if _call(value, "is_date", False):
+        return int(datetime.datetime(year, month, day).timestamp())
+
+    if not _call(value, "is_utc", False):
+        if _call(value, "get_timezone") is not None:
+            value = value.convert_to_zone(ical.Timezone.get_utc_timezone())
+        else:
+            return int(datetime.datetime(year, month, day,
+                                         _call(value, "get_hour", 0),
+                                         _call(value, "get_minute", 0),
+                                         _call(value, "get_second", 0)).timestamp())
+    return int(value.as_timet())
+
+
+def _property_text(icomp, ical, kind_name):
+    """First value of a property kind, as a string. The kind may not exist in the
+    installed libical (CONFERENCE arrived in 3.0), hence the getattr guard."""
+    kind = getattr(ical.PropertyKind, kind_name, None)
+    if kind is None:
+        return ""
+    try:
+        prop = icomp.get_first_property(kind)
+    except Exception:
+        return ""
+    return _property_value(prop) if prop is not None else ""
+
+
+def _property_value(prop):
+    for getter in ("get_value_as_string", "get_conference", "get_x", "get_url"):
+        value = _call(prop, getter)
+        if value:
+            return str(value).strip()
+    return ""
+
+
+def _x_property_text(icomp, ical, x_name):
+    """Value of a named X-property. libical exposes these as one X_PROPERTY kind
+    whose name has to be compared by hand."""
+    kind = getattr(ical.PropertyKind, "X_PROPERTY", None)
+    if kind is None:
+        return ""
+    try:
+        prop = icomp.get_first_property(kind)
+        while prop is not None:
+            if (_call(prop, "get_x_name") or "").upper() == x_name:
+                value = _property_value(prop)
+                if value:
+                    return value
+            prop = icomp.get_next_property(kind)
+    except Exception:
+        return ""
+    return ""
+
+
+def component_texts(icomp, ical):
+    """Every string the pure helpers need, pulled out in one place so the URL
+    precedence and the time maths stay free of gi."""
+    return {
+        "uid": _call(icomp, "get_uid") or "",
+        "title": _call(icomp, "get_summary") or "",
+        "location": _call(icomp, "get_location") or "",
+        "description": _call(icomp, "get_description") or "",
+        "conference": _property_text(icomp, ical, "CONFERENCE_PROPERTY"),
+        "x_google_conference": _x_property_text(icomp, ical, "X-GOOGLE-CONFERENCE"),
+    }
+
+
+def attendee_partstat(icomp, ical, identities):
+    """PARTSTAT of the account's own ATTENDEE line, upper-cased, or "" when the
+    user is not listed. Identities never leave this process."""
+    kind = getattr(ical.PropertyKind, "ATTENDEE_PROPERTY", None)
+    if kind is None:
+        return ""
+    try:
+        prop = icomp.get_first_property(kind)
+        while prop is not None:
+            email = _strip_mailto(_call(prop, "get_attendee") or "")
+            if email.lower() in identities:
+                try:
+                    status = prop.get_parameter_as_string("PARTSTAT")
+                except Exception:
+                    status = ""
+                return (status or "").upper()
+            prop = icomp.get_next_property(kind)
+    except Exception:
+        return ""
+    return ""
+
+
+def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, identities):
+    """`icomp` is the series' component for THIS occurrence: its own
+    get_dtstart() still reads the recurrence master's original date (a
+    birthday's 1988, not this year's), which is why only the instance times the
+    callback handed over are used."""
+    if identities and attendee_partstat(icomp, ical, identities) == "DECLINED":
+        return None
+    start = ical_time_to_epoch(instance_start, ical)
+    if start is None:
+        return None
+    texts = component_texts(icomp, ical)
+    url, path = pick_join_url(texts["conference"], texts["x_google_conference"],
+                              texts["location"], texts["description"])
+    return make_event(texts["uid"], texts["title"], start,
+                      ical_time_to_epoch(instance_end, ical),
+                      bool(_call(instance_start, "is_date", False)),
+                      url, calendar_name, texts["location"], path)
+
+
+def generate_instances(client, ical, glib, window_start, window_end, calendar_name, identities):
+    """-> (events, problem). generate_instances_sync is what actually expands
+    recurrences; get_object_list_as_comps_sync hands back the masters instead."""
+    collected = []
+    trouble = []
+
+    def on_instance(icomp, instance_start, instance_end, *_rest):
+        # ECalRecurInstanceCb also passes user_data and a GCancellable; *_rest
+        # absorbs whichever arity the installed binding uses. An exception here
+        # would unwind through C, so nothing may escape.
+        try:
+            event = instance_to_event(icomp, instance_start, instance_end, ical,
+                                      calendar_name, identities)
+            if event is not None:
+                collected.append(event)
+        except Exception as exc:
+            trouble.append("%s: %s" % (type(exc).__name__, _short(exc, 60)))
+        return True
+
+    start, end = int(window_start), int(window_end)
+    try:
+        try:
+            client.generate_instances_sync(start, end, None, on_instance)
+        except TypeError:
+            client.generate_instances_sync(start, end, None, on_instance, None)
+    except glib.Error as exc:
+        return collected, _short(getattr(exc, "message", exc), 80)
+    return collected, trouble[0] if trouble else ""
+
+
+def google_collection_roots(registry):
+    """Top-level sources that stand for a linked Google account. The GOA
+    extension is deliberately not required: a Collection root with backend
+    "google" is the account whether GOA created it or the user did by hand."""
+    roots = []
+    for source in registry.list_sources(None):
+        if source.get_parent():
+            continue
+        if not source.has_extension("Collection"):
+            continue
+        if source.get_extension("Collection").get_backend_name() != "google":
+            continue
+        roots.append(source)
+    return roots
+
+
+def calendar_sources(registry, roots):
+    """Direct Calendar children of those roots, enabled per
+    registry.check_enabled() -- source.get_enabled() alone still reports True
+    for a calendar whose parent account is switched off."""
+    root_uids = {source.get_uid() for source in roots}
+    found = []
+    for source in registry.list_sources(None):
+        if source.get_parent() not in root_uids:
+            continue
+        if not source.has_extension("Calendar"):
+            continue
+        if not registry.check_enabled(source):
+            continue
+        found.append(source)
+    return found
+
+
+def calendar_excluded(source, excluded):
+    """calendars_exclude matches either the display name or the UID. The
+    exclusion set is lower-cased, so the raw uid has to be lower-cased too --
+    comparing it as-is made every uid entry a no-op unless it happened to be
+    all lower case already."""
+    if not excluded:
+        return False
+    name = (source.get_display_name() or "").strip().lower()
+    uid = (source.get_uid() or "").strip().lower()
+    return name in excluded or uid in excluded
+
+
+def account_identities(roots):
+    """Lower-cased addresses this machine's own account owns, for skip_declined.
+    Held in memory only and never written anywhere."""
+    identities = set()
+    for source in roots:
+        for extension_name, getter in (("Collection", "get_identity"),
+                                       ("Authentication", "get_user")):
+            if not source.has_extension(extension_name):
+                continue
+            value = _strip_mailto(_call(source.get_extension(extension_name), getter) or "")
+            if value:
+                identities.add(value.lower())
+    return identities
+
+
+def open_registry(eds, glib):
+    try:
+        return eds.SourceRegistry.new_sync(None)
+    except glib.Error as exc:
+        raise BackendError("Evolution Data Server antwortet nicht (%s). Dienst prüfen: "
+                           "systemctl --user status evolution-source-registry"
+                           % _short(getattr(exc, "message", exc), 80)) from None
+
+
+def read_eds(config, now, window_start, window_end, cache, force_refresh):
+    """-> (events, refreshed_at, failure, warnings). Raises BackendError when
+    there is no usable calendar at all. A single failing calendar only fills
+    `failure`, which the caller reports as a warning -- or, when nothing
+    survives filtering, as status "error" (D2)."""
+    eds, ecal, ical, glib = import_eds()
+    registry = open_registry(eds, glib)
+
+    # These two strings are what the widget and `meetings status` put in front of
+    # the user in exactly the situation where the next step matters, so they name
+    # the GOA dialog that is actually installable here (GOA_DIALOG) and nothing
+    # else.
+    roots = google_collection_roots(registry)
+    if not roots:
+        raise BackendError("Kein Google-Konto gefunden. In GNOME Online Accounts anlegen: %s"
+                           % GOA_DIALOG)
+    sources = calendar_sources(registry, roots)
+    if not sources:
+        raise BackendError("Google-Konto vorhanden, aber kein aktivierter Kalender – "
+                           "Kalender in GNOME Online Accounts einschalten: %s" % GOA_DIALOG)
+
+    warnings = []
+    identities = account_identities(roots) if config["skip_declined"] else set()
+    if config["skip_declined"] and not identities:
+        # Without an own address there is nothing to compare ATTENDEE against, so
+        # the filter silently does nothing and declined meetings still raise a
+        # fullscreen alert. That has to be visible, not silent.
+        warnings.append("skip_declined ist aktiv, aber im Konto ist keine eigene "
+                        "Adresse hinterlegt – abgelehnte Termine lösen weiterhin "
+                        "einen Alarm aus.")
+    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+
+    # EDS's own refresh interval defaults to 60 minutes, which is far too coarse
+    # for a meeting alarm, so a network refresh is pushed by hand -- but only
+    # every refresh_seconds, since the fetcher itself runs every minute.
+    refreshed_at = _int(cache.get("refreshed_at"))
+    refresh_due = force_refresh or (now - refreshed_at) >= max(config["refresh_seconds"], 0)
+
+    events = []
+    failures = []
+    for source in sources:
+        name = source.get_display_name() or ""
+        if calendar_excluded(source, excluded):
+            continue
+        try:
+            client = ecal.Client.connect_sync(source, ecal.ClientSourceType.EVENTS,
+                                              CONNECT_TIMEOUT_SECONDS, None)
+        except glib.Error as exc:
+            failures.append("%s (%s)" % (name, _short(getattr(exc, "message", exc), 60)))
+            continue
+
+        if refresh_due:
+            try:
+                if client.check_refresh_supported():
+                    client.refresh_sync(None)
+            except glib.Error:
+                pass  # a failed refresh still leaves the locally cached copy readable
+            # Stamp the ATTEMPT, not the success. With the stamp inside the try
+            # after refresh_sync(), a calendar that fails or does not support
+            # refresh left refreshed_at untouched, so the throttle never engaged
+            # and every 60 s run blocked on another refresh of every calendar.
+            refreshed_at = now
+
+        collected, problem = generate_instances(client, ical, glib, window_start, window_end,
+                                                name, identities)
+        events.extend(collected)
+        if problem:
+            failures.append("%s (%s)" % (name, problem))
+
+    if failures and not events:
+        raise BackendError("Kalender nicht lesbar – " + "; ".join(failures))
+    failure = ("Teilweise fehlgeschlagen: " + "; ".join(failures)) if failures else ""
+    return events, refreshed_at, failure, warnings
+
+
+# --- fetch dispatch ---------------------------------------------------------
+
+
+def fetch(config, backend, args, now, window_start, window_end, cache):
+    """-> (events, refreshed_at, failure, warnings). Raises BackendError when the
+    backend produced nothing trustworthy at all. `failure` non-empty means the
+    backend delivered only part of its data; `warnings` are non-fatal notes."""
+    if backend == "demo":
+        return demo_events(now), now, "", []
+    if backend == "ics":
+        events, failure = read_ics(config, window_start, window_end)
+        return events, now, failure, []
+    return read_eds(config, now, window_start, window_end, cache, args.refresh)
+
+
+def window_for(config, now):
+    """The query window starts BEFORE now on purpose -- see apply_filters."""
+    return now - max(config["grace_seconds"], 0), now + config["lookahead_minutes"] * 60
+
+
+# --- diagnose ---------------------------------------------------------------
+
+
+def typelib_search_paths():
+    paths = [p for p in (os.environ.get("GI_TYPELIB_PATH") or "").split(os.pathsep) if p]
+    paths += ["/usr/lib/girepository-1.0", "/usr/lib64/girepository-1.0",
+              "/usr/local/lib/girepository-1.0"]
+    return [p for p in paths if os.path.isdir(p)]
+
+
+def typelib_state(namespace, versions):
+    """-> (ok, detail). Importability is authoritative; the file check is what
+    tells the two failures apart -- not installed at all, versus installed but
+    unloadable, which needs a completely different fix."""
+    try:
+        import gi
+    except ImportError:
+        return False, "python-gobject fehlt"
+    for version in versions:
+        try:
+            gi.require_version(namespace, version)
+            return True, "%s-%s" % (namespace, version)
+        except (ValueError, AttributeError):
+            continue
+    # versions[0] is the version this machine is expected to have (ICalGLib 4.0
+    # from libical); the rest are only fallbacks and are named as such.
+    wanted = "%s-%s.typelib" % (namespace, versions[0])
+    also = (" (auch %s geprüft)" % ", ".join(versions[1:])) if len(versions) > 1 else ""
+    on_disk = any(os.path.exists(os.path.join(path, "%s-%s.typelib" % (namespace, version)))
+                  for path in typelib_search_paths() for version in versions)
+    if on_disk:
+        return False, "%s vorhanden, aber nicht ladbar%s" % (wanted, also)
+    return False, "%s fehlt%s" % (wanted, also)
+
+
+def module_state(name):
+    try:
+        module = __import__(name)
+    except ImportError:
+        return False, "nicht installiert"
+    return True, str(getattr(module, "__version__", "") or "vorhanden")
+
+
+def goa_google_accounts():
+    """-> (google count, detail). Reads GOA's own config file, so this works
+    without the Goa typelib. Only counts are reported, never addresses."""
+    if not os.path.exists(GOA_ACCOUNTS_PATH):
+        return 0, "%s fehlt" % GOA_ACCOUNTS_PATH
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(GOA_ACCOUNTS_PATH, encoding="utf-8")
+    except (configparser.Error, OSError, UnicodeDecodeError) as exc:
+        return 0, "nicht lesbar (%s)" % type(exc).__name__
+    total = google = 0
+    for section in parser.sections():
+        if not section.startswith("Account"):
+            continue
+        total += 1
+        if (parser.get(section, "Provider", fallback="") or "").strip().lower() == "google":
+            google += 1
+    return google, "%d GOA-Konto/-Konten insgesamt" % total
+
+
+def diagnose_calendars(config):
+    try:
+        eds, _ecal, _ical, glib = import_eds()
+        registry = open_registry(eds, glib)
+    except BackendError as exc:
+        return ["  nicht prüfbar: %s" % exc.message]
+    try:
+        roots = google_collection_roots(registry)
+        sources = calendar_sources(registry, roots)
+    except Exception as exc:
+        return ["  Abfrage fehlgeschlagen: %s" % _short(exc, 80)]
+    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+    skipped = sum(1 for source in sources if calendar_excluded(source, excluded))
+    return [
+        "  Google-Konten:        %d" % len(roots),
+        "  Kalender aktiviert:   %d" % len(sources),
+        "  davon ausgeschlossen: %d" % skipped,
+        "  eigene Adressen:      %d (für skip_declined)" % len(account_identities(roots)),
+    ]
+
+
+def diagnose_cache(path, cache, now):
+    lines = ["  Datei:                %s" % path]
+    try:
+        info = os.stat(path)
+    except OSError:
+        lines.append("  Zustand:              noch nicht vorhanden")
+        return lines
+    try:
+        dir_mode = os.stat(os.path.dirname(path) or ".").st_mode & 0o777
+    except OSError:
+        dir_mode = 0
+    lines.append("  Rechte:               %04o (Verzeichnis %04o, erwartet 0600 / 0700)"
+                 % (info.st_mode & 0o777, dir_mode))
+    lines.append("  Alter:                %s" % human_delta(now - int(info.st_mtime)))
+    if not cache:
+        lines.append("  Inhalt:               unlesbar oder kein JSON-Objekt")
+        return lines
+    refreshed = _int(cache.get("refreshed_at"))
+    lines.append("  Schema / Backend:     %s / %s"
+                 % (cache.get("schema"), cache.get("backend")))
+    lines.append("  Status:               %s%s"
+                 % (cache.get("status"), " (stale)" if cache.get("stale") else ""))
+    if cache.get("error"):
+        lines.append("  Fehler:               %s" % _short(cache.get("error"), 200))
+    if cache.get("warning"):
+        lines.append("  Warnung:              %s" % _short(cache.get("warning"), 200))
+    events = cache.get("events")
+    lines.append("  Termine im Cache:     %d" % (len(events) if isinstance(events, list) else 0))
+    lines.append("  Letzter Netz-Sync:    %s"
+                 % (human_delta(now - refreshed) + " her" if refreshed else "nie"))
+    return lines
+
+
+def diagnose_join_paths(config, backend, args, now, cache):
+    """Which URL rule matched for the next few events. Path names only: no
+    titles, no times, and above all never the URL itself."""
+    window_start, window_end = window_for(config, now)
+    try:
+        events, _refreshed, failure, warnings = fetch(config, backend, args, now,
+                                                      window_start, window_end, cache)
+    except BackendError as exc:
+        return ["  Backend-Fehler: %s" % exc.message]
+    except Exception as exc:
+        return ["  unerwarteter Fehler: %s: %s" % (type(exc).__name__, _short(exc, 80))]
+    events = apply_filters(events, config, now, window_end)
+    lines = ["  Hinweis: %s" % note for note in ([failure] if failure else []) + warnings]
+    for index, event in enumerate(events[:MAX_DIAGNOSE_EVENTS], start=1):
+        lines.append("  Termin %d: %s%s" % (index, event["_join_path"],
+                                            "" if event["url"] else "  (keine Beitritts-URL)"))
+    if not events:
+        lines.append("  keine Termine im Vorschaufenster")
+    else:
+        lines.append("  (%d Termine im Fenster, angezeigt: %d)"
+                     % (len(events), min(len(events), MAX_DIAGNOSE_EVENTS)))
+    return lines
+
+
+def diagnose(args, config, config_warning, out_path, cache, now):
+    stamp = datetime.datetime.fromtimestamp(now).astimezone()
+    backend = args.backend or config["backend"]
+
+    lines = ["c51.meetings – Bereitschaftsprüfung", ""]
+    lines.append("Umgebung")
+    lines.append("  Zeit:                 %s (%s)"
+                 % (stamp.strftime("%Y-%m-%d %H:%M:%S"), stamp.tzname()))
+    lines.append("  Python:               %s (%s)"
+                 % (sys.version.split()[0], sys.executable))
+    lines.append("")
+
+    lines.append("Konfiguration")
+    lines.append("  Datei:                %s%s"
+                 % (args.config, "" if os.path.exists(args.config) else "  (fehlt)"))
+    if config_warning:
+        lines.append("  PROBLEM:              %s" % config_warning)
+    lines.append("  Backend:              %s%s"
+                 % (backend, "  (per --backend)" if args.backend else ""))
+    lines.append("  Vorschau / Nachlauf:  %d min / %d s"
+                 % (config["lookahead_minutes"], config["grace_seconds"]))
+    lines.append("  Alarm-Vorlauf:        %d s" % config["alert_lead_seconds"])
+    lines.append("  Netz-Refresh:         alle %d s" % config["refresh_seconds"])
+    lines.append("  ICS-Quellen:          %d konfiguriert" % len(config["ics_urls"]))
+    lines.append("")
+
+    lines.append("Pakete  (linke Spalte = pacman-Paketname)")
+    ok, detail = module_state("gi")
+    lines.append("  %-30s %-6s gi %s" % ("python-gobject", "ok" if ok else "FEHLT", detail))
+    for namespace, versions in EDS_NAMESPACES:
+        ok, detail = typelib_state(namespace, versions)
+        lines.append("  %-30s %-6s %s"
+                     % (typelib_package(namespace), "ok" if ok else "FEHLT", detail))
+    for module, package in (("icalendar", "python-icalendar"),
+                            ("recurring_ical_events", "python-recurring-ical-events")):
+        ok, detail = module_state(module)
+        lines.append("  %-30s %-6s %s (nur Backend ics)"
+                     % (package, "ok" if ok else "FEHLT", detail))
+    lines.append("  Typelib-Suchpfad: %s" % (", ".join(typelib_search_paths()) or "-"))
+    lines.append("")
+
+    lines.append("Google-Konto (GNOME Online Accounts)")
+    google, detail = goa_google_accounts()
+    lines.append("  Google-Konten:        %d  (%s)" % (google, detail))
+    lines.append("")
+
+    lines.append("Kalender")
+    lines.extend(diagnose_calendars(config))
+    lines.append("")
+
+    lines.append("Cache")
+    lines.extend(diagnose_cache(out_path, cache, now))
+    lines.append("")
+
+    lines.append("Beitritts-URL: welcher Pfad greift (ohne URL-Inhalt)")
+    lines.extend(diagnose_join_paths(config, backend, args, now, cache))
+
+    sys.stdout.write("\n".join(lines) + "\n")
+    return 0
+
+
+# --- entry point ------------------------------------------------------------
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog="meetings-fetch",
+        description="Write the c51.meetings event cache.")
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, metavar="PATH",
+                        help="config file (default: %s)" % DEFAULT_CONFIG_PATH)
+    parser.add_argument("--out", default=None, metavar="PATH",
+                        help="cache file (default: $XDG_RUNTIME_DIR/omarchy-meetings/events.json)")
+    parser.add_argument("--backend", choices=BACKENDS, default=None,
+                        help="override the configured backend")
+    parser.add_argument("--in-seconds", type=int, default=None, metavar="N",
+                        help="arm a test event exactly N seconds from now (any "
+                             "backend): writes inject.json next to the cache, which "
+                             "every later run merges in with a stable id until it "
+                             "ages out of grace_seconds; re-arming replaces it")
+    parser.add_argument("--refresh", action="store_true",
+                        help="force a network refresh, ignoring refresh_seconds")
+    parser.add_argument("--diagnose", action="store_true",
+                        help="print a readiness report and exit; writes nothing")
+    parser.add_argument("--print", dest="print_json", action="store_true",
+                        help="write the JSON to stdout instead of the cache file")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    now = int(time.time())
+    config, config_warning = load_config(args.config)
+    backend = args.backend or config["backend"]
+    out_path = args.out or os.path.join(runtime_dir(), CACHE_BASENAME)
+    inject_path = inject_path_for(out_path)
+    cache = load_cache(out_path)
+
+    if args.diagnose:
+        return diagnose(args, config, config_warning, out_path, cache, now)
+
+    warnings = [config_warning] if config_warning else []
+    if args.in_seconds is not None:
+        try:
+            write_inject(inject_path, now, args.in_seconds)
+        except OSError as exc:
+            sys.stderr.write("meetings-fetch: cannot write %s: %s\n"
+                             % (inject_path, _short(exc, 100)))
+            return 1
+    injected = load_inject(inject_path, now, max(config["grace_seconds"], 0))
+
+    window_start, window_end = window_for(config, now)
+    status, error, failure, stale = "ok", "", "", False
+    refreshed_at = now
+    try:
+        events, refreshed_at, failure, backend_warnings = fetch(
+            config, backend, args, now, window_start, window_end, cache)
+        warnings.extend(backend_warnings)
+        events = apply_filters(events, config, now, window_end)
+    except BackendError as exc:
+        status, error = "error", exc.message
+        events = previous_events(cache)
+        stale = bool(events)
+        refreshed_at = _int(cache.get("refreshed_at"))
+    except Exception as exc:
+        # A backend bug must still leave a readable cache behind, never a
+        # traceback on the service's stderr and an unchanged stale file.
+        status = "error"
+        error = ("Unerwarteter Fehler im Backend '%s' (%s: %s)."
+                 % (backend, type(exc).__name__, _short(exc, 100)))
+        events = previous_events(cache)
+        stale = bool(events)
+        refreshed_at = _int(cache.get("refreshed_at"))
+
+    if failure:
+        # D2, decided AFTER filtering and on the backend's own events: a partial
+        # failure that leaves nothing behind is not a usable result and must not
+        # reach the user as "no meetings today" on a status-ok cache. With events
+        # left it is only a warning -- the list is usable, just incomplete.
+        # No stale fallback here on purpose: unlike a total failure we do know
+        # that the calendars we could read are empty, and resurrecting old events
+        # would alert for meetings that may well be gone. The test marker is
+        # merged below, so arming one cannot hide a half-failed calendar read.
+        if events:
+            warnings.append(failure)
+        else:
+            status, error = "error", failure
+
+    if injected is not None:
+        events, inject_warning = merge_inject(events, injected, config, now, window_end)
+        if inject_warning:
+            warnings.append(inject_warning)
+
+    payload = build_payload(backend, status, error, " ".join(warnings), events,
+                            refreshed_at, stale, now)
+
+    if args.print_json:
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        try:
+            write_cache(out_path, payload)
+        except OSError as exc:
+            sys.stderr.write("meetings-fetch: cannot write %s: %s\n"
+                             % (out_path, _short(exc, 100)))
+            return 1
+
+    if status != "ok":
+        sys.stderr.write("meetings-fetch: %s\n" % error)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
