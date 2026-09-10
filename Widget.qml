@@ -34,6 +34,10 @@ BarWidget {
   //      block, then these defaults. Every layer tolerates junk.
   property var fileConfig: ({})
   readonly property var fileWidget: Util.isPlainObject(fileConfig.widget) ? fileConfig.widget : ({})
+  readonly property var fileColors: Util.isPlainObject(fileConfig.colors) ? fileConfig.colors : ({})
+
+  readonly property string runningColor: colorOption(fileColors.running, "#FF9500")
+  readonly property string upcomingColor: colorOption(fileColors.upcoming, "#00BEFF")
 
   readonly property int warnMinutes: numberOption("warn_minutes", fileWidget.warn_minutes, 15, 0, 1440)
   readonly property int maxTitleChars: numberOption("max_title_chars", fileWidget.max_title_chars, 28, 4, 200)
@@ -85,6 +89,8 @@ BarWidget {
   readonly property bool hasEvent: nextEvent !== null
   readonly property real secondsToStart: hasEvent ? nextEvent.start - nowSec : 0
   readonly property bool urgent: hasEvent && secondsToStart <= warnMinutes * 60
+  // The colour says which of the two states this is, not how close it is.
+  readonly property bool runningNow: hasEvent && secondsToStart <= 0
 
   readonly property string glyph: "󰃭"
   // Calm marker for a cache that parses fine but ran on fallbacks: the meeting
@@ -163,6 +169,14 @@ BarWidget {
     var n = Number(setting(key, fileValue))
     if (!isFinite(n)) return fallback
     return Math.max(min, Math.min(max, Math.round(n)))
+  }
+
+  // Only #rrggbb: an invalid colour string paints black in QML, so a typo in
+  // meetings.json must fall back to the documented default instead.
+  function colorOption(fileValue, fallback) {
+    if (fileValue === undefined || fileValue === null) return fallback
+    var text = String(fileValue).trim()
+    return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
   }
 
   function boolOption(key, fileValue, fallback) {
@@ -407,7 +421,14 @@ BarWidget {
     bar: root.bar
     text: root.labelText
     tooltipText: root.tooltipText
-    active: root.urgent
+    // Every meeting in the list is colour-coded: orange once it is running,
+    // turquoise while it is still ahead. warn_minutes keeps its job by driving
+    // the brightness — full strength inside the window, slightly held back
+    // outside it — so "soon" is still readable at a glance.
+    active: root.hasEvent
+    activeColor: root.runningNow
+      ? root.runningColor
+      : (root.urgent ? root.upcomingColor : Util.alpha(root.upcomingColor, 0.75))
     dimmed: root.degraded || !root.hasEvent
     fontSize: root.vertical ? Style.bar.iconFont : Style.font.body
     fixedHeight: root.vertical ? Style.bar.iconSlot : -1

@@ -145,7 +145,9 @@ sondern zu den eingebauten Standards (und einer Zeile im Journal).
 | `fetch_interval_seconds` | `60` | Wie oft der Service den Fetcher startet (lokales Lesen, kein Netz). |
 | `alert_lead_seconds` | `60` | So viele Sekunden vor Start kommt der Vollbild-Alarm. |
 | `auto_dismiss_seconds` | `90` | Alarm schließt sich von selbst. `0` = bleibt, bis man ihn wegklickt. |
-| `inhibit_lead_seconds` | `300` | Ab so vielen Sekunden vor Start wird ein Wayland-Idle-Inhibitor gehalten (bis `start + grace_seconds`), damit die Session nicht in den Alarm hinein sperrt. |
+| `colors.running` | `#FF9500` | Farbe für ein **laufendes** Meeting — im Bar-Eintrag und im Countdown des Vollbild-Alarms. Nur `#rrggbb`; alles andere fällt auf den Standard zurück. |
+| `colors.upcoming` | `#00BEFF` | Farbe für ein **anstehendes** Meeting, ebenfalls in Bar und Alarm. |
+| `inhibit_lead_seconds` | `600` | Ab so vielen Sekunden vor Start wird ein Wayland-Idle-Inhibitor gehalten (bis `start + grace_seconds`), damit die Session nicht in den Alarm hinein sperrt. |
 | `grace_seconds` | `300` | Nachlauf: ein Termin, dessen Start höchstens so lange her ist, wird noch alarmiert (Suspend, Sperre). Älter = nie. |
 | `sound` | `.../alarm-clock-elapsed.oga` | Wird per `pw-play` gespielt. Leerer String = kein Ton. Omarchy liefert selbst keine Sounds; die Datei kommt aus `sound-theme-freedesktop` und ist vorhanden. |
 | `notify` | `true` | Zusätzlich `omarchy-notification-send -u critical` (umgeht DND). |

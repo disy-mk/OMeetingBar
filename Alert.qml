@@ -30,11 +30,16 @@ Item {
   property string calendar: ""
   property string location: ""
   property int autoDismissSeconds: 90
+  // Defaults, so a hand-made summon without a colours block still renders.
+  property string runningColorName: "#FF9500"
+  property string upcomingColorName: "#00BEFF"
   property bool isTest: false
   // How many further alerts Service.qml still has queued behind this one.
   property int queuedCount: 0
 
   readonly property bool hasStart: root.startEpoch > 0
+  // Same split the bar entry makes: the meeting has begun, or it has not.
+  readonly property bool runningNow: root.hasStart && root.nowMs / 1000 >= root.startEpoch
   readonly property bool hasUrl: root.joinUrl !== ""
   // Only ever hand a real web URL to the browser launcher. Calendar bodies are
   // third-party data, so a file:// or javascript: "join link" is dropped
@@ -73,7 +78,10 @@ Item {
   // always fully opaque, which is what makes this a blanking alert.
   readonly property color surfaceColor: Util.alpha(Color.background, 1.0)
   readonly property color textColor: Color.notifications.text
-  readonly property color loudColor: Color.urgent
+  // The countdown and the glyph carry the state: orange once it is running,
+  // turquoise while it is still ahead. Deliberately not a theme token — these
+  // two colours are the plugin's own signal and are set in meetings.json.
+  readonly property color loudColor: root.runningNow ? root.runningColorName : root.upcomingColorName
   readonly property color mutedColor: Util.alpha(root.textColor, 0.62)
   readonly property color dimColor: Util.alpha(root.textColor, 0.48)
   readonly property color trackColor: Util.alpha(root.textColor, 0.14)
@@ -123,6 +131,12 @@ Item {
 
   function cleanText(value) {
     return String(value === undefined || value === null ? "" : value).replace(/\s+/g, " ").replace(/^ | $/g, "")
+  }
+
+  function colorOr(value, fallback) {
+    if (value === undefined || value === null) return fallback
+    var text = String(value).trim()
+    return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
   }
 
   function numberOr(value, fallback) {
@@ -218,6 +232,9 @@ Item {
     // bounded by the hard dismiss instead.
     var wantedDismiss = Math.max(0, Math.round(root.numberOr(payload.auto_dismiss, 90)))
     root.autoDismissSeconds = wantedDismiss > 0 ? Math.min(wantedDismiss, root.hardDismissSeconds) : 0
+    var palette = Util.isPlainObject(payload.colors) ? payload.colors : ({})
+    root.runningColorName = root.colorOr(palette.running, "#FF9500")
+    root.upcomingColorName = root.colorOr(palette.upcoming, "#00BEFF")
     root.isTest = payload.test === true
     root.queuedCount = Math.max(0, Math.round(root.numberOr(payload.queued, 0)))
 

@@ -57,6 +57,7 @@ supply these defaults and never crash on a missing/broken file:
   "fetch_interval_seconds": 60,
   "alert_lead_seconds": 60,
   "auto_dismiss_seconds": 90,
+  "colors": { "running": "#FF9500", "upcoming": "#00BEFF" },
   "inhibit_lead_seconds": 600,
   "grace_seconds": 300,
   "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
@@ -84,6 +85,11 @@ Semantics:
   `inhibit_lead_seconds` before the meeting, it is already locked when the inhibitor would go up,
   and no third-party overlay can draw over `WlSessionLock`. The alert is then queued and shown at
   the unlock (see the state file), within `grace_seconds`.
+- `colors.running` / `colors.upcoming` — the plugin colour-codes exactly two states, and both the
+  bar entry and the fullscreen alert use the same two values, so the colour means the same thing
+  wherever it appears: a meeting that has started is `running`, one that has not is `upcoming`.
+  Only `#rrggbb` is accepted — an invalid colour string paints black in QML, so anything else falls
+  back to the default. These are deliberately not theme tokens: they are the plugin's own signal.
 - `auto_dismiss_seconds` — 0 means "stay until dismissed", bounded by the overlay's 600 s hard
   dismiss (see the overlay contract).
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
@@ -210,7 +216,8 @@ function close() { }
 Payload:
 ```json
 { "title": "…", "start": 1757503200, "end": 1757505000, "url": "…", "calendar": "…",
-  "location": "…", "auto_dismiss": 90, "test": false }
+  "location": "…", "auto_dismiss": 90,
+  "colors": { "running": "#FF9500", "upcoming": "#00BEFF" }, "test": false }
 ```
 
 Requirements:
@@ -246,8 +253,10 @@ Requirements:
 - Reads the cache and config itself via `FileView` (`watchChanges: true`, and
   `onFileChanged: reload()` — it does **not** auto-reload). Watch the parent *directory* too,
   because the cache may not exist yet.
-- Renders e.g. `󰃭 14:00 Standup · 12m`; switches to the theme's urgent/attention color inside
-  `widget.warn_minutes`; truncates the title to `widget.max_title_chars`;
+- Renders e.g. `󰃭 14:00 Standup · 12m` in `colors.upcoming`, switching to `colors.running` once the
+  meeting has started. `widget.warn_minutes` no longer decides *whether* there is colour — it drives
+  the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
+  at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
   collapses to zero width when there is nothing (if `hide_when_empty`).
 - Click → join the meeting URL when there is one, otherwise `preview` the alert.
 - Shows a clear degraded state when the cache is missing or `status != "ok"` (e.g. a dim `󰃭 —`),

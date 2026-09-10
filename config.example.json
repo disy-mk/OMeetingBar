@@ -6,6 +6,10 @@
   "fetch_interval_seconds": 60,
   "alert_lead_seconds": 60,
   "auto_dismiss_seconds": 90,
+  "colors": {
+    "running": "#FF9500",
+    "upcoming": "#00BEFF"
+  },
   "inhibit_lead_seconds": 600,
   "grace_seconds": 300,
   "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",

@@ -62,7 +62,11 @@ Item {
     grace_seconds: 300,
     sound: "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
     notify: true,
-    wake_display: true
+    wake_display: true,
+    // The two states the whole plugin colour-codes: a meeting that has started
+    // and one that has not. Both the bar entry and the fullscreen alert use
+    // these, so the colour means the same thing wherever it shows up.
+    colors: ({ running: "#FF9500", upcoming: "#00BEFF" })
   })
 
   property var config: ({})
@@ -80,6 +84,8 @@ Item {
   readonly property int inhibitLeadSeconds: intConfig("inhibit_lead_seconds", 0, 7200)
   readonly property int graceSeconds: intConfig("grace_seconds", 0, 3600)
   readonly property string soundPath: stringConfig("sound")
+  readonly property string runningColor: colorConfig("running", "#FF9500")
+  readonly property string upcomingColor: colorConfig("upcoming", "#00BEFF")
   readonly property bool notifyEnabled: boolConfig("notify")
   readonly property bool wakeDisplayEnabled: boolConfig("wake_display")
 
@@ -202,6 +208,16 @@ Item {
   function stringConfig(key) {
     var value = configValue(key)
     return value === undefined || value === null ? "" : String(value)
+  }
+
+  // Only #rrggbb is accepted: a typo must fall back to the documented default
+  // rather than reach QML as an invalid colour, which paints black.
+  function colorConfig(key, fallback) {
+    var group = configValue("colors")
+    var value = Util.isPlainObject(group) ? group[key] : undefined
+    if (value === undefined || value === null) return fallback
+    var text = String(value).trim()
+    return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
   }
 
   function applyConfig(raw) {
@@ -750,6 +766,7 @@ Item {
       calendar: entry.calendar,
       location: entry.location,
       auto_dismiss: root.autoDismissSeconds,
+      colors: ({ running: root.runningColor, upcoming: root.upcomingColor }),
       test: isTest === true
     }
     // True means the host accepted the summon, not that anything is on screen.
