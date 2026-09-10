@@ -66,7 +66,15 @@ DEFAULTS = {
     "calendars_exclude": [],
 }
 
-CONNECT_TIMEOUT_SECONDS = 30
+# ECal.Client.connect_sync's wait_for_connected_seconds is not an upper bound —
+# it is waited out in FULL whenever the backend never reports itself connected,
+# which is what Google CalDAV sources do here. Measured on 2026-09-10: 30 s per
+# calendar (60 s for two, over the service's 45 s watchdog), while 1 s returns a
+# client that reads every instance correctly. Keep this at 1: the cost is paid
+# per calendar, and the data comes from EDS's local cache either way.
+# 0 is deliberately not used — it is not documented as "no wait" and hung in
+# testing.
+CONNECT_TIMEOUT_SECONDS = 1
 ICS_TIMEOUT_SECONDS = 20
 MAX_ICS_BYTES = 8 * 1024 * 1024
 MAX_DIAGNOSE_EVENTS = 5

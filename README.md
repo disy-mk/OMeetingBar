@@ -78,7 +78,11 @@ cd ~/.config/omarchy/plugins/c51.meetings
   also führt das Script es nicht aus),
 - registriert das Plugin: `omarchy-shell shell rescanPlugins`, dann
   `omarchy plugin enable c51.meetings`, und prüft das Ergebnis mit
-  `omarchy plugin list --json`.
+  `omarchy plugin list --json`,
+- legt `~/.local/bin/meetings-fetch` an — einen Wrapper, damit der Fetcher aus jedem
+  Verzeichnis aufrufbar ist (`meetings-fetch --diagnose` statt Pfad tippen). Absichtlich
+  ohne `omarchy-`-Präfix, weil die omarchy-CLI `omarchy <gruppe> <aktion>` auf
+  `omarchy-<gruppe>-<aktion>` im PATH auflöst und das hier kein First-Party-Befehl ist.
 
 Danach von Hand:
 
@@ -110,7 +114,7 @@ GOA legt das Konto als Collection-Source in `evolution-data-server` an; die Kale
 erscheinen als CalDAV-Kindquellen darunter. Prüfen mit:
 
 ```bash
-./bin/meetings-fetch --diagnose
+meetings-fetch --diagnose
 ```
 
 Erst wenn dort Kalender auftauchen, das Backend umstellen:
@@ -172,10 +176,10 @@ omarchy-shell meetings preview    # Alarm für den echten nächsten Termin, ohne
 omarchy-shell meetings refresh    # Fetcher jetzt laufen lassen
 omarchy-shell meetings dismiss    # Alarm wegschalten
 
-./bin/meetings-fetch --diagnose   # Pakete, Typelibs, GOA-Konten, gefundene Kalender,
+meetings-fetch --diagnose   # Pakete, Typelibs, GOA-Konten, gefundene Kalender,
                                   # Alter des letzten Syncs — ohne Termininhalte
-./bin/meetings-fetch --print      # Cache-JSON nach stdout statt in die Cache-Datei
-./bin/meetings-fetch --backend demo --in-seconds 20   # Termin in 20 s erzeugen
+meetings-fetch --print      # Cache-JSON nach stdout statt in die Cache-Datei
+meetings-fetch --backend demo --in-seconds 20   # Termin in 20 s erzeugen
 
 journalctl --user -t omarchy-shell -f    # QML-Fehler und Zustandswechsel
 quickshell log -f                        # dasselbe Log direkt von Quickshell

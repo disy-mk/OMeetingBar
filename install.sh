@@ -132,6 +132,37 @@ if (( ${#missing_packages[@]} )); then
   demo_advised=1
 fi
 
+# -------------------------------------------------------------- path wrapper
+
+# The fetcher lives inside the plugin dir, which nobody wants to type. A wrapper
+# on PATH makes `meetings-fetch --diagnose` work from anywhere. Not named
+# omarchy-* on purpose: the omarchy CLI resolves `omarchy <group> <action>` to
+# omarchy-<group>-<action> on PATH, and this is not a first-party command.
+step "Wrapper auf PATH"
+WRAPPER="$HOME/.local/bin/meetings-fetch"
+wrapper_body="#!/usr/bin/env bash
+# Thin wrapper for the $PLUGIN_ID event fetcher, so it is reachable from any
+# directory. Deliberately not named omarchy-*: the omarchy CLI resolves
+# \`omarchy <group> <action>\` to omarchy-<group>-<action> on PATH, and this is
+# not a first-party command. Written by install.sh — edit it there.
+set -euo pipefail
+exec /usr/bin/python3 \"\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/meetings-fetch\" \"\$@\"
+"
+# Both sides go through command substitution so the trailing newline is stripped
+# from each: comparing against $wrapper_body directly never matches.
+if [[ -e $WRAPPER ]] && [[ $(cat "$WRAPPER" 2>/dev/null) == "$(printf '%s' "$wrapper_body")" ]]; then
+  say "  $WRAPPER ist aktuell"
+elif (( DRY_RUN )); then
+  say "  would write $WRAPPER (mode 0755)"
+else
+  say "  schreibe $WRAPPER"
+  install -Dm755 /dev/stdin "$WRAPPER" <<<"$wrapper_body"
+fi
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) : ;;
+  *) warn "$HOME/.local/bin liegt nicht auf dem PATH — der Wrapper ist dann nicht aufrufbar." ;;
+esac
+
 # ------------------------------------------------------------- registration
 
 # Enabling a bar-widget plugin inserts it into bar.layout.<defaultSection>, and

@@ -283,8 +283,8 @@ Requirements:
   `/usr/lib/qt6/qml/Quickshell/Io/quickshell-io.qmltypes`). The outcome (`ok`/`failed`/`timeout`)
   is logged once and reported through `status`, and the next interval simply retries. Without the
   watchdog a single hung fetcher holds the re-entrancy guard forever and the cache silently stops
-  updating: `ECal.Client.connect_sync` waits up to 30 s *per calendar*, and the `ics` backend
-  talks to the network.
+  updating. Note the watchdog is a backstop, not the fix for a slow backend: see the
+  `wait_for_connected_seconds` note below, and remember the `ics` backend talks to the network.
 - **Firing** the next event (invariant 1) when `start - now <= alert_lead_seconds` and
   `now - start <= grace_seconds` and its id is not in `notified`. All-day events are skipped here
   unconditionally (invariant 4).
@@ -403,7 +403,14 @@ Verified API recipe — follow it exactly:
   `Calendar` extension** (backend `caldav`).
 - Use `registry.check_enabled(source)` — **not** `source.get_enabled()`, which returns true even
   when the parent account is disabled.
-- `client = ECal.Client.connect_sync(source, ECal.ClientSourceType.EVENTS, 30, None)`.
+- `client = ECal.Client.connect_sync(source, ECal.ClientSourceType.EVENTS, 1, None)`. The third
+  argument, `wait_for_connected_seconds`, is **not an upper bound** — it is waited out in FULL
+  whenever the backend never reports itself connected, which is what these Google CalDAV sources
+  do. Measured on 2026-09-10 with two calendars: 30 s each, 60 s total, over the 45 s watchdog, so
+  every service fetch was killed while a manual run right after an account sync returned instantly
+  (the intermittency is what made this look like a deadlock). With `1` the same code returns every
+  instance in ~2 s cold and ~0.15 s warm. The cost is paid per calendar, so keep it at 1; `0` is
+  not documented as "no wait" and hung in testing.
 - Expand occurrences with `client.generate_instances_sync(start_epoch, end_epoch, None, cb)` —
   plain `time_t` seconds. `get_object_list_as_comps_sync` does **not** expand recurrences.
 - In the callback `cb(icomp, instance_start, instance_end, user_data)` use the **instance**
@@ -418,10 +425,15 @@ Verified API recipe — follow it exactly:
   first `https://meet.google.com/…`, `https://…zoom.us/j/…`, `https://teams.microsoft.com/l/…`,
   `https://…webex.com/…` match in `LOCATION`, then in `DESCRIPTION`. Do **not** prefer the
   iCalendar `URL` property (for Google events that is the calendar web page, not the room).
-  Note that whether Google's CalDAV emits `CONFERENCE`/`X-GOOGLE-CONFERENCE` is unverified, so the
-  regex path over DESCRIPTION is the real implementation, and `--diagnose` must be able to show
-  which path matched.
+  Verified on 2026-09-10 against this account: Google's CalDAV **does** emit
+  `X-GOOGLE-CONFERENCE`, and it matched on every event in the window, so the X-property is the
+  path that actually carries the Meet link here. The DESCRIPTION regex stays as the fallback for
+  accounts or events that lack it, and `--diagnose` reports which path matched (path name only,
+  never the URL).
 - `skip_declined`: drop events where the account's own `ATTENDEE` `PARTSTAT` is `DECLINED`.
+  Verified against real data on 2026-09-10: the account identity resolves from
+  `Collection.get_identity()`, and a declined invitation was correctly absent from the cache while
+  the three accepted events in the same window were present.
 
 ### backend `ics`
 
