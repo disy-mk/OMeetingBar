@@ -1,11 +1,11 @@
-# c51.meetings — implementation contract (authoritative)
+# OMeetingBar (`io.github.disy-mk.omeetingbar`) — implementation contract (authoritative)
 
 A MeetingBar replacement for Omarchy: a bar widget showing the next meeting, and a
 **fullscreen blanking alert** shortly before it starts, for a user who does not notice
 ordinary notifications.
 
-Plugin dir (also the git repo): `~/.config/omarchy/plugins/c51.meetings/`
-Plugin id: `c51.meetings` (ids starting with `omarchy.` are rejected by the host).
+Plugin dir (also the git repo): `~/.config/omarchy/plugins/io.github.disy-mk.omeetingbar/`
+Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rejected by the host).
 
 ## Files
 
@@ -16,8 +16,8 @@ Plugin id: `c51.meetings` (ids starting with `omarchy.` are rejected by the host
 | `Alert.qml` | `overlay` | the fullscreen alert surface |
 | `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
 | `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
-| `bin/meetings-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
-| `config.example.json` | — | copied to `~/.config/omarchy/meetings.json` on install |
+| `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
+| `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
 | `README.md` | — | user-facing docs incl. the Google Workspace setup |
 
@@ -30,8 +30,12 @@ Five questions every file has to answer the same way. They are written out once,
 consumer that answers one of them on its own silently disagrees with the other two.
 
 1. **Next event** = the first event in `start` order with `max(end, start) > now` — *not over yet*,
-   not *not started yet*. A meeting that is running is still the next meeting. Widget, service and
-   alert all use this expression.
+   not *not started yet*. A meeting that is running is still the next meeting. Over the **whole
+   agenda** this is `status.next` and the popup's notion of next; the bar label, the popup hero and
+   `preview` speak for the **alertable view** of the same list (no all-day, no declined while
+   `skip_declined`, not over), so they can legitimately name a different meeting than `status.next`.
+   "Over" is `max(end, start) <= now` on every surface, `isAlertable()` included — a zero-length
+   occurrence (invariant 2's fallback) is therefore over the second it starts, everywhere.
 2. **`end` is the fetcher's word.** No consumer invents a duration. A missing, non-numeric or
    reversed `end` collapses to `end = start` (a zero-length occurrence, which by rule 1 stays
    visible until its start has passed) — never to `start + <any guessed length>`.
@@ -42,7 +46,8 @@ consumer that answers one of them on its own silently disagrees with the other t
    `javascript:` nor an argument containing whitespace may ever reach a browser command line.
 4. **All-day events never take the alert path.** An all-day entry has no meaningful start moment,
    so the service skips it when firing regardless of `skip_all_day`; that option only decides
-   whether all-day entries reach the cache and the widget at all.
+   whether all-day entries reach the cache and the popup's agenda rows. The bar label never shows
+   an all-day entry — it speaks for the alertable view (invariant 1).
 5. **The cache is the agenda, not a list of alert candidates.** Since schema 2 it holds the whole
    two-day agenda — events that are already over, and declined ones (flagged, not dropped) — because
    the popup shows them. The invariant the fetcher used to enforce for everyone therefore moved into
@@ -52,12 +57,14 @@ consumer that answers one of them on its own silently disagrees with the other t
    still listed, struck through, in the agenda; off, a declined meeting is treated like any other. Every alert-side path goes through it — `dueEvent`,
    `requeueUnshown`, `updateInhibit`, `nextAlertableEvent`, and `dropCancelledAlerts` (where
    "present in the cache" becomes "present **and** still alertable", so declining a meeting still
-   withdraws its queued alert). Nothing else may iterate the event list to decide whether to alert.
+   withdraws its queued alert). Nothing else may iterate the event list to decide whether to alert — the queue included:
+   `drainQueue` re-checks the head against the live cache entry right before every summon, so an
+   alert queued under the lock for a meeting that has since ended is withdrawn, not shown.
    `meetings status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
    a wrong decision is diagnosable instead of invisible. `declined` is eds-only: the `ics` and
    `demo` backends always write `false`, which is correct rather than a bug.
 
-## Config — `~/.config/omarchy/meetings.json`
+## Config — `~/.config/omarchy/omeetingbar.json`
 
 Single source of truth, read by the fetcher AND by the QML. Every key optional; code must
 supply these defaults and never crash on a missing/broken file:
@@ -116,9 +123,9 @@ Semantics:
   measured to move the agenda end by ±1 h — losing tomorrow's late meetings, or leaking a
   day-after-tomorrow meeting into the "Morgen" section.
 
-## Event cache — `$XDG_RUNTIME_DIR/omarchy-meetings/events.json`
+## Event cache — `$XDG_RUNTIME_DIR/omeetingbar/events.json`
 
-Written **only** by `bin/meetings-fetch`: mode 0600, atomic (tmp in the same dir + `os.replace`),
+Written **only** by `bin/omeetingbar-fetch`: mode 0600, atomic (tmp in the same dir + `os.replace`),
 dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
 
 ```json
@@ -164,7 +171,7 @@ dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
 - **Privacy**: only the fields above. No attendees, no description, no organizer. Never log event
   content to stdout/journal beyond counts.
 
-## Alert state — `$XDG_RUNTIME_DIR/omarchy-meetings/state.json`
+## Alert state — `$XDG_RUNTIME_DIR/omeetingbar/state.json`
 
 Written by `Service.qml` (FileView `setText`), mode 0600 best effort. It survives a plugin
 hot-reload (which re-mounts the service and would otherwise re-fire everything) and a shell
@@ -212,17 +219,18 @@ restart during a lock.
 
 ## IPC
 
-`Service.qml` registers `IpcHandler { target: "meetings" }` (must not collide with the
+`Service.qml` registers `IpcHandler { target: "omeetingbar" }` (must not collide with the
 first-party targets: shell, bar, idle, lock, notifications, background, nightlight, osd,
 image-selector, omarchy.indicators). All args and returns are **strings**.
 
 | Call | Effect |
 |---|---|
-| `omarchy-shell meetings status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths |
-| `omarchy-shell meetings refresh` | run the fetcher now |
-| `omarchy-shell meetings test` | show a synthetic alert immediately (no calendar needed) |
-| `omarchy-shell meetings preview` | show the alert for the real next event, without touching `notified`/`shown` |
-| `omarchy-shell meetings dismiss` | hide the alert |
+| `omarchy-shell omeetingbar status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths |
+| `omarchy-shell omeetingbar refresh` | run the fetcher now |
+| `omarchy-shell omeetingbar test` | show a synthetic alert immediately (no calendar needed) |
+| `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
+| `omarchy-shell omeetingbar dismiss` | hide the alert |
+| `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed to the widget on the focused monitor (`Widget.qml`'s handler) — the target to bind a Hyprland key to |
 
 ## Overlay contract — `Alert.qml`
 
@@ -278,15 +286,22 @@ Requirements:
   meeting has started. `widget.warn_minutes` no longer decides *whether* there is colour — it drives
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
   at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
-  collapses to zero width when there is nothing (if `hide_when_empty`).
+  collapses to zero width only when the whole agenda is empty (if `hide_when_empty`): while today
+  or tomorrow still hold entries it stays as a dimmed `󰃭 —`, because the left click is the popup's
+  mouse entry point and "what did I have today, what is tomorrow" is exactly the evening question.
 - Left click → toggle the agenda popup. Right and middle click → refresh. **No click opens the
   fullscreen alert**: it exists to interrupt someone who is not looking at the bar, so whoever just
   clicked it has already seen the meeting. `preview` remains an IPC diagnostic only. Joining moved
   into the popup (a row click, and a footer action).
-- The widget hosts the popup and must satisfy the bar's panel contract, or the bar can neither route
-  hotkeys to it nor light the open-panel indicator: expose `opened`, `open()`, `close()`,
-  `toggle()`, `closeForPopoutSwitch()`, `popoutSwitchClosing` and `openPanelIndicatorWidth`, and make
-  the `KeyboardPanel`'s `owner` the `BarWidget` root — not the popup object.
+- The widget hosts the popup and satisfies the bar's panel contract (`opened`, `open()`, `close()`,
+  `toggle()`, `closeForPopoutSwitch()`, `popoutSwitchClosing`, `openPanelIndicatorWidth`; the
+  `KeyboardPanel`'s `owner` is the `BarWidget` root). Two consequences of the plugin's `overlay` kind
+  follow from that and are handled, not wished away: (a) the bar's positional panel hotkey resolves
+  the plugin by manifest kind and reaches `Alert.open("{}")` — so `Alert.qml` refuses to blank for a
+  payload without a start; (b) the bar instantiates the widget once per monitor and Quickshell keeps
+  only the first `IpcHandler` registration, so the `omeetingbar-agenda` handler never acts on its own
+  instance but routes through `bar.summonBarWidget/hideBarWidget/isBarWidgetOpen(moduleName)`, which
+  picks the widget on the focused screen.
 - The widget keeps reading the cache and the config; the popup renders what it is handed. `events`
   is the full agenda, while the bar label, its colour, the tooltip and "next meeting" all come from
   an alertable-filtered view of it (no declined, no all-day, not over), so their meaning is
@@ -305,8 +320,8 @@ Requirements:
 
 Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `anchorItem`,
 `hostWidget` and the data. The popup renders; the host acts. It calls back only through the host
-(`hostWidget.join(url)`, `hostWidget.requestRefresh()`, `hostWidget.openUrl(url)`,
-`hostWidget.close()`), so exactly one file talks to the outside world.
+(`hostWidget.join(url)`, `hostWidget.requestRefresh()`, `hostWidget.openUrl(url)`), so exactly one
+file talks to the outside world.
 
 - The surface is `Ui.KeyboardPanel` (from `qs.Ui`) anchored to the widget's `WidgetButton`. It owns
   the card, border, padding, fade, outside-click and per-output dismissal and the focus prime —
@@ -315,11 +330,17 @@ Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `an
   again.
 - Body: `PanelKeyCatcher` → `Flickable` (clip, `StopAtBounds`, `interactive: contentHeight > height`)
   → `Column { spacing: Style.space(14) }` of: `PanelHero` (next meeting, countdown, refresh action),
-  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT.` section, the same for `MORGEN`,
-  the degraded/empty message, `PanelSeparator`, the footer action rows.
+  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT.` section, `PanelSeparator`, the
+  same for `MORGEN`, the degraded/empty message, `PanelSeparator`, the footer action rows.
 - Rows are `CursorSurface`, and the panel owns the cursor state (`cursorActive`, `focusSection`,
   `selectedIndex`); a row must never colour itself from `containsMouse`, or mouse and keyboard show
-  two highlights at once. Row states: finished → 45 % opacity, running → `current` + bold + the
+  two highlights at once. Hover goes through `Ui/PointerMoveGate` (reset on every keyboard move):
+  Qt re-delivers hover to whatever a keyboard scroll slides under a stationary pointer, and without
+  the gate `j`/`k` could not cross the viewport edge while the mouse rested on the list. A keyboard
+  move sets one `revealPending` token that the newly selected row consumes (deferred, because a
+  freshly created row reports `y = 0` until the Column's polish), so Repeater rebuilds under an open
+  popup never scroll. Cursor transitions toggle `cursorActive` off and on around the two writes, so
+  no row is selected with the old index in the new section for a frame. Row states: finished → 45 % opacity, running → `current` + bold + the
   running colour, declined → `font.strikeout` (lowercase "o"; it leaves `implicitWidth` untouched).
 - The timeline strip carries **no hour numbers**, and that is a deliberate scar rather than an
   omission: any `Text` in that axis row — even a constant string with no geometry of its own — put
@@ -350,8 +371,8 @@ Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `an
   `Date.now()` wall clock each tick. No long one-shot timers, no `systemd-run --on-active`
   (CLOCK_MONOTONIC, paused across suspend → fires late). If the wall clock jumped more than 15 s
   between ticks (suspend/resume or a clock correction), force a fetch immediately.
-- **Fetch**: `Process` running `/usr/bin/python3 <pluginDir>/bin/meetings-fetch` — resolve the
-  plugin dir with `String(Qt.resolvedUrl("bin/meetings-fetch")).replace(/^file:\/\//, "")`.
+- **Fetch**: `Process` running `/usr/bin/python3 <pluginDir>/bin/omeetingbar-fetch` — resolve the
+  plugin dir with `String(Qt.resolvedUrl("bin/omeetingbar-fetch")).replace(/^file:\/\//, "")`.
   Always the absolute `/usr/bin/python3`, never a bare `python3` (mise/pyenv shims lack `gi`).
   Re-entrancy guard (`if (proc.running) return`). Run at startup, every
   `fetch_interval_seconds`, on wall-clock jumps, and on IPC `refresh`.
@@ -400,7 +421,7 @@ Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `an
   unsafe one; `Util.execArgv` is safe.
 - Log at most one line per state change to the journal, without event titles.
 
-## Environment facts (verified — do not re-derive, do not "fix")
+## Environment facts (the author's reference machine — verified there, do not re-derive)
 
 - Omarchy 4.0.x, Hyprland 0.56.2, Quickshell 0.3.1, Qt 6.11.2, systemd 261, Europe/Berlin, NTP on.
 - Monitors: eDP-1 3200x2000@120 scale 1.6, DP-1 5120x2160@60 scale 1.25.
@@ -415,7 +436,7 @@ Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `an
   `/run/user/1000/quickshell/by-id/<id>/log.qslog` (`quickshell log -f`).
 - Saving any file under `~/.config/omarchy/plugins/` triggers a plugin reload, but — measured on
   2026-09-10 on this machine — that reload does **not** replace the running third-party *service*
-  instance with the new code: `omarchy-shell meetings status` kept returning the old schema after
+  instance with the new code: `omarchy-shell omeetingbar status` kept returning the old schema after
   the file change, after `omarchy-shell shell rescanPlugins`, and after clearing
   `~/.cache/quickshell/qmlcache`. Only `omarchy restart shell` loads changed service code.
   Config changes do apply immediately (the config is read through a `FileView`).
@@ -427,9 +448,9 @@ Not an entry point: `Widget.qml` loads it with a `Loader` and injects `bar`, `an
 - `libical` 4.0.5 ships `ICalGLib-4.0.typelib`, `evolution-data-server` ships `ECal-2.0` and
   `EDataServer-1.2` (both from `pacman -Fl`).
 
-## Event source — `bin/meetings-fetch`
+## Event source — `bin/omeetingbar-fetch`
 
-CLI: `meetings-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [--in-seconds N]
+CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [--in-seconds N]
 [--refresh] [--diagnose] [--print]`
 - `--in-seconds N`: inject one synthetic event starting N seconds from now, so the alert path can
   be tested deterministically on whatever backend is configured (see *Test injection* below).
@@ -440,13 +461,13 @@ CLI: `meetings-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [--in
 
 ### Test injection — `--in-seconds`
 
-`omarchy-shell meetings test` only draws the overlay; it proves the surface renders, not that the
+`omarchy-shell omeetingbar test` only draws the overlay; it proves the surface renders, not that the
 alert *fires*. The real path — cache → service tick → notification → summon → state file — is
 tested with an injected event:
 
 ```
-./bin/meetings-fetch --in-seconds 45      # writes the cache and the inject marker
-omarchy-shell meetings status             # next event is the synthetic one
+./bin/omeetingbar-fetch --in-seconds 45      # writes the cache and the inject marker
+omarchy-shell omeetingbar status             # next event is the synthetic one
 # the service picks the new cache up at once and fires alert_lead_seconds before that start
 ```
 

@@ -1,8 +1,8 @@
 #!/usr/bin/python3
-"""Event source for the omarchy shell plugin `c51.meetings`.
+"""Event source for OMeetingBar, an omarchy shell plugin.
 
 Reads the user's calendar and writes the event cache the QML side polls:
-`$XDG_RUNTIME_DIR/omarchy-meetings/events.json`, mode 0600, replaced atomically.
+`$XDG_RUNTIME_DIR/omeetingbar/events.json`, mode 0600, replaced atomically.
 
 Three backends:
 
@@ -51,7 +51,7 @@ import urllib.request
 SCHEMA_VERSION = 2
 BACKENDS = ("eds", "ics", "demo")
 
-DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/meetings.json")
+DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/omarchy/omeetingbar.json")
 CACHE_BASENAME = "events.json"
 GOA_ACCOUNTS_PATH = os.path.expanduser("~/.config/goa-1.0/accounts.conf")
 
@@ -87,6 +87,8 @@ MAX_DIAGNOSE_EVENTS = 5
 # absurd lookahead_minutes really does ask EDS to expand recurrences into the
 # year 1.9 million. 30 days is far past anything the widget or the alert can use.
 MAX_LOOKAHEAD_MINUTES = 30 * 24 * 60
+# Six hours already covers any suspend or lock worth alerting after.
+MAX_GRACE_SECONDS = 6 * 3600
 
 # Exactly the three packages README.md and install.sh name, in the same order,
 # so the sentence the user reads here is the command they can paste.
@@ -183,7 +185,7 @@ def human_delta(seconds):
 
 def runtime_dir():
     base = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
-    return os.path.join(base, "omarchy-meetings")
+    return os.path.join(base, "omeetingbar")
 
 
 # --- configuration ----------------------------------------------------------
@@ -236,6 +238,9 @@ def load_config(path):
         warnings.append("lookahead_minutes ist auf %d min (30 Tage) begrenzt."
                         % MAX_LOOKAHEAD_MINUTES)
         config["lookahead_minutes"] = MAX_LOOKAHEAD_MINUTES
+    if config["grace_seconds"] > MAX_GRACE_SECONDS:
+        warnings.append("grace_seconds ist auf %d s (6 Stunden) begrenzt." % MAX_GRACE_SECONDS)
+        config["grace_seconds"] = MAX_GRACE_SECONDS
     return config, " ".join(warnings)
 
 
@@ -330,7 +335,7 @@ def apply_filters(events, config, now, window_end):
     min_seconds = config["min_duration_minutes"] * 60
 
     kept = []
-    seen = set()
+    seen = {}
     for event in events:
         if config["skip_all_day"] and event["all_day"]:
             continue
@@ -345,9 +350,20 @@ def apply_filters(events, config, now, window_end):
         # to the next agenda, not to this one's "Morgen" section.
         if event["start"] >= window_end:
             continue
-        if event["id"] in seen:
+        previous = seen.get(event["id"])
+        if previous is not None:
+            # The same occurrence from two calendars (own + a subscribed team
+            # calendar). EDS hands them over sorted by calendar display name, so
+            # "first wins" made the declined flag -- and with it whether the
+            # fullscreen alert fires -- depend on how the calendars are named.
+            # Merge instead: a decline recorded on any copy counts, and the
+            # first non-empty join URL is kept.
+            if event["declined"] and not previous["declined"]:
+                previous["declined"] = True
+            if not previous["url"] and event["url"]:
+                previous["url"] = event["url"]
             continue
-        seen.add(event["id"])
+        seen[event["id"]] = event
         kept.append(event)
 
     kept.sort(key=lambda event: (event["start"], event["id"]))
@@ -388,7 +404,7 @@ def previous_events(cache):
             # Load-bearing: without this key a backend failure would rebuild a
             # declined meeting as a normal one and blank the screen for a
             # meeting the user has already said no to.
-            "declined": bool(item.get("declined")),
+            "declined": item.get("declined") is True,
             "url": str(item.get("url") or ""),
             "calendar": str(item.get("calendar") or ""),
             "location": str(item.get("location") or ""),
@@ -452,8 +468,8 @@ def _unlink(path):
 # --- injected test event (--in-seconds) -------------------------------------
 
 INJECT_BASENAME = "inject.json"
-INJECT_UID = "c51-meetings-inject"
-INJECT_TITLE = "TEST-Termin (c51.meetings)"
+INJECT_UID = "omeetingbar-inject"
+INJECT_TITLE = "TEST-Termin (OMeetingBar)"
 INJECT_CALENDAR = "Test"
 INJECT_LOCATION = "Arbeitszimmer"
 INJECT_URL = "https://meet.google.com/tst-test-tst"
@@ -561,7 +577,7 @@ def demo_events(now):
         url, path = pick_join_url("", "", location, link)
         # The uid is date-free: the start already varies per day, and the id
         # mixes both, so ids stay stable within a day and differ across days.
-        uid = "c51-meetings-demo-%s" % re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        uid = "omeetingbar-demo-%s" % re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
         events.append(make_event(uid, title, start, start + minutes * 60, all_day,
                                  url, DEMO_CALENDAR, location, path))
     return events
@@ -593,7 +609,7 @@ def _network_detail(exc):
 
 
 def _http_get_ics(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "omarchy-c51-meetings/1"})
+    request = urllib.request.Request(url, headers={"User-Agent": "omeetingbar/1"})
     opener = urllib.request.build_opener(HttpsOnlyRedirectHandler)
     with opener.open(request, timeout=ICS_TIMEOUT_SECONDS) as response:
         payload = response.read(MAX_ICS_BYTES + 1)
@@ -637,6 +653,13 @@ def ics_component_to_event(component, calendar_name):
         return None
     end_value = getattr(_ics_property(component, "DTEND"), "dt", None)
     end = _dt_to_epoch(end_value)
+    if end is None:
+        # RFC 5545 allows DURATION instead of DTEND; a feed that uses it would
+        # otherwise produce zero-length occurrences that every surface treats
+        # as over the second they start.
+        duration = getattr(_ics_property(component, "DURATION"), "dt", None)
+        if isinstance(duration, datetime.timedelta):
+            end = start + int(duration.total_seconds())
     all_day = isinstance(start_value, datetime.date) and not isinstance(start_value, datetime.datetime)
     location = _ics_text(component, "LOCATION")
     url, path = pick_join_url(_ics_text(component, "CONFERENCE"),
@@ -1219,13 +1242,17 @@ def diagnose_join_paths(config, backend, args, now, cache):
         return ["  Backend-Fehler: %s" % exc.message]
     except Exception as exc:
         return ["  unerwarteter Fehler: %s: %s" % (type(exc).__name__, _short(exc, 80))]
-    events = apply_filters(events, config, now, window_end)
+    # Since schema 2 the agenda starts at local midnight, so without this the
+    # report would describe the morning's finished meetings and never reach
+    # the one being diagnosed.
+    events = [event for event in apply_filters(events, config, now, window_end)
+              if max(event["end"], event["start"]) > now]
     lines = ["  Hinweis: %s" % note for note in ([failure] if failure else []) + warnings]
     for index, event in enumerate(events[:MAX_DIAGNOSE_EVENTS], start=1):
         lines.append("  Termin %d: %s%s" % (index, event["_join_path"],
                                             "" if event["url"] else "  (keine Beitritts-URL)"))
     if not events:
-        lines.append("  keine Termine im Vorschaufenster")
+        lines.append("  keine anstehenden Termine im Fenster")
     else:
         lines.append("  (%d Termine im Fenster, angezeigt: %d)"
                      % (len(events), min(len(events), MAX_DIAGNOSE_EVENTS)))
@@ -1236,7 +1263,7 @@ def diagnose(args, config, config_warning, out_path, cache, now):
     stamp = datetime.datetime.fromtimestamp(now).astimezone()
     backend = args.backend or config["backend"]
 
-    lines = ["c51.meetings – Bereitschaftsprüfung", ""]
+    lines = ["OMeetingBar – Bereitschaftsprüfung", ""]
     lines.append("Umgebung")
     lines.append("  Zeit:                 %s (%s)"
                  % (stamp.strftime("%Y-%m-%d %H:%M:%S"), stamp.tzname()))
@@ -1298,12 +1325,12 @@ def diagnose(args, config, config_warning, out_path, cache, now):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(
-        prog="meetings-fetch",
-        description="Write the c51.meetings event cache.")
+        prog="omeetingbar-fetch",
+        description="Write the OMeetingBar event cache.")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, metavar="PATH",
                         help="config file (default: %s)" % DEFAULT_CONFIG_PATH)
     parser.add_argument("--out", default=None, metavar="PATH",
-                        help="cache file (default: $XDG_RUNTIME_DIR/omarchy-meetings/events.json)")
+                        help="cache file (default: $XDG_RUNTIME_DIR/omeetingbar/events.json)")
     parser.add_argument("--backend", choices=BACKENDS, default=None,
                         help="override the configured backend")
     parser.add_argument("--in-seconds", type=int, default=None, metavar="N",
@@ -1337,7 +1364,7 @@ def main(argv=None):
         try:
             write_inject(inject_path, now, args.in_seconds)
         except OSError as exc:
-            sys.stderr.write("meetings-fetch: cannot write %s: %s\n"
+            sys.stderr.write("omeetingbar-fetch: cannot write %s: %s\n"
                              % (inject_path, _short(exc, 100)))
             return 1
     injected = load_inject(inject_path, now, max(config["grace_seconds"], 0))
@@ -1394,12 +1421,12 @@ def main(argv=None):
         try:
             write_cache(out_path, payload)
         except OSError as exc:
-            sys.stderr.write("meetings-fetch: cannot write %s: %s\n"
+            sys.stderr.write("omeetingbar-fetch: cannot write %s: %s\n"
                              % (out_path, _short(exc, 100)))
             return 1
 
     if status != "ok":
-        sys.stderr.write("meetings-fetch: %s\n" % error)
+        sys.stderr.write("omeetingbar-fetch: %s\n" % error)
         return 1
     return 0
 

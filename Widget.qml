@@ -7,7 +7,7 @@ import qs.Ui
 // Next-meeting label for the bar, and the host of the agenda popup.
 //
 // Reads the two files the rest of the plugin owns — the event cache the
-// fetcher writes and the user's meetings.json — rather than talking to
+// fetcher writes and the user's omeetingbar.json — rather than talking to
 // Service.qml, so the bar keeps painting while the service is reloading and
 // says so honestly when there is nothing to read.
 //
@@ -18,17 +18,17 @@ import qs.Ui
 // so exactly one place talks to the outside world.
 BarWidget {
   id: root
-  moduleName: "c51.meetings"
+  moduleName: "io.github.disy-mk.omeetingbar"
 
   // ---- Paths. The cache is on tmpfs on purpose, so it is legitimately
   //      absent after a reboot until the first fetch lands.
   readonly property string runtimeDir: String(Quickshell.env("XDG_RUNTIME_DIR") || "")
-  readonly property string cacheDir: runtimeDir === "" ? "" : runtimeDir + "/omarchy-meetings"
+  readonly property string cacheDir: runtimeDir === "" ? "" : runtimeDir + "/omeetingbar"
   readonly property string cachePath: cacheDir === "" ? "" : cacheDir + "/events.json"
-  readonly property string configPath: String(Quickshell.env("HOME") || "") + "/.config/omarchy/meetings.json"
+  readonly property string configPath: String(Quickshell.env("HOME") || "") + "/.config/omarchy/omeetingbar.json"
 
   // ---- Config. Three layers, most specific first: the inline shell.json
-  //      entry the bar settings UI writes, then meetings.json's `widget`
+  //      entry the bar settings UI writes, then omeetingbar.json's `widget`
   //      block, then these defaults. Every layer tolerates junk.
   property var fileConfig: ({})
   readonly property var fileWidget: Util.isPlainObject(fileConfig.widget) ? fileConfig.widget : ({})
@@ -40,17 +40,17 @@ BarWidget {
   readonly property int warnMinutes: numberOption("warn_minutes", fileWidget.warn_minutes, 15, 0, 1440)
   readonly property int maxTitleChars: numberOption("max_title_chars", fileWidget.max_title_chars, 28, 4, 200)
   readonly property bool hideWhenEmpty: boolOption("hide_when_empty", fileWidget.hide_when_empty, true)
-  // Read straight out of meetings.json, not through setting(): this one
+  // Read straight out of omeetingbar.json, not through setting(): this one
   // mirrors an alert-side decision (invariant 5 — a declined meeting never
   // blanks the screen while it is on, but stays in the agenda), and a bar
   // layout entry must not be able to disagree with what the service does.
-  readonly property bool skipDeclined: boolValue(fileConfig.skip_declined, true)
+  readonly property bool skipDeclined: Style.boolToken(fileConfig.skip_declined, true)
   // ---- Cache state. "unknown" until the first read resolves, so a present
   //      cache never flashes the placeholder on startup.
   property string cacheState: "unknown"
   property string cacheError: ""
   // Degraded-but-usable: the fetcher ran on fallback values (e.g. a typo in
-  // meetings.json). Separate from cacheError, which belongs to status "error".
+  // omeetingbar.json). Separate from cacheError, which belongs to status "error".
   property string cacheWarning: ""
   property bool cacheStale: false
   property real cacheGeneratedAt: 0
@@ -125,7 +125,7 @@ BarWidget {
   // hover that repeats the panel is just two places to keep in step.
   readonly property string tooltipText: {
     if (runtimeMissing)
-      return "Meetings: XDG_RUNTIME_DIR ist nicht gesetzt, der Termin-Cache ist nicht lesbar."
+      return "OMeetingBar: XDG_RUNTIME_DIR ist nicht gesetzt, der Termin-Cache ist nicht lesbar."
     if (pending) return ""
 
     var lines = []
@@ -148,7 +148,7 @@ BarWidget {
     if (cacheWarning !== "")
       lines.push("Eingeschränkt: " + cacheWarning)
     if (cacheOutdated)
-      lines.push("Daten sind " + minutesWord(Math.floor(cacheAge / 60)) + " alt — läuft der Meetings-Dienst?")
+      lines.push("Daten sind " + minutesWord(Math.floor(cacheAge / 60)) + " alt — läuft der OMeetingBar-Dienst?")
     if (!hasEvent) {
       lines.push("Kein anstehender Termin.")
       // Without this line a bar showing "—" over a popup full of rows looks
@@ -285,7 +285,7 @@ BarWidget {
   }
 
   // Only #rrggbb: an invalid colour string paints black in QML, so a typo in
-  // meetings.json must fall back to the documented default instead.
+  // omeetingbar.json must fall back to the documented default instead.
   function colorOption(fileValue, fallback) {
     if (fileValue === undefined || fileValue === null) return fallback
     var text = String(fileValue).trim()
@@ -293,16 +293,14 @@ BarWidget {
   }
 
   function boolOption(key, fileValue, fallback) {
-    return boolValue(setting(key, fileValue), fallback)
+    return Style.boolToken(setting(key, fileValue), fallback)
   }
 
+  // Style.boolToken is the one boolean parser in this plugin — the service
+  // reads the same keys with it, so a "yes"/"1"/"on" in omeetingbar.json can never
+  // make the bar hide a meeting the service still alerts on.
   function boolValue(value, fallback) {
-    if (value === undefined || value === null) return fallback
-    if (typeof value === "boolean") return value
-    var s = String(value).toLowerCase()
-    if (s === "true" || s === "1" || s === "yes" || s === "on") return true
-    if (s === "false" || s === "0" || s === "no" || s === "off") return false
-    return fallback
+    return Style.boolToken(value, fallback)
   }
 
   // ---- Formatting
@@ -322,7 +320,11 @@ BarWidget {
   }
 
   function timeRange(event) {
-    return event.allDay ? "ganztägig" : clockTime(event.start) + "–" + clockTime(event.end)
+    if (event.allDay) return "ganztägig"
+    // A zero-length occurrence (end == start, the invariant-2 fallback) reads
+    // as one time, the way the popup and the notification already print it.
+    if (!(event.end > event.start)) return clockTime(event.start)
+    return clockTime(event.start) + "–" + clockTime(event.end)
   }
 
   function shortCountdown(delta) {
@@ -363,7 +365,7 @@ BarWidget {
       var json = JSON.parse(text)
       fileConfig = Util.isPlainObject(json) ? json : ({})
     } catch (e) {
-      // meetings.json caught mid-edit: fall back to the built-in defaults
+      // omeetingbar.json caught mid-edit: fall back to the built-in defaults
       // rather than to whatever half a file parses as.
       fileConfig = ({})
     }
@@ -481,7 +483,7 @@ BarWidget {
   }
 
   function requestRefresh() {
-    Quickshell.execDetached(["omarchy-shell", "meetings", "refresh"])
+    Quickshell.execDetached(["omarchy-shell", "omeetingbar", "refresh"])
   }
 
   SystemClock {
@@ -560,26 +562,47 @@ BarWidget {
   // One instance per bar (so per monitor) registers this target; the shell logs
   // that the later registration is unused and the first one answers, which is
   // the same shape several first-party widgets already have.
+  // One IpcHandler per bar — so per monitor — and Quickshell keeps only the
+  // first registration. Whichever instance answers must therefore not act on
+  // itself: with two monitors that dragged a popup open on screen B over to
+  // screen A. It asks the bar to route to the widget on the FOCUSED screen,
+  // the same path the bar's own hotkeys take for first-party widgets
+  // (Bar.summonBarWidget → findPanelWidget → BarModel.pickPanelSlot). The
+  // local fallback only runs when a bar without that facade hosts us.
+  function routeToFocused(action) {
+    var b = root.bar
+    var id = root.moduleName
+    if (b && typeof b.summonBarWidget === "function" && typeof b.isBarWidgetOpen === "function") {
+      if (action === "isOpen") return b.isBarWidgetOpen(id) === true
+      if (action === "open") return b.summonBarWidget(id) === true
+      if (action === "close") return b.hideBarWidget(id) === true
+      return (b.isBarWidgetOpen(id) ? b.hideBarWidget(id) : b.summonBarWidget(id)) === true
+    }
+    if (action === "isOpen") return root.opened
+    if (action === "open") root.open()
+    else if (action === "close") root.close()
+    else root.toggle()
+    return true
+  }
+
   IpcHandler {
-    target: "meetings-agenda"
+    target: "omeetingbar-agenda"
 
     function open(): string {
-      root.open()
-      return "ok"
+      return root.routeToFocused("open") ? "ok" : "unavailable"
     }
 
     function close(): string {
-      root.close()
-      return "ok"
+      return root.routeToFocused("close") ? "ok" : "unavailable"
     }
 
     function toggle(): string {
-      root.toggle()
-      return root.opened ? "open" : "closed"
+      if (!root.routeToFocused("toggle")) return "unavailable"
+      return root.routeToFocused("isOpen") ? "open" : "closed"
     }
 
     function isOpen(): string {
-      return root.opened ? "true" : "false"
+      return root.routeToFocused("isOpen") ? "true" : "false"
     }
   }
 

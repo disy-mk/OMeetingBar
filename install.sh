@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
 
-# Idempotent installer for the c51.meetings Omarchy shell plugin.
+# Idempotent installer for OMeetingBar, an Omarchy shell plugin.
 # Safe to re-run: it never overwrites an existing config and never calls sudo.
 # Package installation is printed for the user to run, not attempted.
 
 set -euo pipefail
 
-PLUGIN_ID="c51.meetings"
+PLUGIN_ID="io.github.disy-mk.omeetingbar"
 REQUIRED_PACKAGES=(gnome-online-accounts gnome-online-accounts-gtk evolution-data-server)
 
 # The shell hardcodes ~/.config/omarchy/plugins (PluginRegistry.qml pluginsDir),
 # so this path is HOME-based on purpose and ignores XDG_CONFIG_HOME.
 OMARCHY_CONFIG_DIR="$HOME/.config/omarchy"
 PLUGINS_DIR="$OMARCHY_CONFIG_DIR/plugins"
-CONFIG_FILE="$OMARCHY_CONFIG_DIR/meetings.json"
+CONFIG_FILE="$OMARCHY_CONFIG_DIR/omeetingbar.json"
+# Pre-release names of the config and the wrapper; migrated, never overwritten.
+LEGACY_CONFIG_FILE="$OMARCHY_CONFIG_DIR/meetings.json"
+LEGACY_WRAPPER="$HOME/.local/bin/meetings-fetch"
 
 DRY_RUN=0
+UNINSTALL=0
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -27,10 +31,13 @@ fail() {
 
 usage() {
   cat <<USAGE
-Usage: ./install.sh [--dry-run]
+Usage: ./install.sh [--dry-run] [--uninstall]
 
 Installs and registers the $PLUGIN_ID plugin in the running Omarchy shell.
 
+  --uninstall Reverse what this script created: the PATH wrapper, the runtime
+              cache and the bar entry. Leaves your config, the packages and
+              the Google account alone and says so.
   --dry-run   Print every change without making one.
   -h, --help  This text.
 
@@ -42,6 +49,7 @@ USAGE
 while (( $# > 0 )); do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --uninstall) UNINSTALL=1 ;;
     -h | --help)
       usage
       exit 0
@@ -74,6 +82,36 @@ for tool in omarchy omarchy-shell jq pacman; do
   command -v "$tool" >/dev/null 2>&1 || fail "required command not found: $tool"
 done
 
+# ---------------------------------------------------------------- uninstall
+
+if (( UNINSTALL )); then
+  step "Uninstall"
+  runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/omeetingbar"
+  for w in "$HOME/.local/bin/omeetingbar-fetch" "$LEGACY_WRAPPER"; do
+    # Only a wrapper that points at THIS plugin is ours to remove.
+    if [[ -f $w ]] && grep -q "omarchy/plugins/" "$w" && grep -q "omeetingbar-fetch\|meetings-fetch" "$w"; then
+      if (( DRY_RUN )); then say "  would remove $w"; else rm -f -- "$w"; say "  removed $w"; fi
+    fi
+  done
+  if [[ -d $runtime_dir ]]; then
+    if (( DRY_RUN )); then say "  would remove $runtime_dir"; else rm -rf -- "$runtime_dir"; say "  removed $runtime_dir"; fi
+  fi
+  if omarchy-shell shell ping >/dev/null 2>&1; then
+    if (( DRY_RUN )); then say "  would run: omarchy plugin disable $PLUGIN_ID"
+    elif omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1; then say "  bar entry removed (omarchy plugin disable)"
+    else warn "could not disable the plugin over IPC — remove the bar entry with: omarchy plugin disable $PLUGIN_ID"; fi
+  else
+    warn "omarchy-shell is not running; remove the bar entry later with: omarchy plugin disable $PLUGIN_ID"
+  fi
+  say ""
+  say "  Left in place on purpose:"
+  say "    $CONFIG_FILE   (your settings)"
+  say "    the Arch packages   (sudo pacman -Rs evolution-data-server gnome-online-accounts gnome-online-accounts-gtk)"
+  say "    the Google account  (remove it in gnome-online-accounts-gtk)"
+  say "  To delete the plugin files themselves: omarchy plugin remove $PLUGIN_ID"
+  exit 0
+fi
+
 # --------------------------------------------------------------- validation
 
 # Read-only, and the same checks the running shell applies, so a manifest the
@@ -91,6 +129,13 @@ fi
 step "User configuration"
 jq -e . "$SCRIPT_DIR/config.example.json" >/dev/null 2>&1 ||
   fail "config.example.json is not valid JSON"
+
+if [[ ! -e $CONFIG_FILE && -e $LEGACY_CONFIG_FILE ]]; then
+  # Pre-release installs called the file meetings.json. Carry the settings over
+  # rather than silently starting from defaults.
+  if (( DRY_RUN )); then say "  would move $LEGACY_CONFIG_FILE -> $CONFIG_FILE"
+  else mv -- "$LEGACY_CONFIG_FILE" "$CONFIG_FILE"; say "  moved $LEGACY_CONFIG_FILE -> $CONFIG_FILE"; fi
+fi
 
 if [[ -e $CONFIG_FILE ]]; then
   say "  $CONFIG_FILE exists — left untouched"
@@ -135,18 +180,18 @@ fi
 # -------------------------------------------------------------- path wrapper
 
 # The fetcher lives inside the plugin dir, which nobody wants to type. A wrapper
-# on PATH makes `meetings-fetch --diagnose` work from anywhere. Not named
+# on PATH makes `omeetingbar-fetch --diagnose` work from anywhere. Not named
 # omarchy-* on purpose: the omarchy CLI resolves `omarchy <group> <action>` to
 # omarchy-<group>-<action> on PATH, and this is not a first-party command.
 step "Wrapper auf PATH"
-WRAPPER="$HOME/.local/bin/meetings-fetch"
+WRAPPER="$HOME/.local/bin/omeetingbar-fetch"
 wrapper_body="#!/usr/bin/env bash
 # Thin wrapper for the $PLUGIN_ID event fetcher, so it is reachable from any
 # directory. Deliberately not named omarchy-*: the omarchy CLI resolves
 # \`omarchy <group> <action>\` to omarchy-<group>-<action> on PATH, and this is
 # not a first-party command. Written by install.sh — edit it there.
 set -euo pipefail
-exec /usr/bin/python3 \"\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/meetings-fetch\" \"\$@\"
+exec /usr/bin/python3 \"\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/omeetingbar-fetch\" \"\$@\"
 "
 # Both sides go through command substitution so the trailing newline is stripped
 # from each: comparing against $wrapper_body directly never matches.
@@ -157,6 +202,10 @@ elif (( DRY_RUN )); then
 else
   say "  schreibe $WRAPPER"
   install -Dm755 /dev/stdin "$WRAPPER" <<<"$wrapper_body"
+fi
+if [[ -f $LEGACY_WRAPPER ]] && grep -q "omarchy/plugins/" "$LEGACY_WRAPPER" && grep -q "meetings-fetch" "$LEGACY_WRAPPER"; then
+  if (( DRY_RUN )); then say "  would remove the pre-release wrapper $LEGACY_WRAPPER"
+  else rm -f -- "$LEGACY_WRAPPER"; say "  removed the pre-release wrapper $LEGACY_WRAPPER"; fi
 fi
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) : ;;
@@ -251,7 +300,7 @@ fi
 # The steps are built, not pasted, so they can never contradict the package
 # block above: "switch to eds" is only printed when the config actually sits on
 # demo — because that block just advised it, or because an existing
-# meetings.json says so. On a fresh install (config.example.json ships "eds")
+# omeetingbar.json says so. On a fresh install (config.example.json ships "eds")
 # that jq line would be a no-op the user cannot tell apart from a real change.
 config_backend="eds"
 if [[ -e $CONFIG_FILE ]]; then
@@ -285,7 +334,7 @@ if (( demo_advised )) || [[ $config_backend == "demo" ]]; then
 fi
 
 next_step "Testen:"
-say "       omarchy-shell meetings test      # Vollbild-Alarm sofort, ohne Kalender"
-say "       omarchy-shell meetings status    # Backend-Status, Cache-Alter, nächster Termin"
-say "       ./bin/meetings-fetch --diagnose  # Pakete, Typelibs, GOA-Konten, Kalender"
+say "       omarchy-shell omeetingbar test    # Vollbild-Alarm sofort, ohne Kalender"
+say "       omarchy-shell omeetingbar status  # Backend-Status, Cache-Alter, nächster Termin"
+say "       omeetingbar-fetch --diagnose      # Pakete, Typelibs, GOA-Konten, Kalender"
 printf '\n'

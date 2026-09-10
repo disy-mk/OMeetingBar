@@ -1,10 +1,12 @@
 {
   "schemaVersion": 1,
-  "id": "c51.meetings",
-  "name": "Meetings",
-  "version": "0.1.0",
-  "author": "c51",
-  "description": "MeetingBar-Ersatz für Omarchy: das nächste Google-Kalender-Meeting in der Bar und ein Vollbild-Alarm kurz vor dem Start.",
+  "id": "io.github.disy-mk.omeetingbar",
+  "name": "OMeetingBar",
+  "version": "1.0.0",
+  "author": "Manuel Knitza",
+  "license": "MIT",
+  "homepage": "https://github.com/disy-mk/OMeetingBar",
+  "description": "MeetingBar for Omarchy: your next Google Calendar meeting in the bar, an agenda popup, and a fullscreen alert before a meeting starts that you cannot miss.",
   "kinds": [
     "service",
     "overlay",
@@ -16,8 +18,8 @@
     "barWidget": "Widget.qml"
   },
   "barWidget": {
-    "displayName": "Meetings",
-    "description": "Nächster Termin in der Bar. Klick öffnet den Meeting-Link, sonst eine Vorschau des Alarms.",
+    "displayName": "OMeetingBar",
+    "description": "Nächster Termin in der Bar. Linksklick öffnet die Agenda für heute und morgen, Rechtsklick lädt neu.",
     "category": "Time",
     "allowMultiple": false,
     "defaultSection": "center",
@@ -50,8 +52,8 @@
       {
         "key": "hide_when_empty",
         "type": "boolean",
-        "label": "Ausblenden, wenn kein Termin ansteht",
-        "description": "Aus: der Eintrag bleibt sichtbar und zeigt einen Platzhalter.",
+        "label": "Ausblenden, wenn die Agenda leer ist",
+        "description": "Aus: der Eintrag bleibt immer sichtbar. An: er verschwindet erst, wenn weder heute noch morgen Termine enthalten – solange die Agenda etwas zeigt, bleibt er als gedimmter Platzhalter erreichbar.",
         "defaultValue": true
       }
     ]

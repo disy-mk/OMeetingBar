@@ -80,7 +80,7 @@ Item {
   readonly property color textColor: Color.notifications.text
   // The countdown and the glyph carry the state: orange once it is running,
   // turquoise while it is still ahead. Deliberately not a theme token — these
-  // two colours are the plugin's own signal and are set in meetings.json.
+  // two colours are the plugin's own signal and are set in omeetingbar.json.
   readonly property color loudColor: root.runningNow ? root.runningColorName : root.upcomingColorName
   readonly property color mutedColor: Util.alpha(root.textColor, 0.62)
   readonly property color dimColor: Util.alpha(root.textColor, 0.48)
@@ -245,6 +245,16 @@ Item {
     // timers, no leftover state from the previous payload.
     root.nowMs = Date.now()
     root.openedAtMs = root.nowMs
+    // A payload without a start is not a meeting. The bar's positional panel
+    // hotkey (SUPER+CTRL+N on a right-section slot, or `shell togglePanelAt`)
+    // reaches this overlay with "{}", because shell.qml routes every summon of
+    // a plugin that declares an overlay kind here — and blanking every monitor
+    // for nothing is the one thing this surface must never do. A test payload
+    // is explicit and still shows.
+    if (!(root.startEpoch > 0) && !root.isTest) {
+      root.dismiss()
+      return
+    }
     root.dismissProgress = 1
     root.inhibitHeld = true
     root.opened = true
@@ -264,7 +274,7 @@ Item {
     root.dismissProgress = 1
     root.inhibitHeld = false
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "c51.meetings")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.disy-mk.omeetingbar")
   }
 
   function join() {
@@ -338,7 +348,7 @@ Item {
       visible: root.opened
       anchors { top: true; bottom: true; left: true; right: true }
       color: "transparent"
-      WlrLayershell.namespace: "c51-meetings-alert"
+      WlrLayershell.namespace: "omeetingbar-alert"
       WlrLayershell.layer: WlrLayer.Overlay
       WlrLayershell.keyboardFocus: panel.focusHere ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
       exclusionMode: ExclusionMode.Ignore

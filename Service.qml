@@ -2,9 +2,10 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
+import qs.Commons
 
-// The brain of c51.meetings. Reads the event cache written by
-// bin/meetings-fetch, decides on a 1 Hz wall clock when a meeting is close
+// The brain of OMeetingBar. Reads the event cache written by
+// bin/omeetingbar-fetch, decides on a 1 Hz wall clock when a meeting is close
 // enough to blank the screen, and holds a Wayland idle inhibitor across the
 // alert window so the session cannot lock into the alert.
 Item {
@@ -22,11 +23,11 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR")
   readonly property bool runtimeReady: runtimeDir !== ""
-  readonly property string configPath: home + "/.config/omarchy/meetings.json"
-  readonly property string cacheDir: runtimeDir + "/omarchy-meetings"
+  readonly property string configPath: home + "/.config/omarchy/omeetingbar.json"
+  readonly property string cacheDir: runtimeDir + "/omeetingbar"
   readonly property string cachePath: cacheDir + "/events.json"
   readonly property string statePath: cacheDir + "/state.json"
-  readonly property string fetcherPath: String(Qt.resolvedUrl("bin/meetings-fetch")).replace(/^file:\/\//, "")
+  readonly property string fetcherPath: String(Qt.resolvedUrl("bin/omeetingbar-fetch")).replace(/^file:\/\//, "")
 
   readonly property int stateRetentionSeconds: 43200
   readonly property int pruneIntervalSeconds: 3600
@@ -48,8 +49,8 @@ Item {
   readonly property int resummonIntervalSeconds: 5
   readonly property int maxSummonAttempts: 6
 
-  // Only the keys this service acts on; the rest of meetings.json belongs to
-  // bin/meetings-fetch and to Widget.qml, which read the same file themselves.
+  // Only the keys this service acts on; the rest of omeetingbar.json belongs to
+  // bin/omeetingbar-fetch and to Widget.qml, which read the same file themselves.
   readonly property var configDefaults: ({
     fetch_interval_seconds: 60,
     alert_lead_seconds: 60,
@@ -163,7 +164,7 @@ Item {
 
   readonly property string statusMessage: {
     if (!root.runtimeReady) return "XDG_RUNTIME_DIR ist nicht gesetzt"
-    if (!root.configValid) return "meetings.json ist unlesbar — Standardwerte aktiv"
+    if (!root.configValid) return "omeetingbar.json ist unlesbar — Standardwerte aktiv"
     if (root.cacheStatus === "unknown") return "Cache wird gelesen"
     if (root.cacheStatus === "missing") return "Noch kein Cache — Abruf läuft"
     if (root.cacheStatus === "invalid") return "Cache ist unlesbar"
@@ -189,7 +190,7 @@ Item {
     root.logStates = next
     root.logLine = name + (text === "" ? "" : ": " + text)
     root.logAt = new Date().toISOString()
-    console.log("meetings " + root.logAt + " " + root.logLine)
+    console.log("omeetingbar " + root.logAt + " " + root.logLine)
   }
 
   function configValue(key) {
@@ -203,10 +204,11 @@ Item {
     return Math.max(min, Math.min(max, n))
   }
 
+  // Style.boolToken is the one boolean parser in this plugin; Widget.qml reads
+  // the same keys with it, so a "yes"/"1"/"on" in omeetingbar.json cannot make the
+  // bar and the alert path disagree. An unrecognised value keeps the default.
   function boolConfig(key) {
-    var value = configValue(key)
-    if (typeof value === "string") return value.trim().toLowerCase() === "true"
-    return value === true || value === 1
+    return Style.boolToken(configValue(key), root.configDefaults[key] === true)
   }
 
   function stringConfig(key) {
@@ -218,12 +220,7 @@ Item {
   // rather than reach QML as an invalid colour, which paints black.
   function colorConfig(key, fallback) {
     var group = configValue("colors")
-    // Inline rather than Util.isPlainObject(): this file imports no qs.Commons,
-    // so that call threw "ReferenceError: Util is not defined" on every config
-    // read and both colours stayed empty, which silently dropped a configured
-    // colours block from the alert payload. Same test as applyConfig() above.
-    var plain = group !== null && typeof group === "object" && !Array.isArray(group)
-    var value = plain ? group[key] : undefined
+    var value = Util.isPlainObject(group) ? group[key] : undefined
     if (value === undefined || value === null) return fallback
     var text = String(value).trim()
     return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
@@ -239,7 +236,7 @@ Item {
         parsed = null
       }
     }
-    var valid = parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+    var valid = Util.isPlainObject(parsed)
     root.config = valid ? parsed : ({})
     root.configValid = valid || text === ""
     root.configLoaded = true
@@ -274,7 +271,7 @@ Item {
       var url = String(entry.url === undefined || entry.url === null ? "" : entry.url)
       // Only https is ever handed to the browser or to a notification --exec,
       // and every file drops the rest in its own cache parser.
-      if (!/^https:\/\//.test(url)) url = ""
+      if (!/^https:\/\/[^\s]+$/i.test(url)) url = ""
       out.push({
         id: id,
         title: String(entry.title === undefined || entry.title === null ? "" : entry.title),
@@ -379,7 +376,7 @@ Item {
       setAlertState(pending.id, { failed: atSec })
       dequeueAlert(i)
       saveState()
-      logState("alert-cancelled", "id=" + pending.id)
+      logState("alert-withdrawn", "id=" + pending.id + (index === -1 ? " gone from cache" : " no longer alertable"))
     }
   }
 
@@ -469,7 +466,7 @@ Item {
     var end = epochOf(raw.end)
     var until = epochOf(raw.untilSec)
     var url = String(raw.url === undefined || raw.url === null ? "" : raw.url)
-    if (!/^https:\/\//.test(url)) url = ""
+    if (!/^https:\/\/[^\s]+$/i.test(url)) url = ""
     return {
       id: id,
       title: String(raw.title === undefined || raw.title === null ? "" : raw.title),
@@ -509,7 +506,7 @@ Item {
     var cutoff = atSec - root.stateRetentionSeconds
 
     var incoming = ({})
-    if (parsed && parsed.events && typeof parsed.events === "object" && !Array.isArray(parsed.events)) {
+    if (parsed && Util.isPlainObject(parsed.events)) {
       for (var id in parsed.events) {
         var record = parsed.events[id]
         if (!record || typeof record !== "object") continue
@@ -519,7 +516,7 @@ Item {
           failed: tsOf(record.failed)
         }
       }
-    } else if (parsed && parsed.fired && typeof parsed.fired === "object" && !Array.isArray(parsed.fired)) {
+    } else if (parsed && Util.isPlainObject(parsed.fired)) {
       for (var legacyId in parsed.fired) {
         var at = tsOf(parsed.fired[legacyId])
         if (at === 0) continue
@@ -690,9 +687,11 @@ Item {
     }
   }
 
-  // "Next" has exactly one meaning in every file of this plugin: the earliest
-  // event that is not over yet, end > now. Widget.qml applies the same rule, so
-  // `meetings status` and the bar can never name different meetings.
+  // Invariant 1 over the whole agenda: the earliest event that is not over yet.
+  // This is `status.next` and the popup's notion of "next", declined and
+  // all-day entries included. The bar label and `preview` speak for the
+  // alertable view instead (nextAlertableEvent), so the two can legitimately
+  // name different meetings — e.g. a declined 14:00 here, the 15:00 there.
   function nextEvent(atSec) {
     for (var i = 0; i < root.events.length; i++) {
       if (root.events[i].end > atSec) return root.events[i]
@@ -714,15 +713,12 @@ Item {
     // may still show it. Otherwise a whole-day entry blanks every monitor at
     // one minute to midnight.
     if (entry.allDay) return false
-    // Over is over (invariant 1). The agenda keeps finished meetings, and a
-    // short one that ended a minute ago is still inside its grace window, so
-    // without this it would blank every monitor after the fact.
-    // The length test matters: a zero-length occurrence (end == start, the
-    // invariant-2 fallback for a missing or broken `end`) would otherwise be
-    // unalertable from its own start second onward, silently reducing
-    // grace_seconds to 0 for that class — a suspend across the start moment
-    // would lose the alert entirely. For those, the grace check below bounds it.
-    if (entry.end > entry.start && entry.end <= atSec) return false
+    // Over is over (invariant 1), with the same expression the bar, the popup
+    // rows and `status.next` use: max(end, start) <= now. A zero-length
+    // occurrence (end == start, the invariant-2 fallback for a broken `end`)
+    // is therefore over the second it starts — on every surface alike. The
+    // grace window below is for meetings with a real length that we missed.
+    if (Math.max(entry.end, entry.start) <= atSec) return false
     // Missed by more than the grace window — suspended or locked for too long
     // — is too late to be worth a screen.
     if (atSec - entry.start > root.graceSeconds) return false
@@ -801,7 +797,13 @@ Item {
     Quickshell.execDetached(argv)
   }
 
-  function summonAlert(entry, isTest) {
+  // What the last summon was for. drainQueue may only confirm a queued alert as
+  // "shown" when the overlay it sees is that alert — not a preview or a test
+  // the user opened by hand while something was queued.
+  property string lastSummonKind: ""
+
+  function summonAlert(entry, isTest, kind) {
+    root.lastSummonKind = kind || (isTest === true ? "test" : "queue")
     var id = root.pluginId()
     if (id === "" || !root.shell || typeof root.shell.summon !== "function") {
       logState("summon-unavailable", id === "" ? "no manifest" : "no shell api")
@@ -819,7 +821,8 @@ Item {
       // Alert.qml renders a "one more alert waits behind this" hint from this;
       // without it that line was unreachable in exactly the two-meetings-while-
       // locked case the queue exists for.
-      queued: Math.max(0, root.alertQueue.length - 1),
+      queued: root.lastSummonKind === "queue"
+        ? Math.max(0, root.alertQueue.length - 1) : root.alertQueue.length,
       test: isTest === true
     }
     // True means the host accepted the summon, not that anything is on screen.
@@ -914,7 +917,8 @@ Item {
     }
 
     var head = root.alertQueue[0]
-    if (open && head.summonedAtSec > 0 && head.shownAt === 0) confirmShown(head, atSec)
+    if (open && head.summonedAtSec > 0 && head.shownAt === 0 && root.lastSummonKind === "queue")
+      confirmShown(head, atSec)
 
     if (head.shownAt > 0) {
       if (open) {
@@ -933,6 +937,23 @@ Item {
       }
       head = root.alertQueue[0]
       open = false
+    }
+
+    // isAlertable is the only gate (invariant 5), and the queue was the one
+    // path that reached the screen without passing it: an alert queued under
+    // the lock stayed queued after its meeting ended and was shown to the
+    // returning user for a meeting that was over. So the head is re-checked
+    // against the live cache entry — or its own times if the event is gone —
+    // right before every summon.
+    if (head.shownAt === 0) {
+      var liveIndex = eventIndexOf(head.id)
+      if (!isAlertable(liveIndex !== -1 ? root.events[liveIndex] : head, atSec)) {
+        setAlertState(head.id, { failed: atSec })
+        dequeueAlert(0)
+        saveState()
+        logState("alert-withdrawn", "id=" + head.id + " no longer alertable")
+        return
+      }
     }
 
     // Nothing draws over the WlSessionLock surface, so a locked session waits
@@ -968,7 +989,7 @@ Item {
 
     head.attempts += 1
     head.summonedAtSec = atSec
-    var accepted = summonAlert(head, false)
+    var accepted = summonAlert(head, false, "queue")
     root.deferredReason = accepted ? "waiting" : "summon-failed"
     logState(accepted ? "alert-summoned" : "alert-summon-failed",
       "id=" + head.id + " attempt=" + head.attempts)
@@ -1203,6 +1224,7 @@ Item {
         maxSummonAttempts: root.maxSummonAttempts,
         notify: root.notifyEnabled,
         wakeDisplay: root.wakeDisplayEnabled,
+        skipDeclined: root.skipDeclined,
         sound: root.soundPath
       },
       paths: {
@@ -1229,16 +1251,18 @@ Item {
       url: "",
       calendar: "Test",
       location: ""
-    }, true)
+    }, true, "test")
   }
 
   function showPreview() {
     // A real alert on screen is not overwritten by a preview of the next one.
     if (root.alertQueue.length > 0 && root.alertQueue[0].shownAt > 0) return "busy"
-    // Shows what the alert path would show: same "next" rule, minus all-day.
+    // Shows what the alert path would fire on next: isAlertable's view, so a
+    // meeting that started more than grace_seconds ago is skipped even while
+    // it is still running (the bar still shows that one as "läuft").
     var entry = nextAlertableEvent(Math.floor(Date.now() / 1000))
     if (entry === null) return "no-event"
-    return summonAlert(entry, false) ? "ok" : "failed"
+    return summonAlert(entry, false, "preview") ? "ok" : "failed"
   }
 
   function dismissAlert() {
@@ -1293,7 +1317,8 @@ Item {
         stop()
         return
       }
-      if (root.alertOpen()) root.confirmShown(head, Math.floor(Date.now() / 1000))
+      if (root.alertOpen() && root.lastSummonKind === "queue")
+        root.confirmShown(head, Math.floor(Date.now() / 1000))
     }
   }
 
@@ -1431,7 +1456,7 @@ Item {
       implicitHeight: 1
       anchors { top: true; left: true }
       exclusionMode: ExclusionMode.Ignore
-      WlrLayershell.namespace: "omarchy-meetings-inhibitor"
+      WlrLayershell.namespace: "omeetingbar-inhibitor"
       WlrLayershell.layer: WlrLayer.Overlay
       WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
       // Nothing may reach this surface: an empty input region leaves the
@@ -1457,7 +1482,7 @@ Item {
   }
 
   IpcHandler {
-    target: "meetings"
+    target: "omeetingbar"
 
     function status(): string {
       return root.statusJson()

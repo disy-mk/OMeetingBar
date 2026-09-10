@@ -48,7 +48,7 @@ Item {
   property bool pending: false
 
   // Not pushed by the host, so it is derived rather than injected: the widget
-  // already resolved it out of meetings.json and the bar's layout entry, and
+  // already resolved it out of omeetingbar.json and the bar's layout entry, and
   // the popup must not invent a second answer.
   readonly property int warnMinutes: {
     var value = hostWidget ? Number(hostWidget.warnMinutes) : NaN
@@ -142,10 +142,12 @@ Item {
     return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset).getTime() / 1000)
   }
 
+  // Subtract the wall-clock minutes and seconds instead of setMinutes(0):
+  // on the DST fall-back night 02:xx exists twice, and setMinutes resolves to
+  // the later instant — an hour off, which hid the now-marker once a year.
   function floorHourSec(sec) {
     var d = new Date(sec * 1000)
-    d.setMinutes(0, 0, 0)
-    return Math.floor(d.getTime() / 1000)
+    return Math.floor(sec - (d.getMinutes() * 60 + d.getSeconds()))
   }
 
   function ceilHourSec(sec) {
@@ -209,6 +211,12 @@ Item {
     // Seeded from the list rather than from its first entry, so one unusable
     // timestamp cannot turn the whole window into NaN.
     if (!isFinite(lo)) return { start: 0, end: 0 }
+    // Clip the seeds to the day the rail stands for: a timed Monday-to-
+    // Wednesday event is listed on Tuesday, but its Monday start must not pin
+    // the rail to a day nobody is looking at.
+    lo = Math.max(lo, root.stripSource.dayStart)
+    hi = Math.min(hi, root.stripSource.dayEnd)
+    if (!(hi > lo)) hi = lo + 3600
     // A rail is only a clock if "now" is on it.
     if (root.stripSource.today) {
       lo = Math.min(lo, root.nowHourStart)
@@ -218,7 +226,13 @@ Item {
     hi = ceilHourSec(hi)
     var span = hi - lo
     if (span < 4 * 3600) hi = lo + 4 * 3600
-    else if (span > 14 * 3600) hi = lo + 14 * 3600
+    else if (span > 14 * 3600) {
+      // Too long a day for one rail. Today's rail keeps "now" and the meetings
+      // still ahead and lets the morning fall off the left edge; tomorrow's has
+      // no now and keeps its start.
+      if (root.stripSource.today) lo = hi - 14 * 3600
+      else hi = lo + 14 * 3600
+    }
     return { start: lo, end: hi }
   }
 
@@ -226,13 +240,12 @@ Item {
   readonly property real stripEndSec: stripWindow.end
   readonly property real stripSpanSec: Math.max(1, stripEndSec - stripStartSec)
 
-  // An integer model, deliberately not a JS array: a `property var` array
-  // handed to a Repeater is re-created whenever the binding re-evaluates, and
-  // every re-creation tears down and rebuilds every delegate. Two Repeaters fed
-  // from one such array (the notches and the hour labels) put the panel into a
-  // rebuild loop that pinned a core and grew the shell by ~1 GB every two
-  // seconds — measured, not theorised. An int model changes only when the hour
-  // count changes, and each delegate derives its own position from `index`.
+  // An integer model: each delegate derives its own position from `index`,
+  // so the notch row never allocates an array. (It was once suspected of
+  // rebuilding delegates on every evaluation; measured on Qt 6.11 that is not
+  // what happens — a var array with equal content does not rebuild a Repeater.
+  // The loop that was actually observed came from the hour LABELS row, see the
+  // strip below.)
   readonly property int stripTickCount: {
     if (!(root.stripEndSec > root.stripStartSec)) return 0
     return Math.floor((root.stripEndSec - root.stripStartSec) / 3600) + 1
@@ -297,12 +310,26 @@ Item {
   readonly property string heroTitle: {
     if (root.pending) return "Termine werden geladen …"
     if (root.hasNext) return String(root.nextEvent.title || "Ohne Titel")
-    return root.degraded ? "Keine Termindaten" : "Keine Termine"
+    if (root.degraded) return "Keine Termindaten"
+    // The alertable view is empty, but the agenda underneath may well list the
+    // day: "no meetings" over four finished rows read as a contradiction.
+    return root.hasAgenda ? "Kein anstehender Termin" : "Keine Termine"
+  }
+
+  function countPhrase(n, singular, plural) {
+    return n + " " + (n === 1 ? singular : plural)
   }
 
   readonly property string heroMeta: {
     if (root.pending) return ""
-    if (!root.hasNext) return root.degraded ? "" : "keine Termine heute und morgen"
+    if (!root.hasNext) {
+      if (root.degraded) return ""
+      if (!root.hasAgenda) return "keine Termine heute und morgen"
+      return countPhrase(root.todayEvents.length, "Termin", "Termine") + " heute · "
+        + (root.tomorrowEvents.length > 0
+          ? countPhrase(root.tomorrowEvents.length, "Termin", "Termine") + " morgen"
+          : "keine morgen")
+    }
     var parts = []
     var prefix = dayPrefixFor(root.nextStartSec)
     if (prefix !== "") parts.push(prefix)
@@ -337,7 +364,7 @@ Item {
       lines.push("Termindaten sind nicht lesbar.")
     }
     if (root.cacheWarning !== "") lines.push("Eingeschränkt: " + root.cacheWarning)
-    if (root.cacheOutdated) lines.push("Termindaten sind veraltet — läuft der Meetings-Dienst?")
+    if (root.cacheOutdated) lines.push("Termindaten sind veraltet — läuft der OMeetingBar-Dienst?")
     return lines
   }
 
@@ -368,11 +395,28 @@ Item {
     return 0
   }
 
+  // A keyboard move asks for exactly one reveal, consumed by the row that
+  // becomes selected. Without the token every Repeater rebuild under an open
+  // popup (a cache rewrite, midnight) re-selected the remembered row while the
+  // Column had not positioned it yet and scrolled the view to its section
+  // header instead.
+  property bool revealPending: false
+
   function setCursor(section, index, fromKeyboard) {
     root.cursorFromKeyboard = fromKeyboard === true
-    root.cursorActive = true
+    // Written as one transition: with cursorActive kept on, the first write
+    // (focusSection) briefly selected the row with the OLD index in the new
+    // section, and a scroll followed that phantom selection.
+    root.cursorActive = false
     root.focusSection = section
     root.selectedIndex = index
+    root.cursorActive = true
+    if (fromKeyboard === true) {
+      root.revealPending = true
+      // A stationary pointer must not win the cursor back when the list
+      // scrolls under it — Qt re-delivers hover to whatever slides underneath.
+      pointerGate.reset()
+    }
   }
 
   function moveCursor(delta) {
@@ -559,6 +603,13 @@ Item {
   // and then nothing reads this clock. It stays enabled while the panel is
   // open all the same, so a popup that is rendered without a host — or before
   // the first push lands — still counts down instead of freezing at the epoch.
+  // Filters synthetic hover churn from rows moving under a stationary pointer;
+  // the shell's clipboard and menu surfaces use the same gate.
+  PointerMoveGate {
+    id: pointerGate
+    referenceItem: agendaColumn
+  }
+
   SystemClock {
     id: fallbackClock
     enabled: root.opened
@@ -630,6 +681,10 @@ Item {
 
         Column {
           id: agendaColumn
+
+          HoverHandler {
+            onPointChanged: pointerGate.moved(agendaColumn, point.position)
+          }
           width: agendaScroll.width
           spacing: Style.space(14)
 
@@ -650,15 +705,10 @@ Item {
           //      clock panel's track rails, PanelSlider's fraction-positioned
           //      ticks notched in the card colour, and the theme accent for
           //      the now-marker.
-          // Every size in here is derived from the token scale and the lane
-          // count, never from a child's geometry, and the two rows are placed
-          // by explicit `y` rather than by anchoring to each other. The version
-          // that summed `lanes.height + hourLabels.height` into implicitHeight
-          // while `hourLabels` anchored to `lanes.bottom` pinned a core and grew
-          // the shell by gigabytes for as long as the popup was open, and it did
-          // so without Qt reporting a binding loop. Bisected down to the label
-          // row; a Rectangle in the same place was fine, so the trigger is the
-          // sibling-anchor/implicitHeight interaction rather than the text.
+          // Sizes come from the token scale and the lane count, rows are placed
+          // by explicit y. Kept that way on purpose — it is cheap and it stays
+          // legible — but note it is NOT what fixed the polish loop described at
+          // the (missing) hour-labels row below.
           Item {
             id: strip
             width: parent.width
@@ -739,17 +789,20 @@ Item {
               }
             }
 
-            // NO HOUR NUMBERS, on purpose. Any Text in this row — even one with
-            // a constant string and no geometry of its own — puts the shell into
-            // a polish loop: one core pinned and gigabytes of growth for as long
-            // as the popup is open, with no binding-loop warning from Qt.
-            // Bisected step by step on this machine: notches in the lane row are
-            // fine, a Rectangle here is fine, a Text here is not, and neither an
-            // integer Repeater model, dropping the self-referential x binding,
-            // nor replacing every sibling anchor with explicit geometry changed
-            // it. Root cause not established, so the row is left out rather than
-            // shipped as a desktop-freezing decoration. The notches carry the
-            // hour grid; the times are on every row underneath anyway.
+            // NO HOUR NUMBERS, on purpose. Any Text in an hour-label row here —
+            // even a constant string with no geometry of its own — drove the
+            // shell into a polish loop: one core pinned and gigabytes of growth
+            // for as long as the popup was open, with no binding-loop warning
+            // from Qt. Bisected on the author's machine: notches in the lane
+            // row are fine, a Rectangle in the label row is fine, a Text is not,
+            // and neither an integer Repeater model, nor dropping the
+            // self-referential x binding, nor explicit geometry instead of
+            // sibling anchors changed it. Root cause not established; the
+            // var-array and geometry-feedback hypotheses were both refuted by
+            // measurement. Triage recipe if someone wants it back: watch for
+            // Qt's "possible QQuickItem::polish() loop" warning and run
+            // `perf top -p $(pgrep -x quickshell)` with the popup open. The
+            // notches carry the hour grid; every row prints its own times.
           }
 
           PanelSeparator {
@@ -912,8 +965,17 @@ Item {
                 enabled: modelData.enabled === true
                 opacity: footerButton.enabled ? 1.0 : 0.45
                 hasCursor: root.cursorActive && root.focusSection === "footer" && root.selectedIndex === footerButton.index
-                onHasCursorChanged: if (footerButton.hasCursor && root.cursorFromKeyboard) root.revealItem(footerButton)
-                onHovered: function(isHovered) { if (isHovered) root.setCursor("footer", footerButton.index, false) }
+                onHasCursorChanged: {
+                  if (!footerButton.hasCursor || !root.revealPending) return
+                  root.revealPending = false
+                  Qt.callLater(function() { root.revealItem(footerButton) })
+                }
+                // Ui.Button reports hover without a position; the card-wide
+                // HoverHandler below primes the gate, so this only fires once
+                // the pointer has really moved since the last keyboard step.
+                onHovered: function(isHovered) {
+                  if (isHovered && pointerGate.primed) root.setCursor("footer", footerButton.index, false)
+                }
                 onClicked: root.footerActivate(footerButton.index)
               }
             }
@@ -970,7 +1032,13 @@ Item {
     opacity: row.finished ? 0.45 : 1.0
     implicitHeight: rowContent.implicitHeight + Style.spacing.rowPaddingX
 
-    onRowSelectedChanged: if (row.rowSelected && root.cursorFromKeyboard) root.revealItem(row)
+    onRowSelectedChanged: {
+      if (!row.rowSelected || !root.revealPending) return
+      root.revealPending = false
+      // Deferred: at handler time a freshly created row still reports y=0,
+      // its real position arrives with the Column's polish.
+      Qt.callLater(function() { root.revealItem(row) })
+    }
 
     MouseArea {
       id: rowMouse
@@ -979,7 +1047,11 @@ Item {
       acceptedButtons: Qt.LeftButton
       cursorShape: row.joinTarget !== "" ? Qt.PointingHandCursor : Qt.ArrowCursor
 
-      onContainsMouseChanged: if (containsMouse) root.setCursor(row.sectionName, row.rowIndex, false)
+      // Only a pointer that actually moved takes the cursor — not one a
+      // keyboard scroll slid a new row underneath.
+      onPositionChanged: function(mouse) {
+        if (pointerGate.moved(rowMouse, mouse)) root.setCursor(row.sectionName, row.rowIndex, false)
+      }
       onClicked: root.joinEvent(row.ev)
     }
 
