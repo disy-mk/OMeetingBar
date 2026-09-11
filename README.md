@@ -17,7 +17,8 @@ around it.
   turquoise while it is ahead, orange once it is running.
 - **Agenda popup** (left click) — today and tomorrow, MeetingBar-style: a timeline strip, one
   row per meeting with a join glyph, finished rows dimmed, the running one emphasised, declined
-  invitations struck through, and footer actions (join, create, refresh, open calendar).
+  invitations struck through, then the next few later meetings ("Demnächst"), and footer actions
+  (join, create, refresh, open calendar).
 - **Fullscreen alert** — configurable lead time (default 60 s), auto-dismiss, `Enter` joins the
   meeting, `Esc` dismisses. It also sends a critical notification, plays a sound and wakes the
   display, so the alert reaches you even when the overlay cannot (see limits).
@@ -95,7 +96,7 @@ save.
 |---|---|---|
 | `backend` | `"eds"` | `eds` = Google via GOA/Evolution. `ics` = private iCal URLs (backstop, see limits). `demo` = synthetic events, no account needed. |
 | `ics_urls` | `[]` | Private ICS URLs for `backend: "ics"`. Treated as secrets — never logged. |
-| `lookahead_minutes` | `720` | Extends the agenda beyond tomorrow; can never shorten it. |
+| `lookahead_minutes` | `10080` | How far ahead meetings are fetched (7 days). The bar always names the next meeting in this window — on a Friday evening that is Monday's first one. Never shortens the two-day agenda. |
 | `refresh_seconds` | `300` | Minimum spacing between network refreshes (EDS `refresh_sync`). EDS alone would poll hourly. |
 | `fetch_interval_seconds` | `60` | How often the service reads the local calendar cache. Backs off to 15 min while a backend keeps failing. |
 | `alert_lead_seconds` | `60` | Fullscreen alert this many seconds before start. |

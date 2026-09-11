@@ -163,6 +163,23 @@ Item {
   readonly property var tomorrowEvents: eventsInDay(tomorrowStartSec, dayAfterStartSec)
   readonly property bool hasAgenda: todayEvents.length > 0 || tomorrowEvents.length > 0
 
+  // Beyond tomorrow: the next few meetings inside the fetcher's window, so the
+  // popup answers "what is next" even when today and tomorrow are empty — on a
+  // Friday evening the answer is Monday morning. Capped on purpose: this is a
+  // two-day agenda plus a glance ahead, not a month view.
+  readonly property int laterMax: 5
+  readonly property var laterEvents: {
+    var out = []
+    for (var i = 0; i < root.events.length && out.length < root.laterMax; i++) {
+      var ev = root.events[i]
+      var start = Number(ev.start)
+      if (!isFinite(start) || start < root.dayAfterStartSec) continue
+      out.push(ev)
+    }
+    return out
+  }
+  readonly property bool hasLater: laterEvents.length > 0
+
   function eventsInDay(fromSec, toSec) {
     var out = []
     for (var i = 0; i < root.events.length; i++) {
@@ -384,6 +401,7 @@ Item {
     var out = []
     if (root.todayEvents.length > 0) out.push("today")
     if (root.tomorrowEvents.length > 0) out.push("tomorrow")
+    if (root.laterEvents.length > 0) out.push("later")
     out.push("footer")
     return out
   }
@@ -391,6 +409,7 @@ Item {
   function sectionCount(name) {
     if (name === "today") return root.todayEvents.length
     if (name === "tomorrow") return root.tomorrowEvents.length
+    if (name === "later") return root.laterEvents.length
     if (name === "footer") return root.footerActions.length
     return 0
   }
@@ -471,7 +490,8 @@ Item {
       footerActivate(root.selectedIndex)
       return
     }
-    var list = root.focusSection === "today" ? root.todayEvents : root.tomorrowEvents
+    var list = root.focusSection === "today" ? root.todayEvents
+      : (root.focusSection === "later" ? root.laterEvents : root.tomorrowEvents)
     if (root.selectedIndex >= 0 && root.selectedIndex < list.length) joinEvent(list[root.selectedIndex])
   }
 
@@ -558,14 +578,39 @@ Item {
     return Qt.formatTime(new Date(sec * 1000), "HH:mm")
   }
 
+  // ISO 8601 week — what "KW" means in Germany: weeks start on Monday, week 1
+  // is the one containing the first Thursday, so 29–31 December can be KW 1 and
+  // 1–3 January KW 52/53. Computed in UTC from the local date parts so a DST
+  // day cannot shift it. Qt has no formatDate token for it.
+  function isoWeek(sec) {
+    var d = new Date(sec * 1000)
+    var date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+    var day = date.getUTCDay() || 7
+    date.setUTCDate(date.getUTCDate() + 4 - day)
+    var yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1))
+    return Math.ceil(((date - yearStart) / 86400000 + 1) / 7)
+  }
+
+  function weekTag(sec) {
+    return " (KW " + isoWeek(sec) + ")"
+  }
+
+  function dayShort(sec) {
+    return new Date(sec * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd")
+  }
+
   function dayLabel(sec) {
     return new Date(sec * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")
   }
 
+  // The hero's meta line is one elided row: "SO., 13. SEPT. · 10:15–12:45 ·
+  // IN 2 TAGEN" lost its countdown to the ellipsis, so beyond tomorrow only the
+  // weekday goes in here (unambiguous inside a seven-day window); the rows and
+  // their tooltips carry the full date.
   function dayPrefixFor(sec) {
     if (sec < root.tomorrowStartSec) return ""
     if (sec < root.dayAfterStartSec) return "morgen"
-    return dayLabel(sec)
+    return dayShort(sec)
   }
 
   function timeRangeText(ev) {
@@ -581,6 +626,10 @@ Item {
     var minutes = Math.floor(delta / 60)
     if (minutes < 60) return "in " + minutesPhrase(minutes)
     var hours = Math.floor(minutes / 60)
+    if (hours >= 24) {
+      var days = Math.round(delta / 86400)
+      return "in " + (days === 1 ? "1 Tag" : days + " Tagen")
+    }
     var rest = minutes % 60
     return rest > 0 ? "in " + hours + " h " + rest + " min" : "in " + hours + " h"
   }
@@ -817,7 +866,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "HEUTE · " + root.dayLabel(root.todayStartSec).toUpperCase()
+              text: "HEUTE · " + root.dayLabel(root.todayStartSec).toUpperCase() + root.weekTag(root.todayStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -859,7 +908,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "MORGEN · " + root.dayLabel(root.tomorrowStartSec).toUpperCase()
+              text: "MORGEN · " + root.dayLabel(root.tomorrowStartSec).toUpperCase() + root.weekTag(root.tomorrowStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -886,6 +935,40 @@ Item {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
               wrapMode: Text.WordWrap
+            }
+          }
+
+          PanelSeparator {
+            visible: root.hasLater
+            foreground: root.fg
+          }
+
+          // Only when there is something: an empty "Demnächst" would just
+          // restate the fetcher's horizon.
+          Column {
+            id: laterSection
+            width: parent.width
+            visible: root.hasLater
+            spacing: Style.spacing.rowGap
+
+            PanelSectionHeader {
+              text: "DEMNÄCHST"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+            }
+
+            Repeater {
+              model: root.laterEvents
+
+              EventRow {
+                required property var modelData
+                required property int index
+                width: laterSection.width
+                ev: modelData
+                rowIndex: index
+                sectionName: "later"
+                showDay: true
+              }
             }
           }
 
@@ -996,6 +1079,9 @@ Item {
     required property var ev
     required property int rowIndex
     required property string sectionName
+    // Rows beyond tomorrow show "So. 10:00" in the time column — the bar
+    // label's format — instead of a range that would not say which day.
+    property bool showDay: false
 
     readonly property real startSec: Number(row.ev.start)
     readonly property real endSec: Math.max(Number(row.ev.end), row.startSec)
@@ -1012,7 +1098,8 @@ Item {
       && root.selectedIndex === row.rowIndex
 
     readonly property string rowTooltip: {
-      var lines = [root.timeRangeText(row.ev) + "  " + String(row.ev.title || "Ohne Titel")]
+      var lines = [(row.showDay ? root.dayLabel(row.startSec) + "  " : "")
+        + root.timeRangeText(row.ev) + "  " + String(row.ev.title || "Ohne Titel")]
       var meta = []
       if (String(row.ev.calendar || "") !== "") meta.push(String(row.ev.calendar))
       if (String(row.ev.location || "") !== "") meta.push(String(row.ev.location))
@@ -1076,7 +1163,9 @@ Item {
         anchors.left: parent.left
         anchors.verticalCenter: parent.verticalCenter
         width: Style.space(84)
-        text: root.timeRangeText(row.ev)
+        text: row.showDay
+          ? root.dayShort(row.startSec) + (row.allDay ? "" : " " + root.clockTime(row.startSec))
+          : root.timeRangeText(row.ev)
         // The signal colour sits in the time column, so the list carries the
         // same two meanings as the bar without shouting them in every title.
         color: row.finished || row.allDay ? root.mutedFg : root.signalColor(row.startSec, row.endSec)

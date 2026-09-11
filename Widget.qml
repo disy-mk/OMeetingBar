@@ -159,7 +159,10 @@ BarWidget {
       return lines.join("\n")
     }
 
-    lines.push(timeRange(nextEvent) + "  " + truncate(nextEvent.title, 64))
+    var day = dayPrefix(nextEvent)
+    if (day !== "" && day !== "morgen")
+      day = new Date(Number(nextEvent.start) * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")
+    lines.push((day === "" ? "" : day + "  ") + timeRange(nextEvent) + "  " + truncate(nextEvent.title, 64))
     var meta = []
     if (nextEvent.calendar !== "") meta.push(nextEvent.calendar)
     if (nextEvent.location !== "") meta.push(truncate(nextEvent.location, 48))
@@ -315,8 +318,28 @@ BarWidget {
     return Qt.formatDateTime(new Date(seconds * 1000), "HH:mm")
   }
 
+  // Local midnight `offset` days from now, via Date components so the DST
+  // days keep their 23 and 25 hours (never now + n * 86400).
+  function dayStartSec(offset) {
+    var d = new Date(nowSec * 1000)
+    return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset).getTime() / 1000)
+  }
+
+  // "" today, "morgen" tomorrow, else the short weekday — the bar always names
+  // the next meeting even when it is on Monday, and a bare "09:00" for a
+  // Monday meeting read on Friday would be a lie. Explicit de_DE locale: the
+  // system locale is en_US.
+  function dayPrefix(event) {
+    var start = Number(event.start)
+    if (start < dayStartSec(1)) return ""
+    if (start < dayStartSec(2)) return "morgen"
+    return new Date(start * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd")
+  }
+
   function timeLabel(event) {
-    return event.allDay ? "ganztägig" : clockTime(event.start)
+    var prefix = dayPrefix(event)
+    var time = event.allDay ? "ganztägig" : clockTime(event.start)
+    return prefix === "" ? time : prefix + " " + time
   }
 
   function timeRange(event) {
@@ -333,6 +356,9 @@ BarWidget {
     var minutes = Math.floor(delta / 60)
     if (minutes < 60) return minutes + "m"
     var hours = Math.floor(minutes / 60)
+    // Past a day the hour count stops meaning anything at a glance; the label
+    // already carries the weekday, so the countdown just says how many days.
+    if (hours >= 24) return Math.round(delta / 86400) + "d"
     var rest = minutes % 60
     return rest > 0 ? hours + "h" + rest + "m" : hours + "h"
   }
@@ -342,6 +368,10 @@ BarWidget {
     if (delta < 60) return "Beginnt jetzt."
     var minutes = Math.floor(delta / 60)
     if (minutes < 60) return "Beginnt in " + minutesWord(minutes) + "."
+    if (minutes >= 24 * 60) {
+      var days = Math.round(delta / 86400)
+      return "Beginnt in " + (days === 1 ? "1 Tag" : days + " Tagen") + "."
+    }
     return "Beginnt in " + Math.floor(minutes / 60) + " h " + (minutes % 60) + " min."
   }
 

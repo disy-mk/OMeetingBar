@@ -73,7 +73,7 @@ supply these defaults and never crash on a missing/broken file:
 {
   "backend": "eds",
   "ics_urls": [],
-  "lookahead_minutes": 720,
+  "lookahead_minutes": 10080,
   "refresh_seconds": 300,
   "fetch_interval_seconds": 60,
   "alert_lead_seconds": 60,
@@ -115,7 +115,10 @@ Semantics:
   dismiss (see the overlay contract).
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
 - `fetch_interval_seconds` — how often the QML service runs the fetcher (local read).
-- `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it. The
+- `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it.
+  Default 7 days, because the bar's promise is to *always* name the next meeting: on a Friday
+  evening that is Monday's first one, and a 12 h horizon left the bar blank all weekend. The
+  popup lists today and tomorrow in full and the next few later events under DEMNÄCHST. The
   fetcher's window is `[local midnight today, local midnight the day after tomorrow)`, widened to
   cover `now - grace_seconds … now + lookahead_minutes` so the alert horizon can only grow. Compute
   the day boundaries with `datetime.date` arithmetic plus naive `.timestamp()`, **never**
@@ -283,7 +286,10 @@ Requirements:
   `onFileChanged: reload()` — it does **not** auto-reload). Watch the parent *directory* too,
   because the cache may not exist yet.
 - Renders e.g. `󰃭 14:00 Standup · 12m` in `colors.upcoming`, switching to `colors.running` once the
-  meeting has started. `widget.warn_minutes` no longer decides *whether* there is colour — it drives
+  meeting has started. A meeting that is not today carries a day prefix — `morgen 09:00`, or the
+  short weekday (`So. 10:15`) beyond that — and a countdown of a day or more reads in days
+  (`2d`), because the bar always names the next meeting inside the fetcher's seven-day window and
+  a bare `09:00` on a Friday for a Monday meeting would be a lie. `widget.warn_minutes` no longer decides *whether* there is colour — it drives
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
   at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
   collapses to zero width only when the whole agenda is empty (if `hide_when_empty`): while today
@@ -330,8 +336,12 @@ file talks to the outside world.
   again.
 - Body: `PanelKeyCatcher` → `Flickable` (clip, `StopAtBounds`, `interactive: contentHeight > height`)
   → `Column { spacing: Style.space(14) }` of: `PanelHero` (next meeting, countdown, refresh action),
-  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT.` section, `PanelSeparator`, the
-  same for `MORGEN`, the degraded/empty message, `PanelSeparator`, the footer action rows.
+  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT. (KW 37)` section (ISO week, computed
+  in QML — Qt has no format token for it), `PanelSeparator`, the
+  same for `MORGEN`, then — only when non-empty — a `DEMNÄCHST` section with the next (at most
+  five) meetings after tomorrow, their time column reading `So. 10:15` like the bar label, the
+  degraded/empty message, `PanelSeparator`, the footer action rows. The later section exists
+  because the bar promises to always name the next meeting: on a Friday evening that is Monday.
 - Rows are `CursorSurface`, and the panel owns the cursor state (`cursorActive`, `focusSection`,
   `selectedIndex`); a row must never colour itself from `containsMouse`, or mouse and keyboard show
   two highlights at once. Hover goes through `Ui/PointerMoveGate` (reset on every keyboard move):

@@ -60,7 +60,9 @@ GOA_ACCOUNTS_PATH = os.path.expanduser("~/.config/goa-1.0/accounts.conf")
 DEFAULTS = {
     "backend": "eds",
     "ics_urls": [],
-    "lookahead_minutes": 720,
+    # Seven days: the bar promises to ALWAYS name the next meeting, and on a
+    # Friday evening that is Monday morning — a 12 h horizon left it blank.
+    "lookahead_minutes": 10080,
     "refresh_seconds": 300,
     "alert_lead_seconds": 60,
     "grace_seconds": 300,
