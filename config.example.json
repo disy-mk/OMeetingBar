@@ -1,7 +1,7 @@
 {
   "backend": "eds",
   "ics_urls": [],
-  "lookahead_minutes": 720,
+  "lookahead_minutes": 10080,
   "refresh_seconds": 300,
   "fetch_interval_seconds": 60,
   "alert_lead_seconds": 60,
