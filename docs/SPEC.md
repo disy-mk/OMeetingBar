@@ -336,7 +336,8 @@ file talks to the outside world.
   again.
 - Body: `PanelKeyCatcher` → `Flickable` (clip, `StopAtBounds`, `interactive: contentHeight > height`)
   → `Column { spacing: Style.space(14) }` of: `PanelHero` (next meeting, countdown, refresh action),
-  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT.` section, `PanelSeparator`, the
+  the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT. (KW 37)` section (ISO week, computed
+  in QML — Qt has no format token for it), `PanelSeparator`, the
   same for `MORGEN`, then — only when non-empty — a `DEMNÄCHST` section with the next (at most
   five) meetings after tomorrow, their time column reading `So. 10:15` like the bar label, the
   degraded/empty message, `PanelSeparator`, the footer action rows. The later section exists

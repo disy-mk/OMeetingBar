@@ -578,6 +578,23 @@ Item {
     return Qt.formatTime(new Date(sec * 1000), "HH:mm")
   }
 
+  // ISO 8601 week — what "KW" means in Germany: weeks start on Monday, week 1
+  // is the one containing the first Thursday, so 29–31 December can be KW 1 and
+  // 1–3 January KW 52/53. Computed in UTC from the local date parts so a DST
+  // day cannot shift it. Qt has no formatDate token for it.
+  function isoWeek(sec) {
+    var d = new Date(sec * 1000)
+    var date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()))
+    var day = date.getUTCDay() || 7
+    date.setUTCDate(date.getUTCDate() + 4 - day)
+    var yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1))
+    return Math.ceil(((date - yearStart) / 86400000 + 1) / 7)
+  }
+
+  function weekTag(sec) {
+    return " (KW " + isoWeek(sec) + ")"
+  }
+
   function dayShort(sec) {
     return new Date(sec * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd")
   }
@@ -849,7 +866,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "HEUTE · " + root.dayLabel(root.todayStartSec).toUpperCase()
+              text: "HEUTE · " + root.dayLabel(root.todayStartSec).toUpperCase() + root.weekTag(root.todayStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -891,7 +908,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "MORGEN · " + root.dayLabel(root.tomorrowStartSec).toUpperCase()
+              text: "MORGEN · " + root.dayLabel(root.tomorrowStartSec).toUpperCase() + root.weekTag(root.tomorrowStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
