@@ -159,7 +159,7 @@ Item {
   property string lastFetchOutcome: "never"
   property int fetchFailStreak: 0
   // Repeated identical cache/fetch lines carry no information — the counters in
-  // `meetings status` do. Without this a permanently failing backend writes two
+  // `omeetingbar status` do. Without this a permanently failing backend writes two
   // journal lines every minute for ever.
   property string lastCacheLogged: ""
   property string lastFetchLogged: ""
@@ -759,7 +759,7 @@ Item {
 
   // The next event the alert path would act on. Not a filter on nextEvent():
   // the agenda also holds finished and declined meetings, and neither can ever
-  // reach the screen, so `armed` and `meetings preview` ask isAlertable()
+  // reach the screen, so `armed` and `omeetingbar preview` ask isAlertable()
   // instead of re-deriving half of the rule here.
   function nextAlertableEvent(atSec) {
     for (var i = 0; i < root.events.length; i++) {
@@ -1197,7 +1197,7 @@ Item {
       endsInSeconds: entry.end - atSec,
       allDay: entry.allDay,
       // The two facts the agenda added to the cache, so "why did it alert" and
-      // "why did it not" are answerable from `meetings status` alone.
+      // "why did it not" are answerable from `omeetingbar status` alone.
       declined: entry.declined === true,
       ended: entry.end <= atSec,
       hasUrl: entry.url !== "",

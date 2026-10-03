@@ -62,7 +62,7 @@ consumer that answers one of them on its own silently disagrees with the other t
    withdraws its queued alert). Nothing else may iterate the event list to decide whether to alert — the queue included:
    `drainQueue` re-checks the head against the live cache entry right before every summon, so an
    alert queued under the lock for a meeting that has since ended is withdrawn, not shown.
-   `meetings status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
+   `omeetingbar status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
    a wrong decision is diagnosable instead of invisible. `declined` is eds-only: the `ics` and
    `demo` backends always write `false`, which is correct rather than a bug.
 
@@ -164,12 +164,12 @@ dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
   filtering** — an empty list from a failed run is never dressed up as `"ok"`. "Nothing on your
   calendar" and "your calendar could not be read" must not look alike to the user.
 - `warning`: always present, `""` when there is nothing to report. Non-empty means *usable but
-  degraded* — the run produced events, but on fallbacks: e.g. `meetings.json` holds invalid values
+  degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds invalid values
   and the documented defaults were used, one of several calendars failed while the others
   delivered, or an option was ignored because it does not apply to the active backend. `status`
   stays `"ok"`, and the text is German, short and content-free (same privacy rules as `error`).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
-  its tooltip, and `meetings status` reports it. Without that, a typo in `meetings.json` runs on
+  its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
 - `error` belongs to `status: "error"`. A consumer that nevertheless finds a non-empty `error` on
   an `"ok"` cache surfaces it like a warning instead of discarding it.
@@ -239,7 +239,7 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 | `omarchy-shell omeetingbar refresh` | run the fetcher now |
 | `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
 | `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
-| `omarchy-shell omeetingbar dismiss` | hide the alert and stop the alarm sound |
+| `omarchy-shell omeetingbar dismiss` | hide the alert, stop the alarm sound and discard the **whole** pending queue (entries that never reached the screen are recorded as `failed`). Unlike Esc in the overlay, which closes only the head and lets `drainQueue` summon the next queued alert — an explicit dismiss means "give me the screen back" |
 | `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed to the widget on the focused monitor (`Widget.qml`'s handler) — the target to bind a Hyprland key to |
 
 ## Overlay contract — `Alert.qml`
@@ -406,7 +406,7 @@ file talks to the outside world.
   `fetch_interval_seconds`, on wall-clock jumps, and on IPC `refresh`.
 - **Fetch backoff**: consecutive failures double the interval —
   `min(fetch_interval_seconds * 2^min(streak, 4), 900)` — and a single success, or any edit to
-  `meetings.json`, resets it. A backend that cannot work at all (`eds` before the packages are
+  `omeetingbar.json`, resets it. A backend that cannot work at all (`eds` before the packages are
   installed) would otherwise respawn python every interval for ever. Journal noise is bounded by
   `logState`, which drops a repeated (event, detail) pair, and by keeping the streak *count* out
   of the logged line while keeping the backoff step in it: one line per escalation, then silence.
@@ -528,7 +528,7 @@ omarchy-shell omeetingbar status             # next event is the synthetic one
 lands `alert_lead_seconds` before that — by writing an **inject marker** next to the cache:
 `inject.json`, same directory as `--out` points at, same 0600 and same atomic replace as the
 cache. It holds only `id`, `title`, `start`, `end`, `url`; the rest is fixed (`calendar` `Test`,
-a clearly test-labelled title, a demo join URL). The marker, not the event title, is the identity
+`location` `Arbeitszimmer`, a clearly test-labelled title, a demo join URL). The marker, not the event title, is the identity
 of the injected occurrence:
 
 - Every later run reads the marker and merges that event into whatever the active backend
@@ -584,8 +584,8 @@ Verified API recipe — follow it exactly:
   hosts (and their subdomains): `meet.google.com`, `zoom.us`, `zoomgov.com`,
   `teams.microsoft.com`, `teams.live.com`, `webex.com`, `meet.jit.si`, `8x8.vc`, `whereby.com`,
   `gotomeeting.com`, `meet.goto.com`, `gotomeet.me`; for Slack and Discord, which also carry
-  plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…` and
-  `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
+  plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…`,
+  `discordapp.com/channels/…` and `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
   iCalendar `URL` property (for Google events that is the calendar web page, not the room).
   Verified on 2026-09-10 against this account: Google's CalDAV **does** emit
   `X-GOOGLE-CONFERENCE`, and it matched on every event in the window, so the X-property is the

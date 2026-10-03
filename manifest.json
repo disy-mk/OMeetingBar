@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "OMeetingBar",
-    "description": "Nächster Termin in der Bar. Linksklick öffnet die Agenda für heute und morgen, Rechtsklick lädt neu.",
+    "description": "Nächster Termin in der Bar. Linksklick öffnet die Agenda für heute und morgen, Rechts- oder Mittelklick lädt neu.",
     "category": "Time",
     "allowMultiple": false,
     "defaultSection": "center",
@@ -32,8 +32,8 @@
       {
         "key": "warn_minutes",
         "type": "integer",
-        "label": "Warnfarbe ab (Minuten)",
-        "description": "So lange vor dem Start wechselt der Bar-Eintrag auf die Warnfarbe des Themes.",
+        "label": "Volle Farbstärke ab (Minuten)",
+        "description": "So lange vor dem Start zeigt der Bar-Eintrag seine Farbe in voller Stärke, davor leicht abgedimmt.",
         "min": 0,
         "max": 120,
         "step": 1,

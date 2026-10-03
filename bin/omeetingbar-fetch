@@ -1014,7 +1014,7 @@ def read_eds(config, now, window_start, window_end, cache, force_refresh):
     eds, ecal, ical, glib = import_eds()
     registry = open_registry(eds, glib)
 
-    # These two strings are what the widget and `meetings status` put in front of
+    # These two strings are what the widget and `omeetingbar status` put in front of
     # the user in exactly the situation where the next step matters, so they name
     # the GOA dialog that is actually installable here (GOA_DIALOG) and nothing
     # else.
