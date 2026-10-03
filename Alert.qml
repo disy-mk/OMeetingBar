@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Providers.js" as Providers
 
 // Fullscreen blanking alert for an imminent meeting. Deliberately not a toast:
 // every monitor is covered by an opaque themed surface, because the user does
@@ -204,7 +205,12 @@ Item {
     return parts.join(" · ")
   }
 
-  readonly property string hintText: root.hasUrl ? "Enter beitreten · Esc schließen" : "Esc schließen"
+  // Naming the provider tells the user what Enter is about to open before
+  // they press it — a browser tab for Meet, the Zoom client for Zoom.
+  readonly property string providerName: root.hasUrl ? Providers.name(root.joinUrl) : ""
+  readonly property string hintText: !root.hasUrl ? "Esc schließen"
+    : (root.providerName !== "" ? "Enter: in " + root.providerName + " beitreten · Esc schließen"
+      : "Enter beitreten · Esc schließen")
 
   readonly property string queuedText: {
     if (root.queuedCount <= 0) return ""

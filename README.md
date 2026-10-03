@@ -16,14 +16,33 @@ around it.
 - **Bar entry** — the next meeting with time, title and countdown, coloured by state:
   turquoise while it is ahead, orange once it is running.
 - **Agenda popup** (left click) — today and tomorrow, MeetingBar-style: a timeline strip, one
-  row per meeting with a join glyph, finished rows dimmed, the running one emphasised, declined
-  invitations struck through, then the next few later meetings ("Demnächst"), and footer actions
-  (join, create, refresh, open calendar).
+  row per meeting with the provider's mark in its brand colour, finished rows dimmed, the running
+  one emphasised, declined invitations struck through, then the next few later meetings
+  ("Demnächst"), and footer actions (join, create, refresh, open calendar).
 - **Fullscreen alert** — configurable lead time (default 60 s), auto-dismiss, `Enter` joins the
-  meeting, `Esc` dismisses. It also sends a critical notification, plays a sound and wakes the
-  display, so the alert reaches you even when the overlay cannot (see limits).
+  meeting in its provider (the hint names it: "in Teams beitreten"), `Esc` dismisses. It also
+  sends a critical notification, plays a sound and wakes the display, so the alert reaches you
+  even when the overlay cannot (see limits).
+- **Video providers** — join links from Google Meet, Microsoft Teams, Zoom, Webex, Jitsi
+  (meet.jit.si, 8x8.vc), Whereby, GoTo Meeting, Slack Huddles and Discord are recognised in the
+  invite's conference data, location or description. Meet, Teams, Slack and Discord show their
+  own mark; the others share a camera glyph and are told apart by brand colour. Colours are
+  adjusted automatically to stay readable (at least 3:1) on light and dark themes. Marks come
+  from the bar's Nerd Font — no logo files are bundled.
 - **Google Workspace / Google Calendar** through GNOME Online Accounts + evolution-data-server.
   No Google Cloud project, no OAuth client of your own: GOA ships a verified one.
+
+## Screenshots
+
+The bar entry while a meeting is running, and the agenda popup (all meetings shown are made up):
+
+![Bar entry](docs/screenshots/bar.png)
+
+![Agenda popup](docs/screenshots/agenda.png)
+
+The fullscreen alert, a minute before the next meeting:
+
+![Fullscreen alert](docs/screenshots/alert.png)
 
 ## Limits — read these first
 

@@ -16,6 +16,7 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Alert.qml` | `overlay` | the fullscreen alert surface |
 | `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
 | `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
+| `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
 | `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
@@ -369,6 +370,14 @@ file talks to the outside world.
   colours keep meaning "meeting state".
 - Every `Text` sets `textFormat: Text.PlainText`: meeting titles are untrusted third-party input.
   Nerd-font glyphs sit in a fixed-width centred `Item` (single-cell advance, up to 15 px of paint).
+- The provider glyph per row and the join footer come from `Providers.js`, the one table shared
+  with `Alert.qml`. Host matching is exact-or-subdomain (`acme.zoom.us` is Zoom, `evilzoom.us`
+  is not). Only Nerd-Font marks are used — Google, Teams, Slack, Discord have one, the rest share
+  `md-video` — so no trademarked artwork ships with the plugin. The glyph carries the provider's
+  published brand colour (sources in the file), moved towards white or black until it reaches 3:1
+  against `Color.popups.background` (WCAG's figure for non-text UI); a provider without a reliable
+  brand colour (Whereby) keeps the muted theme colour. Brand colour is deliberately confined to
+  the glyph: the time column keeps the two signal colours (running/upcoming).
 - German strings need an explicit locale — the system locale is en_US:
   `d.toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")` → `Do., 10. Sept.`.
 - Sizes come from `Style.space()` / `Style.font.*` only, never a bare pixel number. Width
@@ -537,8 +546,12 @@ Verified API recipe — follow it exactly:
   older than `refresh_seconds`, call `client.refresh_sync()` (guarded by
   `client.check_refresh_supported()`), and record `refreshed_at`.
 - Join URL, in this order: RFC 7986 `CONFERENCE` property → `X-GOOGLE-CONFERENCE` X-property →
-  first `https://meet.google.com/…`, `https://…zoom.us/j/…`, `https://teams.microsoft.com/l/…`,
-  `https://…webex.com/…` match in `LOCATION`, then in `DESCRIPTION`. Do **not** prefer the
+  the first `JOIN_URL_RE` match in `LOCATION`, then in `DESCRIPTION`. `JOIN_URL_RE` accepts these
+  hosts (and their subdomains): `meet.google.com`, `zoom.us`, `zoomgov.com`,
+  `teams.microsoft.com`, `teams.live.com`, `webex.com`, `meet.jit.si`, `8x8.vc`, `whereby.com`,
+  `gotomeeting.com`, `meet.goto.com`, `gotomeet.me`; for Slack and Discord, which also carry
+  plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…` and
+  `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
   iCalendar `URL` property (for Google events that is the calendar web page, not the room).
   Verified on 2026-09-10 against this account: Google's CalDAV **does** emit
   `X-GOOGLE-CONFERENCE`, and it matched on every event in the window, so the X-property is the
