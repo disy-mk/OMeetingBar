@@ -483,7 +483,7 @@ BarWidget {
   // file:// or javascript: url in it must not become a launch argument.
   function httpsUrl(value) {
     var url = String(value || "").trim()
-    return /^https:\/\/[^\s]+$/i.test(url) ? url : ""
+    return /^https:\/\/[^\s\\]+$/i.test(url) ? url : ""
   }
 
   function collapse(value) {

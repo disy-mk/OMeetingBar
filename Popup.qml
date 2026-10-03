@@ -210,8 +210,11 @@ Item {
 
   readonly property var stripSource: {
     var today = timedOnly(root.todayEvents)
-    if (today.length > 0) return { events: today, today: true }
-    return { events: timedOnly(root.tomorrowEvents), today: false }
+    // dayStart/dayEnd clip the rail to the day it stands for (see stripWindow).
+    if (today.length > 0)
+      return { events: today, today: true, dayStart: root.todayStartSec, dayEnd: root.tomorrowStartSec }
+    return { events: timedOnly(root.tomorrowEvents), today: false,
+      dayStart: root.tomorrowStartSec, dayEnd: root.dayAfterStartSec }
   }
 
   readonly property var stripWindow: {
@@ -560,7 +563,7 @@ Item {
   // ever reach a browser command line — not even by way of the host.
   function httpsUrl(value) {
     var url = String(value || "").trim()
-    return /^https:\/\/[^\s]+$/i.test(url) ? url : ""
+    return /^https:\/\/[^\s\\]+$/i.test(url) ? url : ""
   }
 
   // Brand colour of the row's provider, readable on this theme's card, or the

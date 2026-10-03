@@ -154,14 +154,15 @@ save.
 - In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
   `Tab` switches to the neighbouring panel.
 - In the alert: `Enter` or `Space` joins, `Esc` (or any other key, or a click) dismisses.
-  Either way the sound stops.
+  Either way the sound stops. Keys in the first second after it appears are ignored, so a
+  keystroke already on its way down cannot join a meeting you have not read yet.
 - On a meeting notification: click joins while the meeting is on (afterwards it only closes),
   right click closes without joining.
 - From a keybinding or script:
 
 ```bash
 omarchy-shell omeetingbar-agenda toggle   # open/close the agenda popup
-omarchy-shell omeetingbar status          # JSON: backend, cache age, next meeting, alert state
+omarchy-shell omeetingbar status          # JSON: backend, cache age, alert state (ids and times, no titles)
 omarchy-shell omeetingbar test            # fullscreen alert + sound now, synthetic, no calendar needed
 omarchy-shell omeetingbar refresh         # run the fetcher now
 omarchy-shell omeetingbar dismiss         # close the alert, stop the sound, drop queued alerts
@@ -180,7 +181,7 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
 | Symptom | Look here |
 |---|---|
 | Dim `󰃭 —` in the bar | `omarchy-shell omeetingbar status`, then `omeetingbar-fetch --diagnose`. Usually: packages missing, or no Google account connected yet. |
-| No alert | `status`: is the meeting in the cache, is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
+| No alert | `status`: is the meeting in the cache (match it by start time — `status` prints no titles), is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
 | Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply immediately. |
 | Logs | `journalctl --user -t omarchy-shell -f` — the plugin logs one line per state change, never a meeting title. |
 
@@ -191,8 +192,16 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
   check your setup before connecting a work account.
 - The event cache lives in `$XDG_RUNTIME_DIR/omeetingbar/` (tmpfs, mode 0600, gone on
   reboot) and holds only title, times, join URL, calendar name and location — no attendees,
-  no descriptions. Nothing from the calendar is ever written to the journal.
+  no descriptions. Nothing from the calendar is ever written to the journal, and
+  `omarchy-shell omeetingbar status` prints ids and times, never titles.
+- The critical notification does carry the meeting's title and location, and Omarchy keeps
+  dismissed notifications in its history (`~/.local/state/omarchy/notifications/`) — that much
+  outlives a reboot. Set `notify` to `false` if you do not want that.
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
+- The fullscreen alert ignores keys for its first second, so a keystroke in flight cannot join a
+  meeting from an invite you have not seen. Alerts are bounded: at most 8 wait in the queue, at
+  most 3 meetings per minute get their own notification (the rest share one), at most 512
+  occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
   about 5,700 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.

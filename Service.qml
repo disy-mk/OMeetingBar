@@ -52,6 +52,25 @@ Item {
   // The notifications plugin restores its toasts from disk asynchronously after
   // a shell restart; a dismiss sent before that finds nothing and is lost.
   readonly property int toastSettleSeconds: 30
+  // Calendar data is third-party input. These bound what one hostile invite,
+  // or a runaway recurrence rule, can make the shell do.
+  readonly property int maxEvents: 512
+  readonly property int maxUrlChars: 2048
+  readonly property int maxQueueLength: 8
+  // Meetings due in the same tick beyond this share one summary toast instead
+  // of each sending a critical, never-expiring one.
+  readonly property int maxToastsPerTick: 3
+  // Omarchy closes toasts by summary substring; a needle shorter than this
+  // would also take down other apps' toasts, so such a toast is not tracked.
+  readonly property int minToastNeedleChars: 4
+  // The host reports an overlay "open" from the moment a summon is accepted,
+  // before Alert.qml has loaded. Its witness only counts once a failed load
+  // would have had time to clear that state again; the overlay's own callback
+  // (overlayShown) is the primary witness and needs no delay.
+  readonly property int confirmGraceSeconds: 2
+  // After a clock jump the cache predates the sleep; firing waits this long
+  // for the forced fetch so a meeting cancelled while suspended stays silent.
+  readonly property int fireHoldSeconds: 10
 
   // Only the keys this service acts on; the rest of omeetingbar.json belongs to
   // bin/omeetingbar-fetch and to Widget.qml, which read the same file themselves.
@@ -137,6 +156,7 @@ Item {
   // shell restart and so must the list.
   property var openToasts: []
   property int startedAtSec: 0
+  property int fireHoldUntilSec: 0
 
   property int nowSec: 0
   property real lastTickMs: 0
@@ -281,8 +301,11 @@ Item {
       var end = epochOf(entry.end)
       var url = String(entry.url === undefined || entry.url === null ? "" : entry.url)
       // Only https is ever handed to the browser or to a notification --exec,
-      // and every file drops the rest in its own cache parser.
-      if (!/^https:\/\/[^\s]+$/i.test(url)) url = ""
+      // and every file drops the rest in its own cache parser. No backslash:
+      // browsers read it as "/", so it could hide the real host from
+      // Providers.js. The length cap keeps one URL from overflowing the
+      // notification's --exec argv (E2BIG would lose the toast silently).
+      if (url.length > root.maxUrlChars || !/^https:\/\/[^\s\\]+$/i.test(url)) url = ""
       out.push({
         id: id,
         title: String(entry.title === undefined || entry.title === null ? "" : entry.title),
@@ -301,6 +324,14 @@ Item {
       })
     }
     out.sort(function(a, b) { return a.start - b.start })
+    // Earliest first, so the cap drops the far end of the window and never the
+    // meeting about to start. A hostile FREQ=SECONDLY rule expands to hundreds
+    // of thousands of instances; the fetcher caps them too, this is the second
+    // line.
+    if (out.length > root.maxEvents) {
+      logState("events-capped", "count=" + out.length)
+      out = out.slice(0, root.maxEvents)
+    }
     return out
   }
 
@@ -386,6 +417,7 @@ Item {
       if (index !== -1 && isAlertable(root.events[index], atSec)) continue
       setAlertState(pending.id, { failed: atSec })
       dequeueAlert(i)
+      withdrawToast(pending.id, atSec)
       saveState()
       logState("alert-withdrawn", "id=" + pending.id + (index === -1 ? " gone from cache" : " no longer alertable"))
     }
@@ -810,10 +842,17 @@ Item {
     return /^-/.test(text) ? " " + text : text
   }
 
+  // Omarchy renders a toast's body as StyledText (the summary is plain text),
+  // so a location of "<b>…" from an invite would restyle the toast. The
+  // headline needs no escaping.
+  function escapeMarkup(text) {
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
+
   function notificationBody(entry, atSec) {
     var parts = ["Beginnt " + relativeText(entry.start - atSec), timeRangeText(entry)]
-    if (entry.location !== "") parts.push(entry.location)
-    else if (entry.calendar !== "") parts.push(entry.calendar)
+    if (entry.location !== "") parts.push(escapeMarkup(entry.location))
+    else if (entry.calendar !== "") parts.push(escapeMarkup(entry.calendar))
     return parts.join(" · ")
   }
 
@@ -837,14 +876,27 @@ Item {
     trackToast(entry, headline)
   }
 
+  // Meetings due in the same tick beyond maxToastsPerTick get one toast for
+  // all of them: no join link (the agenda has those), tracked under its own id
+  // so it comes down with the last of them.
+  function sendSummaryNotification(extra, atSec) {
+    var latestEnd = atSec
+    for (var i = 0; i < extra.length; i++) latestEnd = Math.max(latestEnd, toastEnd(extra[i]))
+    var headline = extra.length + " weitere Termine"
+    Quickshell.execDetached(["omarchy-notification-send", "-u", "critical", "-g", "󰃭",
+      headline, "Beginnen in Kürze · nicht einzeln gemeldet"])
+    trackToast({ id: "summary-" + atSec, title: headline, start: atSec, end: latestEnd }, headline)
+  }
+
   // Omarchy's notifications plugin can only be asked to close a toast by
   // summary substring: a CloseNotification by id leaves its toast on screen
   // (measured on Omarchy 4.x). So the needle is the full headline, and a
-  // meeting with no title is not tracked at all, since the fallback headline
-  // "Termin" would also hit other apps' toasts. Those still close by click
-  // (bin/omeetingbar-join) or right click.
+  // meeting with no title, or one shorter than minToastNeedleChars, is not
+  // tracked at all, since "Termin" or "1:1" would also hit other apps' toasts.
+  // Those still close by click (bin/omeetingbar-join) or right click.
   function trackToast(entry, headline) {
     if (String(entry.title || "").trim() === "") return
+    if (headline.trim().length < root.minToastNeedleChars) return
     var id = String(entry.id)
     for (var i = 0; i < root.openToasts.length; i++) if (root.openToasts[i].id === id) return
     root.openToasts = root.openToasts.concat([{ id: id, headline: headline, end: toastEnd(entry) }])
@@ -865,7 +917,9 @@ Item {
 
   function clearEndedToasts(atSec) {
     if (root.openToasts.length === 0) return
-    if (atSec - root.startedAtSec < root.toastSettleSeconds) return
+    // startedAtSec is 0 until Component.onCompleted; a tick before that must
+    // not slip past the settle window.
+    if (root.startedAtSec === 0 || atSec - root.startedAtSec < root.toastSettleSeconds) return
     var kept = []
     var cleared = 0
     for (var i = 0; i < root.openToasts.length; i++) {
@@ -883,6 +937,26 @@ Item {
     root.openToasts = kept
     saveState()
     logState("toasts-cleared", "count=" + cleared)
+  }
+
+  // An alert withdrawn before it was shown (cancelled or declined while the
+  // queue waited) would leave a toast with a live join link behind. Its end is
+  // pulled to now, and clearEndedToasts takes it down on the next tick with
+  // the same needle rules as any other ended toast. The caller saves state.
+  function withdrawToast(id, atSec) {
+    var key = String(id)
+    var next = []
+    var hit = false
+    for (var i = 0; i < root.openToasts.length; i++) {
+      var toast = root.openToasts[i]
+      if (toast.id === key && atSec < toast.end) {
+        next.push({ id: toast.id, headline: toast.headline, end: atSec })
+        hit = true
+      } else next.push(toast)
+    }
+    if (!hit) return
+    root.openToasts = next
+    logState("toast-withdrawn", "id=" + key)
   }
 
   // A child process, not a detached one, so closing the alert can cut it short.
@@ -910,6 +984,7 @@ Item {
       return false
     }
     var payload = {
+      id: entry.id,
       title: entry.title,
       start: entry.start,
       end: entry.end,
@@ -943,9 +1018,21 @@ Item {
     lockProbe.running = true
   }
 
-  // The one place "shown" is set. The witness is the host: isPluginOpen reads
-  // the overlay's own `opened` property, so a summon the overlay never
-  // rendered does not count as displayed.
+  // Alert.qml calls this from open(): the overlay itself is the witness that
+  // the alert is on screen. The host's isPluginOpen is not one on its own — it
+  // says "open" from the moment a summon is accepted, before the overlay has
+  // loaded (see confirmGraceSeconds).
+  function overlayShown(id) {
+    if (root.alertQueue.length === 0 || root.lastSummonKind !== "queue") return
+    var head = root.alertQueue[0]
+    if (head.summonedAtSec === 0 || head.shownAt > 0 || head.id !== String(id)) return
+    confirmShown(head, Math.floor(Date.now() / 1000))
+  }
+
+  // The one place "shown" is set. Witnesses: the overlay's own open() through
+  // overlayShown, or the host's isPluginOpen once confirmGraceSeconds have
+  // passed since the summon — so a summon the overlay never rendered does not
+  // count as displayed.
   function confirmShown(entry, atSec) {
     if (entry.shownAt > 0) return
     entry.shownAt = atSec
@@ -956,7 +1043,7 @@ Item {
     logState("alert-shown", "id=" + entry.id)
   }
 
-  function fireEvent(entry, atSec) {
+  function fireEvent(entry, atSec, ordinal) {
     // "notified" is persisted before any side effect: a crash below must not
     // repeat the wake, the notification or the sound, on this tick or after a
     // hot reload.
@@ -965,12 +1052,19 @@ Item {
     logState("notified", "id=" + entry.id + " lead=" + (entry.start - atSec) + "s")
 
     if (root.wakeDisplayEnabled) Quickshell.execDetached(["omarchy-brightness-display", "on"])
-    if (root.notifyEnabled) sendNotification(entry, atSec)
+    // Beyond maxToastsPerTick in one tick, tick() sends one summary toast.
+    if (root.notifyEnabled && (ordinal || 0) < root.maxToastsPerTick) sendNotification(entry, atSec)
     playSound()
 
     // Whether the overlay reaches the screen is the second, separate fact: it
-    // is queued here and only marked shown once the host confirms it.
-    if (enqueueAlert(entry, atSec)) saveState()
+    // is queued here and only marked shown once a witness confirms it. A full
+    // queue is a flood, not a schedule: the entry is recorded as failed instead
+    // of blanking the screen a ninth time in a row.
+    if (root.alertQueue.length >= root.maxQueueLength) {
+      setAlertState(entry.id, { failed: atSec })
+      saveState()
+      logState("alert-queue-full", "id=" + entry.id)
+    } else if (enqueueAlert(entry, atSec)) saveState()
     probeLock(true)
   }
 
@@ -1017,7 +1111,8 @@ Item {
     }
 
     var head = root.alertQueue[0]
-    if (open && head.summonedAtSec > 0 && head.shownAt === 0 && root.lastSummonKind === "queue")
+    if (open && head.summonedAtSec > 0 && head.shownAt === 0 && root.lastSummonKind === "queue"
+      && atSec - head.summonedAtSec >= root.confirmGraceSeconds)
       confirmShown(head, atSec)
 
     if (head.shownAt > 0) {
@@ -1050,6 +1145,7 @@ Item {
       if (!isAlertable(liveIndex !== -1 ? root.events[liveIndex] : head, atSec)) {
         setAlertState(head.id, { failed: atSec })
         dequeueAlert(0)
+        withdrawToast(head.id, atSec)
         saveState()
         logState("alert-withdrawn", "id=" + head.id + " no longer alertable")
         return
@@ -1094,12 +1190,11 @@ Item {
     logState(accepted ? "alert-summoned" : "alert-summon-failed",
       "id=" + head.id + " attempt=" + head.attempts)
     if (!accepted) return
-    // The host delivers straight to an already mounted overlay, so the
-    // confirmation can be in immediately; otherwise confirmTimer samples it
-    // faster than the 1 Hz tick, which could miss an alert that was shown and
-    // dismissed inside the same second.
-    if (alertOpen()) confirmShown(head, atSec)
-    else confirmTimer.start()
+    // Alert.qml's open() confirms through overlayShown the moment it renders,
+    // whether the overlay was mounted already or has just been loaded.
+    // confirmTimer is the fallback witness via the host: sampled faster than
+    // the 1 Hz tick, but only after the grace.
+    confirmTimer.start()
   }
 
   function updateInhibit(atSec) {
@@ -1134,6 +1229,7 @@ Item {
       logState("clock-jump", Math.round(sinceLastTickMs / 1000) + "s")
       pruneState(atSec)
       runFetch("clock-jump")
+      root.fireHoldUntilSec = atSec + root.fireHoldSeconds
     }
 
     checkFetchWatchdog(atSec)
@@ -1159,15 +1255,23 @@ Item {
     // this is the only place a probe is started outside fireEvent.
     if (root.alertQueue.length > 0 && root.alertQueue[0].shownAt === 0) probeLock(false)
 
-    if (root.stateLoaded && root.cacheLoaded && root.configLoaded) {
+    // Right after a clock jump the cache predates the sleep. Firing waits for
+    // the forced fetch (bounded by fireHoldSeconds), so a meeting cancelled or
+    // moved while the machine slept does not wake, notify and ring.
+    var holdFires = fetchProcess.running && atSec < root.fireHoldUntilSec
+    if (root.stateLoaded && root.cacheLoaded && root.configLoaded && !holdFires) {
       // Two meetings in the same minute are two alerts: every due event fires
       // this tick, not only the earliest one. Bounded because fireEvent marks
       // each id notified before dueEvent looks again.
+      var fired = []
       for (var fires = 0; fires < 8; fires++) {
         var due = dueEvent(atSec)
         if (due === null) break
-        fireEvent(due, atSec)
+        fireEvent(due, atSec, fired.length)
+        fired.push(due)
       }
+      if (root.notifyEnabled && fired.length > root.maxToastsPerTick)
+        sendSummaryNotification(fired.slice(root.maxToastsPerTick), atSec)
       requeueUnshown(atSec)
     }
 
@@ -1189,8 +1293,8 @@ Item {
   function eventJson(entry, atSec) {
     var state = stateOf(entry.id)
     return {
+      // Ids and times only: `status` is what people paste into bug reports.
       id: entry.id,
-      title: entry.title,
       start: entry.start,
       end: entry.end,
       inSeconds: entry.start - atSec,
@@ -1201,7 +1305,6 @@ Item {
       declined: entry.declined === true,
       ended: entry.end <= atSec,
       hasUrl: entry.url !== "",
-      calendar: entry.calendar,
       notified: state !== null && state.notified > 0,
       shown: state !== null && state.shown > 0,
       failed: state !== null && state.failed > 0,
@@ -1215,7 +1318,6 @@ Item {
       var pending = root.alertQueue[i]
       out.push({
         id: pending.id,
-        title: pending.title,
         start: pending.start,
         inSeconds: pending.start - atSec,
         graceLeftSeconds: pending.untilSec - atSec,
@@ -1426,8 +1528,10 @@ Item {
         stop()
         return
       }
-      if (root.alertOpen() && root.lastSummonKind === "queue")
-        root.confirmShown(head, Math.floor(Date.now() / 1000))
+      var atSec = Math.floor(Date.now() / 1000)
+      if (atSec - head.summonedAtSec >= root.confirmGraceSeconds
+        && root.alertOpen() && root.lastSummonKind === "queue")
+        root.confirmShown(head, atSec)
     }
   }
 
