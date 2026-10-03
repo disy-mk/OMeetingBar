@@ -49,7 +49,8 @@ consumer that answers one of them on its own silently disagrees with the other t
    evil.example, so `hostOf` also returns `""` for any authority containing one. Each file
    re-checks this in its own cache/payload parser, because the cache is a user-writable file and
    neither `file://`, `javascript:` nor an argument containing whitespace may ever reach a
-   browser command line. The fetcher's `clean_url` enforces the `https://` prefix on its side.
+   browser command line. The fetcher's `clean_url` applies the same test (plus the 2048-character
+   cap) before anything is written to the cache.
 4. **All-day events never take the alert path.** An all-day entry has no meaningful start moment,
    so the service skips it when firing regardless of `skip_all_day`; that option only decides
    whether all-day entries reach the cache and the popup's agenda rows. The bar label never shows
@@ -148,6 +149,7 @@ dismissed notifications in its history under `~/.local/state/omarchy/notificatio
   "warning": "",
   "generated_at": 1757500000,
   "refreshed_at": 1757499900,
+  "refresh_ok_at": 1757499900,
   "events": [
     { "id": "9f2c…", "title": "Standup", "start": 1757503200, "end": 1757505000,
       "all_day": false, "declined": false, "url": "https://meet.google.com/abc-defg-hij",
@@ -162,18 +164,28 @@ dismissed notifications in its history under `~/.local/state/omarchy/notificatio
 - `url`: `https://…` or `""` (invariant 3). The fetcher never writes any other scheme, and every
   consumer still re-validates.
 - `id`: stable across runs — `sha1(uid + "@" + instance_start_epoch)[:16]`. Must be identical for
-  the same occurrence on every run, or the alert fires repeatedly.
+  the same occurrence on every run, or the alert fires repeatedly. An event without a UID hashes
+  `"~" + title` in its place, so two UID-less meetings at the same time stay two events.
+- `refreshed_at`: the last **attempted** network refresh (the throttle for `refresh_seconds`);
+  `refresh_ok_at`: the last one that **succeeded** (the freshness). Both unix seconds, 0 for never.
+  They differ on purpose: a refresh that keeps failing — revoked token, VPN down — must throttle
+  like any other (or every run blocks on it again) and still be visible as "the data is old".
 - `status: "error"` + human-readable `error` when the backend fails; `events` then keeps the last
-  known good list if one is available (write `stale: true` in that case). Never put tokens,
-  URLs with secrets, attendee emails or full ICS text into `error`.
+  known good list if one is available (write `stale: true` in that case), re-filtered with the
+  current config and without occurrences that ended before the agenda window. Never put tokens,
+  URLs with secrets, attendee emails or full ICS text into `error`; calendars are named by
+  position ("Kalender 2") because display names are often an address, and backend error text is
+  scrubbed of URLs and addresses before it is quoted.
 - `status` is `"error"` **whenever the backend reported a failure and no event survived
   filtering** — an empty list from a failed run is never dressed up as `"ok"`. "Nothing on your
   calendar" and "your calendar could not be read" must not look alike to the user.
 - `warning`: always present, `""` when there is nothing to report. Non-empty means *usable but
   degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds invalid values
   and the documented defaults were used, one of several calendars failed while the others
-  delivered, or an option was ignored because it does not apply to the active backend. `status`
-  stays `"ok"`, and the text is German, short and content-free (same privacy rules as `error`).
+  delivered (its previous events were carried forward), the pushed network refresh failed or
+  has not succeeded for over 30 min, a calendar hit the instance cap, or an option was ignored
+  because it does not apply to the active backend. `status` stays `"ok"`, and the text is
+  German, short and content-free (same privacy rules as `error`).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
   its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
@@ -525,11 +537,13 @@ file talks to the outside world.
   the file change, after `omarchy-shell shell rescanPlugins`, and after clearing
   `~/.cache/quickshell/qmlcache`. Only `omarchy restart shell` loads changed service code.
   Config changes do apply immediately (the config is read through a `FileView`).
-- GOA/EDS is **not installed yet**; `backend: "demo"` must therefore work end to end so the whole
-  plugin can be tested before the Google account exists. The required packages are exactly
-  `evolution-data-server`, `gnome-online-accounts` and `gnome-online-accounts-gtk`, and the GOA
-  account dialog on this machine is **`gnome-online-accounts-gtk`** — the only one installed here.
-  Docs, installer output and diagnostics name that command and no other settings app.
+- `backend: "demo"` must work end to end so the whole plugin can be tested before a Google
+  account exists (it did here: GOA/EDS were installed only after the first version ran). The
+  required packages are exactly `evolution-data-server`, `gnome-online-accounts`,
+  `gnome-online-accounts-gtk` and `python-gobject` (in Omarchy's base set, but nothing else in
+  the list depends on it, so it is named), and the GOA account dialog on this machine is
+  **`gnome-online-accounts-gtk`** — the only one installed here. Docs, installer output and
+  diagnostics name that command and no other settings app.
 - `libical` 4.0.5 ships `ICalGLib-4.0.typelib`, `evolution-data-server` ships `ECal-2.0` and
   `EDataServer-1.2` (both from `pacman -Fl`).
 
@@ -538,11 +552,22 @@ file talks to the outside world.
 CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [--in-seconds N]
 [--refresh] [--diagnose] [--print]`
 - `--in-seconds N`: inject one synthetic event starting N seconds from now, so the alert path can
-  be tested deterministically on whatever backend is configured (see *Test injection* below).
+  be tested deterministically on whatever backend is configured (see *Test injection* below). A
+  start already more than `grace_seconds` in the past is spent on the spot and said so in
+  `warning`; the marker is subject to the window only, never to `title_blocklist` or
+  `min_duration_minutes`.
 - `--diagnose`: print a human-readable readiness report (packages, typelibs, GOA accounts,
-  calendars found, last sync age) — no event content.
-- `--print`: write the JSON to stdout instead of the cache file.
+  calendars found, last sync attempt and last success) — no event content. It reads the calendar
+  like a normal run, a due network refresh included, but writes no cache.
+- `--print`: write the JSON to stdout instead of the cache file (full event content — an explicit
+  opt-in, the one exception to the privacy rule above).
 - Exit 0 on success; on failure still write a cache with `status: "error"` and exit non-zero.
+- **Bounds** (calendar data is third-party input): at most 2000 instances per calendar or feed
+  (the expansion is stopped, `warning` says so), at most 512 events in the cache (earliest
+  first), URLs over 2048 characters are dropped. Service.qml caps again on its side.
+- **Deadlines**: the service kills the fetcher at 45 s and a killed run writes no cache, so every
+  blocking call has one — 15 s for all pushed refreshes together (a `Gio.Cancellable` fired from a
+  timer), 30 s for all ICS downloads together, 1 s per `connect_sync` (see below).
 
 ### Test injection — `--in-seconds`
 
@@ -609,16 +634,39 @@ Verified API recipe — follow it exactly:
   call `convert_to_zone(ICalGLib.Timezone.get_utc_timezone())` first, or every timed event is off
   by the local offset. All-day events are `is_date() == True`.
 - Network freshness: EDS's own refresh interval defaults to **60 minutes**. When the last refresh is
-  older than `refresh_seconds`, call `client.refresh_sync()` (guarded by
-  `client.check_refresh_supported()`), and record `refreshed_at`.
+  older than `refresh_seconds`, call `client.refresh_sync(cancellable)` (guarded by
+  `client.check_refresh_supported()`) for every calendar inside one 15 s budget. The attempt is
+  stamped into `refreshed_at` and **persisted before** the refresh starts (the previous cache is
+  rewritten with the new stamp), so a refresh killed by the watchdog cannot make the next run hang
+  on the same refresh again. Outcomes go to `refresh_ok_at` and `warning`: all failed → "Kalender-
+  Sync fehlgeschlagen" and `refresh_ok_at` unchanged; some failed → "teilweise fehlgeschlagen
+  (n von m)"; and whenever `refresh_ok_at` is older than 30 min → "Letzter erfolgreicher
+  Kalender-Sync vor …". A refresh failure never discards the local copy: EDS still has it, and a
+  stale list that says so beats an empty one.
+- One failing calendar: any exception from `connect_sync` or the expansion is that calendar's
+  problem, not the run's. It is reported as "Kalender N (…)" in `warning` (or in `error` when
+  nothing at all was read), and its events from the previous cache are carried forward (with
+  `_join_path: "cache"`), so a one-minute hiccup neither empties the agenda nor makes Service.qml
+  withdraw a queued alert as "gone from the cache".
+- `STATUS:CANCELLED` occurrences are dropped (`get_status()` on eds, the `STATUS` property on
+  ics) — a backend that still hands them over must not blank the screen for them.
 - Join URL, in this order: RFC 7986 `CONFERENCE` property → `X-GOOGLE-CONFERENCE` X-property →
   the first `JOIN_URL_RE` match in `LOCATION`, then in `DESCRIPTION`. `JOIN_URL_RE` accepts these
   hosts (and their subdomains): `meet.google.com`, `zoom.us`, `zoomgov.com`,
   `teams.microsoft.com`, `teams.live.com`, `webex.com`, `meet.jit.si`, `8x8.vc`, `whereby.com`,
   `gotomeeting.com`, `meet.goto.com`, `gotomeet.me`; for Slack and Discord, which also carry
   plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…`,
-  `discordapp.com/channels/…` and `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
-  iCalendar `URL` property (for Google events that is the calendar web page, not the room).
+  `discordapp.com/channels/…` and `discord.gg/…` count. `Providers.js` must know the same hosts.
+  Every path is allow-listed: a `CONFERENCE` / `X-GOOGLE-CONFERENCE` value counts only if the
+  whole value matches `JOIN_URL_RE` (`fullmatch`), not merely because it starts with `https://` —
+  those properties come from the invite like everything else. The host has to **end** after the
+  allow-listed name (a port may follow), so `zoom.us.evil.example` is rejected instead of being
+  truncated to `zoom.us`; a URL ends at whitespace, `<>"'`, Markdown `*` and `|`, a backslash and
+  zero-width characters, and trailing sentence punctuation (plus `*_~|`) is stripped. Only
+  `&lt; &gt; &quot; &#39; &apos; &nbsp; &amp;` are unescaped before matching — `html.unescape()`
+  also decodes legacy entities without a semicolon and turned `?pwd=x&region=eu` into `®ion=eu`.
+  Do **not** prefer the iCalendar `URL` property (for Google events that is the calendar web
+  page, not the room).
   Verified on 2026-09-10 against this account: Google's CalDAV **does** emit
   `X-GOOGLE-CONFERENCE`, and it matched on every event in the window, so the X-property is the
   path that actually carries the Meet link here. The DESCRIPTION regex stays as the fallback for

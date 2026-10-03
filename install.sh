@@ -7,7 +7,9 @@
 set -euo pipefail
 
 PLUGIN_ID="io.github.disy-mk.omeetingbar"
-REQUIRED_PACKAGES=(gnome-online-accounts gnome-online-accounts-gtk evolution-data-server)
+# python-gobject is in Omarchy's base set, but none of the other three depends
+# on it and the eds backend cannot start without it, so it is checked too.
+REQUIRED_PACKAGES=(gnome-online-accounts gnome-online-accounts-gtk evolution-data-server python-gobject)
 
 # The shell hardcodes ~/.config/omarchy/plugins (PluginRegistry.qml pluginsDir),
 # so this path is HOME-based on purpose and ignores XDG_CONFIG_HOME.
@@ -148,6 +150,20 @@ else
   install -Dm600 "$SCRIPT_DIR/config.example.json" "$CONFIG_FILE"
 fi
 
+# What the config says the backend is, read once. The package block below only
+# advises a switch to demo when the config actually sits on eds (an ics or demo
+# config must not be overwritten by the advice), and the next-steps block only
+# prints the switch back when it is on demo. On a fresh install
+# (config.example.json ships "eds") a no-op jq line would be one the user
+# cannot tell apart from a real change.
+config_backend="eds"
+if [[ -e $CONFIG_FILE ]]; then
+  config_backend=$(jq -r '
+    if type == "object" and (.backend | type) == "string" then .backend else "eds" end
+  ' "$CONFIG_FILE" 2>/dev/null) || config_backend="eds"
+  [[ -n $config_backend ]] || config_backend="eds"
+fi
+
 # ----------------------------------------------------------------- packages
 
 step "Arch packages for the eds backend"
@@ -168,13 +184,17 @@ if (( ${#missing_packages[@]} )); then
   say ""
   say "      sudo pacman -S --needed ${missing_packages[*]}"
   say ""
-  # config.example.json ships backend "eds" as the intended steady state, so a
-  # fresh install without these packages needs to be told to start on demo.
-  say "  Until they are installed, run the plugin on the demo backend:"
-  say ""
-  say "      jq '.backend = \"demo\"' $CONFIG_FILE > $CONFIG_FILE.tmp \\"
-  say "        && mv $CONFIG_FILE.tmp $CONFIG_FILE"
-  demo_advised=1
+  if [[ $config_backend == "eds" ]]; then
+    # config.example.json ships backend "eds" as the intended steady state, so a
+    # fresh install without these packages needs to be told to start on demo.
+    # The subshell umask keeps the rewritten config at 0600: ics_urls are bearer
+    # tokens, and a plain redirect would hand them a 0644 file.
+    say "  Until they are installed, run the plugin on the demo backend:"
+    say ""
+    say "      (umask 077; jq '.backend = \"demo\"' \"$CONFIG_FILE\" > \"$CONFIG_FILE.tmp\") \\"
+    say "        && mv \"$CONFIG_FILE.tmp\" \"$CONFIG_FILE\""
+    demo_advised=1
+  fi
 fi
 
 # -------------------------------------------------------------- path wrapper
@@ -300,15 +320,7 @@ fi
 # The steps are built, not pasted, so they can never contradict the package
 # block above: "switch to eds" is only printed when the config actually sits on
 # demo — because that block just advised it, or because an existing
-# omeetingbar.json says so. On a fresh install (config.example.json ships "eds")
-# that jq line would be a no-op the user cannot tell apart from a real change.
-config_backend="eds"
-if [[ -e $CONFIG_FILE ]]; then
-  config_backend=$(jq -r '
-    if type == "object" and (.backend | type) == "string" then .backend else "eds" end
-  ' "$CONFIG_FILE" 2>/dev/null) || config_backend="eds"
-  [[ -n $config_backend ]] || config_backend="eds"
-fi
+# omeetingbar.json says so (config_backend, read before the package check).
 
 step_number=0
 next_step() {
@@ -329,8 +341,8 @@ say '     Google auswählen, anmelden, "Kalender" einschalten.'
 
 if (( demo_advised )) || [[ $config_backend == "demo" ]]; then
   next_step "Backend von demo auf eds umstellen (erst wenn die Schritte oben erledigt sind):"
-  say "       jq '.backend = \"eds\"' $CONFIG_FILE > $CONFIG_FILE.tmp \\"
-  say "         && mv $CONFIG_FILE.tmp $CONFIG_FILE"
+  say "       (umask 077; jq '.backend = \"eds\"' \"$CONFIG_FILE\" > \"$CONFIG_FILE.tmp\") \\"
+  say "         && mv \"$CONFIG_FILE.tmp\" \"$CONFIG_FILE\""
 fi
 
 next_step "Testen:"

@@ -88,8 +88,9 @@ cd ~/.config/omarchy/plugins/io.github.disy-mk.omeetingbar
 the plugin with the running shell, puts the widget on the bar and installs a small wrapper
 at `~/.local/bin/omeetingbar-fetch`. It ends with a numbered list of the steps only you can do:
 
-1. Install what is still missing of `evolution-data-server`, `gnome-online-accounts` and
-   `gnome-online-accounts-gtk` — it prints the exact `sudo pacman -S --needed …` line.
+1. Install what is still missing of `evolution-data-server`, `gnome-online-accounts`,
+   `gnome-online-accounts-gtk` and `python-gobject` — it prints the exact
+   `sudo pacman -S --needed …` line.
 2. Add your Google account in `gnome-online-accounts-gtk` and enable "Calendar".
 3. While packages are missing, the script suggests running on the `demo` backend meanwhile (a
    `jq` one-liner on the config). If you did that, switch `backend` back to `eds` once 1 and 2
@@ -182,6 +183,7 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
 |---|---|
 | Dim `󰃭 —` in the bar | `omarchy-shell omeetingbar status`, then `omeetingbar-fetch --diagnose`. Usually: packages missing, or no Google account connected yet. |
 | No alert | `status`: is the meeting in the cache (match it by start time — `status` prints no titles), is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
+| Tooltip says "Kalender-Sync fehlgeschlagen" or "Letzter erfolgreicher Kalender-Sync vor …" | EDS cannot reach Google: VPN or network down, or the account's login expired — open `gnome-online-accounts-gtk` and sign in again. Until then the plugin shows EDS's last local copy. `omeetingbar-fetch --diagnose` prints the last attempt and the last success. |
 | Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply immediately. |
 | Logs | `journalctl --user -t omarchy-shell -f` — the plugin logs one line per state change, never a meeting title. |
 
@@ -229,8 +231,8 @@ ein Klick danach öffnet den Link nicht mehr, ein Rechtsklick schließt immer oh
 
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
 `./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die noch
-fehlenden der drei benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
-`gnome-online-accounts-gtk`), die Anleitung, das Google-Konto in `gnome-online-accounts-gtk`
+fehlenden der benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
+`gnome-online-accounts-gtk`, `python-gobject`), die Anleitung, das Google-Konto in `gnome-online-accounts-gtk`
 zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es das `demo`-Backend vor. Ein
 Shell-Neustart ist nicht nötig, der nächste Abruf übernimmt Pakete und Konto.
 
