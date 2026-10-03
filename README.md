@@ -86,15 +86,23 @@ cd ~/.config/omarchy/plugins/io.github.disy-mk.omeetingbar
 `install.sh` never runs `sudo`. It validates the manifest, creates
 `~/.config/omarchy/omeetingbar.json` from `config.example.json` (only if absent), registers
 the plugin with the running shell, puts the widget on the bar and installs a small wrapper
-at `~/.local/bin/omeetingbar-fetch`. It then prints the two steps only you can do:
+at `~/.local/bin/omeetingbar-fetch`. It ends with a numbered list of the steps only you can do:
 
-```bash
-sudo pacman -S --needed evolution-data-server gnome-online-accounts gnome-online-accounts-gtk
-gnome-online-accounts-gtk     # add your Google account, enable "Calendar"
-omarchy restart shell
-```
+1. Install what is still missing of `evolution-data-server`, `gnome-online-accounts` and
+   `gnome-online-accounts-gtk` — it prints the exact `sudo pacman -S --needed …` line.
+2. Add your Google account in `gnome-online-accounts-gtk` and enable "Calendar".
+3. While packages are missing, the script suggests running on the `demo` backend meanwhile (a
+   `jq` one-liner on the config). If you did that, switch `backend` back to `eds` once 1 and 2
+   are done; it prints that line too.
+4. Test: `omarchy-shell omeetingbar test`, `omarchy-shell omeetingbar status`,
+   `omeetingbar-fetch --diagnose`.
 
-Until the packages are installed the bar shows a dim `󰃭 —` with the reason in its tooltip;
+No shell restart is needed: the fetcher is a separate process started fresh on every refresh,
+so `omarchy-shell omeetingbar refresh` (or the next interval) picks up the packages and the
+account.
+
+Until the packages are installed (and unless you switched to `demo`) the bar shows a dim
+`󰃭 —` with the reason in its tooltip;
 `omarchy-shell omeetingbar test` shows the fullscreen alert regardless, so you can see it
 before connecting anything.
 
@@ -135,7 +143,7 @@ save.
 | `skip_declined` | `true` | Declined invitations never alert but are listed, struck through, in the agenda. `false` treats them like any other meeting. |
 | `min_duration_minutes` | `0` | Ignore meetings shorter than this. |
 | `title_blocklist` | `[]` | Title fragments that exclude a meeting everywhere. |
-| `calendars_exclude` | `[]` | Calendar names to ignore. |
+| `calendars_exclude` | `[]` | Calendar names or UIDs to ignore (case-insensitive). |
 | `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. |
 | `widget.max_title_chars` | `28` | Truncate the title in the bar. |
 | `widget.hide_when_empty` | `true` | Collapse the bar entry when the agenda is empty. |
@@ -145,18 +153,19 @@ save.
 - **Left click** the bar entry → agenda popup. **Right/middle click** → refresh.
 - In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
   `Tab` switches to the neighbouring panel.
-- In the alert: `Enter` joins, `Esc` (or any other key, or a click) dismisses. Either way the
-  sound stops.
+- In the alert: `Enter` or `Space` joins, `Esc` (or any other key, or a click) dismisses.
+  Either way the sound stops. Keys in the first second after it appears are ignored, so a
+  keystroke already on its way down cannot join a meeting you have not read yet.
 - On a meeting notification: click joins while the meeting is on (afterwards it only closes),
   right click closes without joining.
 - From a keybinding or script:
 
 ```bash
 omarchy-shell omeetingbar-agenda toggle   # open/close the agenda popup
-omarchy-shell omeetingbar status          # JSON: backend, cache age, next meeting, alert state
+omarchy-shell omeetingbar status          # JSON: backend, cache age, alert state (ids and times, no titles)
 omarchy-shell omeetingbar test            # fullscreen alert + sound now, synthetic, no calendar needed
 omarchy-shell omeetingbar refresh         # run the fetcher now
-omarchy-shell omeetingbar dismiss         # close the alert
+omarchy-shell omeetingbar dismiss         # close the alert, stop the sound, drop queued alerts
 omeetingbar-fetch --diagnose              # packages, typelibs, GOA accounts, calendars found
 omeetingbar-fetch --in-seconds 90         # inject a test meeting 90 s out → real alert at T-60
 ```
@@ -172,7 +181,7 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
 | Symptom | Look here |
 |---|---|
 | Dim `󰃭 —` in the bar | `omarchy-shell omeetingbar status`, then `omeetingbar-fetch --diagnose`. Usually: packages missing, or no Google account connected yet. |
-| No alert | `status`: is the meeting in the cache, is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
+| No alert | `status`: is the meeting in the cache (match it by start time — `status` prints no titles), is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
 | Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply immediately. |
 | Logs | `journalctl --user -t omarchy-shell -f` — the plugin logs one line per state change, never a meeting title. |
 
@@ -183,11 +192,19 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
   check your setup before connecting a work account.
 - The event cache lives in `$XDG_RUNTIME_DIR/omeetingbar/` (tmpfs, mode 0600, gone on
   reboot) and holds only title, times, join URL, calendar name and location — no attendees,
-  no descriptions. Nothing from the calendar is ever written to the journal.
+  no descriptions. Nothing from the calendar is ever written to the journal, and
+  `omarchy-shell omeetingbar status` prints ids and times, never titles.
+- The critical notification does carry the meeting's title and location, and Omarchy keeps
+  dismissed notifications in its history (`~/.local/state/omarchy/notifications/`) — that much
+  outlives a reboot. Set `notify` to `false` if you do not want that.
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
+- The fullscreen alert ignores keys for its first second, so a keystroke in flight cannot join a
+  meeting from an invite you have not seen. Alerts are bounded: at most 8 wait in the queue, at
+  most 3 meetings per minute get their own notification (the rest share one), at most 512
+  occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 4,500 lines of QML and Python, and `docs/SPEC.md` explains every decision.
+  about 5,700 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 
@@ -211,10 +228,11 @@ schließt und stoppt den Ton. Die Meeting-Notification schließt sich zum Meetin
 ein Klick danach öffnet den Link nicht mehr, ein Rechtsklick schließt immer ohne Aktion.
 
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
-`./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die drei
-benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
-`gnome-online-accounts-gtk`) und die Anleitung, das Google-Konto in
-`gnome-online-accounts-gtk` zu verbinden. Danach `omarchy restart shell`.
+`./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die noch
+fehlenden der drei benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
+`gnome-online-accounts-gtk`), die Anleitung, das Google-Konto in `gnome-online-accounts-gtk`
+zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es das `demo`-Backend vor. Ein
+Shell-Neustart ist nicht nötig, der nächste Abruf übernimmt Pakete und Konto.
 
 Grenzen: über einen **gesperrten** Bildschirm kann kein Plugin zeichnen — der Alarm wird dann
 nach dem Entsperren nachgezogen, Notification und Ton kommen trotzdem; ein Laptop im Suspend

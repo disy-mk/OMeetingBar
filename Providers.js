@@ -48,7 +48,12 @@ var table = [
 
 function hostOf(url) {
   var rest = String(url || "").replace(/^https:\/\//i, "")
-  return rest.split(/[\/?#]/)[0].split("@").pop().split(":")[0].toLowerCase()
+  var authority = rest.split(/[\/?#]/)[0]
+  // Browsers read "\" as "/" in an https URL, so "evil.example\@meet.google.com"
+  // lands on evil.example while a split on "@" would name Meet. No real host
+  // contains one: treat the URL as unknown rather than guess.
+  if (authority.indexOf("\\") !== -1) return ""
+  return authority.split("@").pop().split(":")[0].toLowerCase()
 }
 
 // Exact host or a subdomain of it ("acme.zoom.us"), never a suffix match on

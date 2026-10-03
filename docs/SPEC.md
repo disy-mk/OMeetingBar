@@ -42,10 +42,14 @@ consumer that answers one of them on its own silently disagrees with the other t
    reversed `end` collapses to `end = start` (a zero-length occurrence, which by rule 1 stays
    visible until its start has passed) — never to `start + <any guessed length>`.
 3. **https only.** A join URL is handed to `omarchy-launch-browser` only if it is an `https://`
-   URL with no whitespace in it — `/^https:\/\/[^\s]+$/i` in QML, the same test the fetcher's
-   `clean_url` applies. `http://` is **not** enough. Each file re-checks this in its own
-   cache/payload parser, because the cache is a user-writable file and neither `file://`,
-   `javascript:` nor an argument containing whitespace may ever reach a browser command line.
+   URL with no whitespace and no backslash in it — `/^https:\/\/[^\s\\]+$/i` in QML (Service,
+   Widget, Popup, Alert), and at most 2048 characters in Service.qml. `http://` is **not** enough.
+   The backslash matters because browsers read `\` as `/` in an https URL: `Providers.js` would
+   name `https://evil.example\@meet.google.com/…` as Google Meet while the browser lands on
+   evil.example, so `hostOf` also returns `""` for any authority containing one. Each file
+   re-checks this in its own cache/payload parser, because the cache is a user-writable file and
+   neither `file://`, `javascript:` nor an argument containing whitespace may ever reach a
+   browser command line. The fetcher's `clean_url` enforces the `https://` prefix on its side.
 4. **All-day events never take the alert path.** An all-day entry has no meaningful start moment,
    so the service skips it when firing regardless of `skip_all_day`; that option only decides
    whether all-day entries reach the cache and the popup's agenda rows. The bar label never shows
@@ -62,7 +66,7 @@ consumer that answers one of them on its own silently disagrees with the other t
    withdraws its queued alert). Nothing else may iterate the event list to decide whether to alert — the queue included:
    `drainQueue` re-checks the head against the live cache entry right before every summon, so an
    alert queued under the lock for a meeting that has since ended is withdrawn, not shown.
-   `meetings status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
+   `omeetingbar status` reports `agendaCount` beside `eventCount` and `declined`/`ended` per event, so
    a wrong decision is diagnosable instead of invisible. `declined` is eds-only: the `ics` and
    `demo` backends always write `false`, which is correct rather than a bug.
 
@@ -131,7 +135,9 @@ Semantics:
 ## Event cache — `$XDG_RUNTIME_DIR/omeetingbar/events.json`
 
 Written **only** by `bin/omeetingbar-fetch`: mode 0600, atomic (tmp in the same dir + `os.replace`),
-dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
+dir mode 0700. On tmpfs on purpose — nothing this plugin writes survives a reboot. One thing
+outside its control does: the critical notification carries title and location, and Omarchy keeps
+dismissed notifications in its history under `~/.local/state/omarchy/notifications/`.
 
 ```json
 {
@@ -164,12 +170,12 @@ dir mode 0700. On tmpfs on purpose — no meeting content survives a reboot.
   filtering** — an empty list from a failed run is never dressed up as `"ok"`. "Nothing on your
   calendar" and "your calendar could not be read" must not look alike to the user.
 - `warning`: always present, `""` when there is nothing to report. Non-empty means *usable but
-  degraded* — the run produced events, but on fallbacks: e.g. `meetings.json` holds invalid values
+  degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds invalid values
   and the documented defaults were used, one of several calendars failed while the others
   delivered, or an option was ignored because it does not apply to the active backend. `status`
   stays `"ok"`, and the text is German, short and content-free (same privacy rules as `error`).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
-  its tooltip, and `meetings status` reports it. Without that, a typo in `meetings.json` runs on
+  its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
 - `error` belongs to `status: "error"`. A consumer that nevertheless finds a non-empty `error` on
   an `"ok"` cache surfaces it like a warning instead of discarding it.
@@ -199,7 +205,11 @@ restart during a lock.
 - `events` — three independent timestamps per occurrence, 0 meaning "not yet":
   - `notified`: the once-per-occurrence side effects are done (display wake, critical
     notification, sound). Persisted **before** they run, so a crash mid-fire cannot loop.
-  - `shown`: the fullscreen overlay was confirmed on screen by the host.
+  - `shown`: the fullscreen overlay was confirmed on screen — by the overlay itself
+    (`Alert.open()` calls `service.overlayShown(id)` with the queue id carried in the payload),
+    or, as a fallback, by the host's `isPluginOpen` once `confirmGraceSeconds` (2 s) have passed
+    since the summon. The host alone is not a witness: it reports "open" from the moment a summon
+    is accepted, before Alert.qml has loaded, and only clears that again when the load fails.
   - `failed`: it never got there inside its window (or the event was cancelled) — do not retry.
   `notified` and `shown` are separate on purpose: under `WlSessionLock` a third-party overlay
   cannot draw at all, so an occurrence can be notified but not yet shown, and it still owes the
@@ -235,11 +245,11 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 
 | Call | Effect |
 |---|---|
-| `omarchy-shell omeetingbar status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths |
+| `omarchy-shell omeetingbar status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths. Events and queue entries carry ids and times only, never titles or calendar names — `status` is what ends up in bug reports |
 | `omarchy-shell omeetingbar refresh` | run the fetcher now |
 | `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
 | `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
-| `omarchy-shell omeetingbar dismiss` | hide the alert and stop the alarm sound |
+| `omarchy-shell omeetingbar dismiss` | hide the alert, stop the alarm sound and discard the **whole** pending queue (entries that never reached the screen are recorded as `failed`). Unlike Esc in the overlay, which closes only the head and lets `drainQueue` summon the next queued alert — an explicit dismiss means "give me the screen back" |
 | `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed to the widget on the focused monitor (`Widget.qml`'s handler) — the target to bind a Hyprland key to |
 
 ## Overlay contract — `Alert.qml`
@@ -271,6 +281,10 @@ Requirements:
   location if present, and the join hint when a URL exists.
 - Keys: Return/Enter/Space → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
   dismiss; Escape or any other key → dismiss. Full-size `MouseArea` → dismiss.
+- Key guard: every key inside `keyGuardMs` (1000 ms) after `open()` is swallowed. The overlay
+  takes exclusive keyboard focus the instant it appears, and a Space or Enter already on its way
+  down must not join a meeting — the invite's URL — that the user has not read yet. `open()`
+  restamps the time for a queued follow-up alert, which re-arms the guard.
 - Every way the overlay closes (`opened` → false: a key, a click, auto-dismiss, the host's
   `hide()`) calls `service.stopSound()`, so Esc silences the alarm too. `service` is the plugin's
   own Service.qml instance, which the host injects into a declared `property var service`.
@@ -406,7 +420,7 @@ file talks to the outside world.
   `fetch_interval_seconds`, on wall-clock jumps, and on IPC `refresh`.
 - **Fetch backoff**: consecutive failures double the interval —
   `min(fetch_interval_seconds * 2^min(streak, 4), 900)` — and a single success, or any edit to
-  `meetings.json`, resets it. A backend that cannot work at all (`eds` before the packages are
+  `omeetingbar.json`, resets it. A backend that cannot work at all (`eds` before the packages are
   installed) would otherwise respawn python every interval for ever. Journal noise is bounded by
   `logState`, which drops a repeated (event, detail) pair, and by keeping the streak *count* out
   of the logged line while keeping the backoff step in it: one line per escalation, then silence.
@@ -418,9 +432,12 @@ file talks to the outside world.
   watchdog a single hung fetcher holds the re-entrancy guard forever and the cache silently stops
   updating. Note the watchdog is a backstop, not the fix for a slow backend: see the
   `wait_for_connected_seconds` note below, and remember the `ics` backend talks to the network.
-- **Firing** the next event (invariant 1) when `start - now <= alert_lead_seconds` and
-  `now - start <= grace_seconds` and its id is not in `notified`. All-day events are skipped here
-  unconditionally (invariant 4).
+- **Firing** every alertable event (invariant 1) with `start - now <= alert_lead_seconds` and
+  `now - start <= grace_seconds` whose id is not in `notified` — all of them on the same tick,
+  not only the earliest, bounded at 8 per tick. All-day events are skipped here unconditionally
+  (invariant 4). Not during the first `fireHoldSeconds` (10 s) after a clock jump while the forced
+  fetch is still running: the cache then predates the sleep, and a meeting cancelled or moved
+  while the machine slept must not wake the display, notify and ring.
   1. persist the id to `notified` in the state file first (so a crash cannot cause a re-fire loop),
   2. if `wake_display`: `omarchy-brightness-display on` (NOT `hyprctl dispatch dpms on` — that
      dispatcher no longer exists in Hyprland 0.56),
@@ -429,20 +446,34 @@ file talks to the outside world.
      words. `omeetingbar-join` opens the URL with `omarchy-launch-browser` only while `now < end`;
      after that a click just closes the toast (Omarchy closes it on click either way). A
      non-numeric `end` opens the URL — a missed join is worse than an unneeded one. The toast is
-     recorded in the state file's `toasts` (not for an empty title, see "Toast cleanup"),
+     recorded in the state file's `toasts` (not for an empty or very short title, see "Toast
+     cleanup"). Location and calendar name are markup-escaped (`& < >`) because Omarchy renders the
+     body as `StyledText`; the headline is plain text there and needs none. Only the first
+     `maxToastsPerTick` (3) meetings due in one tick get their own toast; the rest share one
+     summary toast ("N weitere Termine", no join link, tracked under its own id until the last of
+     them ends) — N same-minute invites must not mean N critical, never-expiring toasts,
   4. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
      detached, so closing the overlay can stop it; a sound still playing is not restarted by a
      second meeting in the same minute,
-  5. if `omarchy-shell lock isLocked` is `true`: do **not** summon (the overlay is invisible under
-     `WlSessionLock`); append the payload to the state file's `queue` and summon as soon as the
-     lock is released, as long as `until` has not passed. Otherwise summon now:
-     `shell.summon(manifest.id, JSON.stringify(payload))` and record the id in `shown`.
-     A queued alert is only ever *shown* late — the notification and the sound in steps 2–4 have
-     already happened at the right moment, which is why the timestamps are separate.
+  5. append the payload to the state file's `queue` in every case and start a lock probe. The
+     queue is capped at `maxQueueLength` (8): a ninth alert waiting is a flood, not a schedule,
+     and is recorded as `failed` without blanking the screen. `drainQueue` summons the head
+     (`shell.summon(manifest.id, JSON.stringify(payload))`) only once a lock answer at most
+     `lockStaleSeconds` old says the session is unlocked — nothing draws over `WlSessionLock` —
+     and as long as `untilSec` has not passed; `shown` is recorded only on a witness (see the
+     state file). A queued alert is only ever *shown* late — the notification and the sound in
+     steps 2–4 have already happened at the right moment, which is why the timestamps are
+     separate.
   6. a queued alert whose event has disappeared from a fresh, healthy, non-stale cache (cancelled,
      or moved out of the window) is dropped as `failed` instead of blanking the screen. Only an
      `ok` and non-stale cache may withdraw an alert: an error or stale cache is missing events for
-     its own reasons.
+     its own reasons. A withdrawn alert also takes its toast down (`withdrawToast`: the recorded
+     toast's `end` is pulled to now, and the next tick's toast cleanup dismisses it under the
+     usual needle rules), so no live join link is left behind for a meeting that is off.
+- **Bounds on calendar input**: `normalizeEvents` keeps at most `maxEvents` (512) occurrences,
+  earliest first, and drops a URL longer than `maxUrlChars` (2048) — a hostile `FREQ=SECONDLY`
+  rule expands to hundreds of thousands of instances, and an over-long URL makes the toast's
+  `--exec` argv fail with E2BIG. The fetcher caps on its side too; this is the second line.
 - **Toast cleanup**: critical toasts never expire in Omarchy, so a meeting notification would
   stay on screen until clicked — and a stale one, clicked after a meeting taken on the phone,
   used to reopen the call. Once `now >= end` of a recorded toast, the service runs
@@ -455,7 +486,8 @@ file talks to the outside world.
   - A substring needle also hits every toast whose headline contains it. An ended toast therefore
     waits while another recorded meeting that is still on has a headline containing its own
     ("Standup" ending must not take down "Standup Team").
-  - An empty title is sent with the fallback headline "Termin" and is not recorded: that needle
+  - An empty title is sent with the fallback headline "Termin" and is not recorded, and neither
+    is a headline shorter than `minToastNeedleChars` (4): "Termin", "e" or "1:1" as a needle
     would hit other apps' toasts. Such a toast still closes by click (`omeetingbar-join`) or by
     right click, which Omarchy maps to "close without action".
   - Nothing is dismissed during the first 30 s after the service starts: after a shell restart
@@ -528,7 +560,7 @@ omarchy-shell omeetingbar status             # next event is the synthetic one
 lands `alert_lead_seconds` before that — by writing an **inject marker** next to the cache:
 `inject.json`, same directory as `--out` points at, same 0600 and same atomic replace as the
 cache. It holds only `id`, `title`, `start`, `end`, `url`; the rest is fixed (`calendar` `Test`,
-a clearly test-labelled title, a demo join URL). The marker, not the event title, is the identity
+`location` `Arbeitszimmer`, a clearly test-labelled title, a demo join URL). The marker, not the event title, is the identity
 of the injected occurrence:
 
 - Every later run reads the marker and merges that event into whatever the active backend
@@ -584,8 +616,8 @@ Verified API recipe — follow it exactly:
   hosts (and their subdomains): `meet.google.com`, `zoom.us`, `zoomgov.com`,
   `teams.microsoft.com`, `teams.live.com`, `webex.com`, `meet.jit.si`, `8x8.vc`, `whereby.com`,
   `gotomeeting.com`, `meet.goto.com`, `gotomeet.me`; for Slack and Discord, which also carry
-  plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…` and
-  `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
+  plain message and server links, only `app.slack.com/huddle/…`, `discord.com/channels/…`,
+  `discordapp.com/channels/…` and `discord.gg/…` count. `Providers.js` must know the same hosts. Do **not** prefer the
   iCalendar `URL` property (for Google events that is the calendar web page, not the room).
   Verified on 2026-09-10 against this account: Google's CalDAV **does** emit
   `X-GOOGLE-CONFERENCE`, and it matched on every event in the window, so the X-property is the

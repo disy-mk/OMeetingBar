@@ -38,6 +38,13 @@ Item {
   property string url: ""
   property string calendar: ""
   property string location: ""
+  // Queue id of the alert on screen, echoed back to the service as the witness
+  // that it rendered (Service.overlayShown). Empty for previews and tests.
+  property string alertId: ""
+  // The overlay takes exclusive keyboard focus the moment it appears, mid-
+  // sentence if need be. Keys inside this window after open() are swallowed,
+  // so a keystroke already on its way down cannot join a meeting unread.
+  readonly property int keyGuardMs: 1000
   property int autoDismissSeconds: 90
   // Defaults, so a hand-made summon without a colours block still renders.
   property string runningColorName: "#FF9500"
@@ -53,7 +60,7 @@ Item {
   // Only ever hand a real web URL to the browser launcher. Calendar bodies are
   // third-party data, so a file:// or javascript: "join link" is dropped
   // instead of launched.
-    readonly property string joinUrl: /^https:\/\/[^\s]+$/i.test(root.url) ? root.url : ""
+    readonly property string joinUrl: /^https:\/\/[^\s\\]+$/i.test(root.url) ? root.url : ""
 
   // ---------------------------------------------------------- clock
   //
@@ -239,6 +246,7 @@ Item {
     root.url = root.cleanText(payload.url)
     root.calendar = root.cleanText(payload.calendar)
     root.location = root.cleanText(payload.location)
+    root.alertId = root.cleanText(payload.id)
     // Missing auto_dismiss means "use the documented config default" rather
     // than "stay forever"; only an explicit 0 pins the alert open. Anything
     // longer than hardDismissSeconds is capped, so the progress bar cannot
@@ -272,6 +280,10 @@ Item {
     root.dismissProgress = 1
     root.inhibitHeld = true
     root.opened = true
+    // The host's isPluginOpen says "open" from the summon on, before this file
+    // has even loaded; the overlay itself is the witness that it is on screen.
+    if (root.service && typeof root.service.overlayShown === "function")
+      root.service.overlayShown(root.alertId)
   }
 
   function close() {
@@ -408,6 +420,10 @@ Item {
             || event.key === Qt.Key_AltGr || event.key === Qt.Key_CapsLock)
             return
           event.accepted = true
+          // open() restamps openedAtMs for a queued follow-up alert too, which
+          // re-arms the guard: an Enter meant for the previous alert must not
+          // join the next one.
+          if (Date.now() - root.openedAtMs < root.keyGuardMs) return
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) root.join()
           else root.dismiss()
         }
