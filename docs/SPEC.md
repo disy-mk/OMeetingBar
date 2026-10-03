@@ -18,6 +18,7 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
 | `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
+| `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: opens the link only while the meeting is on |
 | `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
 | `README.md` | — | user-facing docs incl. the Google Workspace setup |
@@ -190,6 +191,7 @@ restart during a lock.
       "allDay": false, "url": "https://meet.google.com/abc-defg-hij", "calendar": "Work",
       "location": "", "untilSec": 1757503500, "notifiedAt": 1757503140 }
   ],
+  "toasts": [ { "id": "<event id>", "headline": "Standup", "end": 1757505000 } ],
   "fired": { "<event id>": 1757503140 }
 }
 ```
@@ -209,6 +211,10 @@ restart during a lock.
   travels with the entry because the cache may no longer contain the event by the time the alert
   can be shown. It is a queue, not one slot, because two meetings can come due while the session
   is locked; the head owns the overlay and the rest wait for it to close.
+- `toasts` — the meeting notifications this service sent and has not taken down yet: event id,
+  the exact headline it was sent with, and `end` (`max(end, start + grace_seconds)`, so a meeting
+  without a real end keeps its toast as long as its alert stays relevant). See "Toast cleanup"
+  under the firing rules. Merged by id on load, like the rest of the file.
 - `fired` — a schema-1 mirror (`id → notified`) written for readers of the old format and never
   read back. A file that *only* has `fired` is read as legacy: those ids count as notified **and**
   shown, because the old format cannot say whether the overlay was ever seen, and a surprise
@@ -231,9 +237,9 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 |---|---|
 | `omarchy-shell omeetingbar status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths |
 | `omarchy-shell omeetingbar refresh` | run the fetcher now |
-| `omarchy-shell omeetingbar test` | show a synthetic alert immediately (no calendar needed) |
+| `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
 | `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
-| `omarchy-shell omeetingbar dismiss` | hide the alert |
+| `omarchy-shell omeetingbar dismiss` | hide the alert and stop the alarm sound |
 | `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed to the widget on the focused monitor (`Widget.qml`'s handler) — the target to bind a Hyprland key to |
 
 ## Overlay contract — `Alert.qml`
@@ -265,6 +271,9 @@ Requirements:
   location if present, and the join hint when a URL exists.
 - Keys: Return/Enter/Space → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
   dismiss; Escape or any other key → dismiss. Full-size `MouseArea` → dismiss.
+- Every way the overlay closes (`opened` → false: a key, a click, auto-dismiss, the host's
+  `hide()`) calls `service.stopSound()`, so Esc silences the alarm too. `service` is the plugin's
+  own Service.qml instance, which the host injects into a declared `property var service`.
 - `IdleInhibitor { enabled: true; window: <this PanelWindow> }` while open, but **released after
   at most 180 s** even if the overlay is still up: an alert nobody dismissed (the user is not at
   the desk) must not keep the machine awake indefinitely. This is the overlay's own inhibitor,
@@ -416,8 +425,14 @@ file talks to the outside world.
   2. if `wake_display`: `omarchy-brightness-display on` (NOT `hyprctl dispatch dpms on` — that
      dispatcher no longer exists in Hyprland 0.56),
   3. if `notify`: `omarchy-notification-send -u critical -g 󰃭 "<title>" "<body>"` and, only when a
-     URL exists, `--exec omarchy-launch-browser <url>` **last** and as separate argv words,
-  4. if `sound` is non-empty and the file exists: `pw-play <file>`,
+     URL exists, `--exec <plugin>/bin/omeetingbar-join <url> <end>` **last** and as separate argv
+     words. `omeetingbar-join` opens the URL with `omarchy-launch-browser` only while `now < end`;
+     after that a click just closes the toast (Omarchy closes it on click either way). A
+     non-numeric `end` opens the URL — a missed join is worse than an unneeded one. The toast is
+     recorded in the state file's `toasts` (not for an empty title, see "Toast cleanup"),
+  4. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
+     detached, so closing the overlay can stop it; a sound still playing is not restarted by a
+     second meeting in the same minute,
   5. if `omarchy-shell lock isLocked` is `true`: do **not** summon (the overlay is invisible under
      `WlSessionLock`); append the payload to the state file's `queue` and summon as soon as the
      lock is released, as long as `until` has not passed. Otherwise summon now:
@@ -428,6 +443,25 @@ file talks to the outside world.
      or moved out of the window) is dropped as `failed` instead of blanking the screen. Only an
      `ok` and non-stale cache may withdraw an alert: an error or stale cache is missing events for
      its own reasons.
+- **Toast cleanup**: critical toasts never expire in Omarchy, so a meeting notification would
+  stay on screen until clicked — and a stale one, clicked after a meeting taken on the phone,
+  used to reopen the call. Once `now >= end` of a recorded toast, the service runs
+  `omarchy-shell notifications dismiss "<headline>"` and forgets the entry (fire and forget; a
+  toast the user already closed answers `none`). The dismissed toast moves to Omarchy's
+  notification history.
+  - Omarchy's notifications plugin closes toasts by **summary substring** only. A freedesktop
+    `CloseNotification(id)` leaves its toast on screen (measured on Omarchy 4.x: the server object
+    closes, the popup row stays), so the id is not usable and the needle is the full headline.
+  - A substring needle also hits every toast whose headline contains it. An ended toast therefore
+    waits while another recorded meeting that is still on has a headline containing its own
+    ("Standup" ending must not take down "Standup Team").
+  - An empty title is sent with the fallback headline "Termin" and is not recorded: that needle
+    would hit other apps' toasts. Such a toast still closes by click (`omeetingbar-join`) or by
+    right click, which Omarchy maps to "close without action".
+  - Nothing is dismissed during the first 30 s after the service starts: after a shell restart
+    Omarchy restores its toasts from disk asynchronously, and a dismiss sent before that finds
+    nothing. The state file is tmpfs, so after a reboot restored toasts are no longer recorded;
+    `omeetingbar-join` is the fallback for those.
 - **Idle inhibitor**: hold one from `start - inhibit_lead_seconds` (default 600 s, see the config
   semantics) until `start + grace_seconds` for the next event, so the session cannot lock/blank
   into the alert. Implement as a 1x1 click-through `PanelWindow` (input mask empty /
@@ -480,8 +514,8 @@ CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [-
 
 ### Test injection — `--in-seconds`
 
-`omarchy-shell omeetingbar test` only draws the overlay; it proves the surface renders, not that the
-alert *fires*. The real path — cache → service tick → notification → summon → state file — is
+`omarchy-shell omeetingbar test` only draws the overlay and plays the sound; it proves the surface
+renders, not that the alert *fires*. The real path — cache → service tick → notification → summon → state file — is
 tested with an injected event:
 
 ```
