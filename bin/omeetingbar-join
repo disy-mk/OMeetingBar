@@ -1,0 +1,17 @@
+#!/bin/sh
+# Click action of an OMeetingBar notification: omeetingbar-join URL END
+#
+# Opens the meeting link in the browser while the meeting is still on, and does
+# nothing once END (unix seconds) has passed. The notification closes on click
+# either way, so clicking a stale toast after a meeting just clears it instead
+# of reopening a call that is over. An END that is not a number opens the link,
+# because a missed join is worse than an unneeded one.
+url=$1
+end=$2
+
+[ -n "$url" ] || exit 0
+case $end in
+  '' | *[!0-9]*) ;;
+  *) [ "$(date +%s)" -ge "$end" ] && exit 0 ;;
+esac
+exec omarchy-launch-browser "$url"

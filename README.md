@@ -20,9 +20,13 @@ around it.
   one emphasised, declined invitations struck through, then the next few later meetings
   ("Demnächst"), and footer actions (join, create, refresh, open calendar).
 - **Fullscreen alert** — configurable lead time (default 60 s), auto-dismiss, `Enter` joins the
-  meeting in its provider (the hint names it: "in Teams beitreten"), `Esc` dismisses. It also
-  sends a critical notification, plays a sound and wakes the display, so the alert reaches you
-  even when the overlay cannot (see limits).
+  meeting in its provider (the hint names it: "in Teams beitreten"), `Esc` dismisses it and
+  silences the sound. It also sends a critical notification, plays a sound and wakes the
+  display, so the alert reaches you even when the overlay cannot (see limits).
+- **Notifications that clean up after themselves** — a meeting's notification closes itself
+  when the meeting ends, so you do not come back from a call taken on your phone to a stack of
+  stale ones. Clicking one joins only while the meeting is on; afterwards a click just closes
+  it. A right click always closes without joining.
 - **Video providers** — join links from Google Meet, Microsoft Teams, Zoom, Webex, Jitsi
   (meet.jit.si, 8x8.vc), Whereby, GoTo Meeting, Slack Huddles and Discord are recognised in the
   invite's conference data, location or description. Meet, Teams, Slack and Discord show their
@@ -141,13 +145,16 @@ save.
 - **Left click** the bar entry → agenda popup. **Right/middle click** → refresh.
 - In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
   `Tab` switches to the neighbouring panel.
-- In the alert: `Enter` joins, `Esc` (or any other key, or a click) dismisses.
+- In the alert: `Enter` joins, `Esc` (or any other key, or a click) dismisses. Either way the
+  sound stops.
+- On a meeting notification: click joins while the meeting is on (afterwards it only closes),
+  right click closes without joining.
 - From a keybinding or script:
 
 ```bash
 omarchy-shell omeetingbar-agenda toggle   # open/close the agenda popup
 omarchy-shell omeetingbar status          # JSON: backend, cache age, next meeting, alert state
-omarchy-shell omeetingbar test            # fullscreen alert now, synthetic, no calendar needed
+omarchy-shell omeetingbar test            # fullscreen alert + sound now, synthetic, no calendar needed
 omarchy-shell omeetingbar refresh         # run the fetcher now
 omarchy-shell omeetingbar dismiss         # close the alert
 omeetingbar-fetch --diagnose              # packages, typelibs, GOA accounts, calendars found
@@ -200,7 +207,8 @@ OMeetingBar ist ein MeetingBar-Ersatz für Omarchy: der nächste Google-Kalender
 Bar (türkis = steht an, orange = läuft), per Linksklick eine Agenda für heute und morgen mit
 Timeline, und **eine Minute vor dem Meeting ein Vollbild-Alarm**, der den Bildschirm belegt —
 weil man normale Benachrichtigungen im Tunnel nicht wahrnimmt. `Enter` tritt bei, `Esc`
-schließt.
+schließt und stoppt den Ton. Die Meeting-Notification schließt sich zum Meeting-Ende selbst;
+ein Klick danach öffnet den Link nicht mehr, ein Rechtsklick schließt immer ohne Aktion.
 
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
 `./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die drei

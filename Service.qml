@@ -28,6 +28,7 @@ Item {
   readonly property string cachePath: cacheDir + "/events.json"
   readonly property string statePath: cacheDir + "/state.json"
   readonly property string fetcherPath: String(Qt.resolvedUrl("bin/omeetingbar-fetch")).replace(/^file:\/\//, "")
+  readonly property string joinPath: String(Qt.resolvedUrl("bin/omeetingbar-join")).replace(/^file:\/\//, "")
 
   readonly property int stateRetentionSeconds: 43200
   readonly property int pruneIntervalSeconds: 3600
@@ -48,6 +49,9 @@ Item {
   // confirmed on screen. The cap is what keeps a re-summon from looping.
   readonly property int resummonIntervalSeconds: 5
   readonly property int maxSummonAttempts: 6
+  // The notifications plugin restores its toasts from disk asynchronously after
+  // a shell restart; a dismiss sent before that finds nothing and is lost.
+  readonly property int toastSettleSeconds: 30
 
   // Only the keys this service acts on; the rest of omeetingbar.json belongs to
   // bin/omeetingbar-fetch and to Widget.qml, which read the same file themselves.
@@ -126,6 +130,13 @@ Item {
   // the overlay and the rest wait for it to close. Persisted with its payload,
   // because a re-mount must not lose the tail.
   property var alertQueue: []
+
+  // Meeting notifications this service put on screen, as { id, headline, end }.
+  // They are critical, so they never expire on their own; each one is taken
+  // down once its meeting is over. Persisted, because the toasts outlive a
+  // shell restart and so must the list.
+  property var openToasts: []
+  property int startedAtSec: 0
 
   property int nowSec: 0
   property real lastTickMs: 0
@@ -490,6 +501,7 @@ Item {
   //   { "schema": 2,
   //     "events": { "<id>": { "notified": ts, "shown": ts, "failed": ts } },
   //     "queue":  [ { <alert payload>, "untilSec": ts, "notifiedAt": ts } ],
+  //     "toasts": [ { "id": id, "headline": text, "end": ts } ],
   //     "fired":  { "<id>": ts } }   // schema-1 mirror, written for readers of
   //                                  // the old format, never read back here
   // A schema-1 file only knew "fired". Those ids count as notified AND shown,
@@ -569,6 +581,22 @@ Item {
       return a.notifiedAt === b.notifiedAt ? a.start - b.start : a.notifiedAt - b.notifiedAt
     })
     root.alertQueue = restored
+
+    var toasts = root.openToasts.slice()
+    if (parsed && Array.isArray(parsed.toasts)) {
+      for (var t = 0; t < parsed.toasts.length; t++) {
+        var toast = parsed.toasts[t]
+        if (!toast || typeof toast !== "object") continue
+        var headline = typeof toast.headline === "string" ? toast.headline : ""
+        var toastEndSec = tsOf(toast.end)
+        if (toast.id === undefined || headline === "" || toastEndSec === 0) continue
+        var seen = false
+        for (var k = 0; k < toasts.length; k++) if (toasts[k].id === String(toast.id)) seen = true
+        if (!seen) toasts.push({ id: String(toast.id), headline: headline, end: toastEndSec })
+      }
+    }
+    root.openToasts = toasts
+
     root.stateLoaded = true
     if (restored.length > 0) logState("queue-restored", "pending=" + restored.length)
   }
@@ -603,6 +631,7 @@ Item {
       schema: 2,
       events: root.alertState,
       queue: queue,
+      toasts: root.openToasts,
       fired: legacy
     }, null, 2) + "\n")
   }
@@ -788,13 +817,84 @@ Item {
     return parts.join(" · ")
   }
 
+  // When a meeting's toast stops being useful. A meeting without a real end
+  // (end <= start) keeps its toast as long as the alert itself stays relevant.
+  function toastEnd(entry) {
+    return Math.max(entry.end, entry.start + root.graceSeconds)
+  }
+
   function sendNotification(entry, atSec) {
+    var headline = notificationHeadline(entry.title)
     var argv = ["omarchy-notification-send", "-u", "critical", "-g", "󰃭",
-      notificationHeadline(entry.title), notificationBody(entry, atSec)]
+      headline, notificationBody(entry, atSec)]
     // --exec must come last and as separate words; the script hands them to the
-    // click action as argv, so a URL can never become a command.
-    if (entry.url !== "") argv = argv.concat(["--exec", "omarchy-launch-browser", entry.url])
+    // click action as argv, so a URL can never become a command. The join
+    // script opens it only while the meeting is on: a toast clicked after the
+    // meeting is over just closes.
+    if (entry.url !== "")
+      argv = argv.concat(["--exec", root.joinPath, entry.url, String(toastEnd(entry))])
     Quickshell.execDetached(argv)
+    trackToast(entry, headline)
+  }
+
+  // Omarchy's notifications plugin can only be asked to close a toast by
+  // summary substring: a CloseNotification by id leaves its toast on screen
+  // (measured on Omarchy 4.x). So the needle is the full headline, and a
+  // meeting with no title is not tracked at all, since the fallback headline
+  // "Termin" would also hit other apps' toasts. Those still close by click
+  // (bin/omeetingbar-join) or right click.
+  function trackToast(entry, headline) {
+    if (String(entry.title || "").trim() === "") return
+    var id = String(entry.id)
+    for (var i = 0; i < root.openToasts.length; i++) if (root.openToasts[i].id === id) return
+    root.openToasts = root.openToasts.concat([{ id: id, headline: headline, end: toastEnd(entry) }])
+    saveState()
+  }
+
+  // A substring needle also matches every toast whose headline contains it.
+  // While such a meeting is still on, the ended one waits for it, so "Standup"
+  // ending cannot take down "Standup Team" that is still running.
+  function toastNeedleBusy(toast, atSec) {
+    for (var i = 0; i < root.openToasts.length; i++) {
+      var other = root.openToasts[i]
+      if (other.id !== toast.id && atSec < other.end && other.headline.indexOf(toast.headline) !== -1)
+        return true
+    }
+    return false
+  }
+
+  function clearEndedToasts(atSec) {
+    if (root.openToasts.length === 0) return
+    if (atSec - root.startedAtSec < root.toastSettleSeconds) return
+    var kept = []
+    var cleared = 0
+    for (var i = 0; i < root.openToasts.length; i++) {
+      var toast = root.openToasts[i]
+      if (atSec < toast.end || toastNeedleBusy(toast, atSec)) {
+        kept.push(toast)
+        continue
+      }
+      // Fire and forget: a toast the user already closed answers "none", and
+      // one this misses still closes by click or right click.
+      Quickshell.execDetached(["omarchy-shell", "notifications", "dismiss", toast.headline])
+      cleared += 1
+    }
+    if (cleared === 0) return
+    root.openToasts = kept
+    saveState()
+    logState("toasts-cleared", "count=" + cleared)
+  }
+
+  // A child process, not a detached one, so closing the alert can cut it short.
+  // A second meeting in the same minute does not restart a sound still playing.
+  function playSound() {
+    if (root.soundPath === "" || !root.soundAvailable || soundPlayer.running) return
+    soundPlayer.command = ["pw-play", root.soundPath]
+    soundPlayer.running = true
+  }
+
+  function stopSound() {
+    if (soundPlayer.running) soundPlayer.running = false
   }
 
   // What the last summon was for. drainQueue may only confirm a queued alert as
@@ -866,7 +966,7 @@ Item {
 
     if (root.wakeDisplayEnabled) Quickshell.execDetached(["omarchy-brightness-display", "on"])
     if (root.notifyEnabled) sendNotification(entry, atSec)
-    if (root.soundPath !== "" && root.soundAvailable) Quickshell.execDetached(["pw-play", root.soundPath])
+    playSound()
 
     // Whether the overlay reaches the screen is the second, separate fact: it
     // is queued here and only marked shown once the host confirms it.
@@ -1072,6 +1172,7 @@ Item {
     }
 
     drainQueue(atSec)
+    if (root.stateLoaded) clearEndedToasts(atSec)
 
     if (atSec - root.lastFetchAtSec >= root.effectiveFetchIntervalSeconds) runFetch("interval")
   }
@@ -1199,6 +1300,8 @@ Item {
       configValid: root.configValid,
       runtimeReady: root.runtimeReady,
       soundAvailable: root.soundAvailable,
+      soundPlaying: soundPlayer.running,
+      toastsOpen: root.openToasts.length,
       fetch: {
         running: fetchProcess.running,
         outcome: root.lastFetchOutcome,
@@ -1231,7 +1334,8 @@ Item {
         config: root.configPath,
         cache: root.cachePath,
         state: root.statePath,
-        fetcher: root.fetcherPath
+        fetcher: root.fetcherPath,
+        join: root.joinPath
       },
       lastEvent: root.logLine,
       lastEventAt: root.logAt
@@ -1240,9 +1344,11 @@ Item {
 
   // Both IPC previews bypass the queue on purpose: they are an explicit
   // request for the overlay and touch no notified/shown state.
+  // The test alert plays the sound too, so the whole cue — including Esc
+  // cutting the sound short — can be tried without waiting for a meeting.
   function showTestAlert() {
     var atSec = Math.floor(Date.now() / 1000)
-    return summonAlert({
+    var summoned = summonAlert({
       id: "test",
       title: "Testtermin",
       start: atSec + 60,
@@ -1252,6 +1358,8 @@ Item {
       calendar: "Test",
       location: ""
     }, true, "test")
+    if (summoned) playSound()
+    return summoned
   }
 
   function showPreview() {
@@ -1266,6 +1374,7 @@ Item {
   }
 
   function dismissAlert() {
+    stopSound()
     var id = root.pluginId()
     if (id === "" || !root.shell || typeof root.shell.hide !== "function") return "unavailable"
     // An explicit dismiss means "give me the screen back", so it drops the
@@ -1378,6 +1487,10 @@ Item {
   }
 
   Process {
+    id: soundPlayer
+  }
+
+  Process {
     id: soundProbe
     onExited: function(exitCode) {
       root.soundAvailable = exitCode === 0
@@ -1471,6 +1584,7 @@ Item {
   }
 
   Component.onCompleted: {
+    root.startedAtSec = Math.floor(Date.now() / 1000)
     ensureCacheDir()
     // Both are read blocking: the notified/shown state and any queue left by
     // the previous mount have to be known before the first tick can fire or

@@ -16,8 +16,16 @@ Item {
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property var shell: null
   property var manifest: null
+  // This plugin's Service.qml instance, injected by the host.
+  property var service: null
 
   property bool opened: false
+  // Every way the alert leaves the screen — Esc, joining, auto-dismiss, an IPC
+  // dismiss — ends the alarm sound with it.
+  onOpenedChanged: {
+    if (!root.opened && root.service && typeof root.service.stopSound === "function")
+      root.service.stopSound()
+  }
 
   // ---------------------------------------------------------- payload
   //
