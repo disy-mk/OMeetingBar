@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Commons
 import qs.Ui
+import "Providers.js" as Providers
 
 // The agenda popup: today's and tomorrow's meetings under a timeline strip.
 //
@@ -121,10 +122,10 @@ Item {
   readonly property string glyphRefresh: "󰑐"                  // md-refresh U+F0450
   readonly property string glyphCalendarPlus: "󰃳"             // md-calendar_plus U+F00F3
   readonly property string glyphOpenExternal: "󰏌"             // md-open_in_new U+F03CC
-  readonly property string glyphGoogle: "󰊭"                   // md-google U+F02AD
-  readonly property string glyphTeams: "󰊻"                    // md-microsoft_teams U+F02BB
   readonly property string glyphVideo: "󰕧"                    // md-video U+F0567
-  readonly property string glyphLink: "󰌹"                     // md-link_variant U+F0339
+  // Provider marks and brand colours live in Providers.js, shared with Alert.qml.
+  // The card surface they have to stand out against:
+  readonly property color surfaceBg: Color.popups.background
 
   // ---- Time. Day boundaries come from Date(y, m, d + n) arithmetic, never
   //      from midnight + n * 86400: Europe/Berlin has a 23 h and a 25 h day
@@ -515,8 +516,9 @@ Item {
   readonly property var footerActions: [
     {
       key: "join",
-      label: root.joinUrl !== "" ? "Meeting öffnen" : "Kein Meeting-Link",
-      icon: root.joinUrl !== "" ? root.providerGlyph(root.joinUrl) : root.glyphVideo,
+      label: root.joinUrl === "" ? "Kein Meeting-Link"
+        : (Providers.name(root.joinUrl) !== "" ? "In " + Providers.name(root.joinUrl) + " beitreten" : "Meeting öffnen"),
+      icon: root.joinUrl !== "" ? Providers.glyph(root.joinUrl) : root.glyphVideo,
       enabled: root.joinUrl !== ""
     },
     { key: "create", label: "Termin anlegen", icon: root.glyphCalendarPlus, enabled: true },
@@ -561,15 +563,11 @@ Item {
     return /^https:\/\/[^\s]+$/i.test(url) ? url : ""
   }
 
-  function providerGlyph(url) {
-    var target = httpsUrl(url)
-    if (target === "") return ""
-    var host = target.replace(/^https:\/\//i, "").split("/")[0].split("@").pop().toLowerCase()
-    if (host.indexOf("google.com") >= 0) return root.glyphGoogle
-    if (host.indexOf("teams.microsoft.com") >= 0 || host.indexOf("teams.live.com") >= 0) return root.glyphTeams
-    if (host.indexOf("zoom.us") >= 0 || host.indexOf("zoom.com") >= 0) return root.glyphVideo
-    if (host.indexOf("webex.com") >= 0) return root.glyphVideo
-    return root.glyphLink
+  // Brand colour of the row's provider, readable on this theme's card, or the
+  // muted theme colour when the provider has none (or is not one we know).
+  function providerColor(url) {
+    var brand = Providers.brandColor(httpsUrl(url), root.surfaceBg)
+    return brand !== "" ? Qt.color(brand) : root.mutedFg
   }
 
   // ---- Formatting. German needs the locale spelled out — the system locale
@@ -1105,7 +1103,9 @@ Item {
       if (String(row.ev.location || "") !== "") meta.push(String(row.ev.location))
       if (meta.length > 0) lines.push(meta.join(" · "))
       if (row.declined) lines.push("Abgelehnt")
-      if (row.joinTarget !== "") lines.push("Klick: Meeting öffnen")
+      if (row.joinTarget !== "")
+        lines.push(Providers.name(row.joinTarget) !== ""
+          ? "Klick: in " + Providers.name(row.joinTarget) + " beitreten" : "Klick: Meeting öffnen")
       return lines.join("\n")
     }
 
@@ -1188,8 +1188,10 @@ Item {
           anchors.centerIn: parent
           textFormat: Text.PlainText
           visible: row.joinTarget !== ""
-          text: root.providerGlyph(row.joinTarget)
-          color: row.running ? Qt.color(root.runningColor) : root.mutedFg
+          text: Providers.glyph(row.joinTarget)
+          // Brand colour, not state colour: the time column already says
+          // running/upcoming, this column says where the meeting happens.
+          color: root.providerColor(row.joinTarget)
           font.family: root.fontFamily
           font.pixelSize: Style.font.icon
         }

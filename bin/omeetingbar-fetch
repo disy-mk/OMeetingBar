@@ -125,10 +125,20 @@ def typelib_package(namespace):
 
 # Hosts, not free-form URLs: the authority must be one of the conferencing
 # providers, so a stray link in a description cannot be mistaken for a room.
+# Slack and Discord also carry plain links to messages and servers, so for them
+# only a huddle, a voice channel or an invite counts. Providers.js maps the same
+# hosts to a glyph and a brand colour; keep the two lists in step.
 JOIN_URL_RE = re.compile(
-    r"https://(?:[A-Za-z0-9-]+\.)*"
-    r"(?:meet\.google\.com|zoom\.us|teams\.microsoft\.com|webex\.com)"
-    r"(?:/[^\s<>\"']*)?",
+    r"https://(?:"
+    r"(?:[A-Za-z0-9-]+\.)*"
+    r"(?:meet\.google\.com|zoom\.us|zoomgov\.com|teams\.microsoft\.com|teams\.live\.com"
+    r"|webex\.com|meet\.jit\.si|8x8\.vc|whereby\.com"
+    r"|gotomeeting\.com|meet\.goto\.com|gotomeet\.me)"
+    r"(?:/[^\s<>\"']*)?"
+    r"|app\.slack\.com/huddle/[^\s<>\"']+"
+    r"|(?:discord|discordapp)\.com/channels/[^\s<>\"']+"
+    r"|discord\.gg/[^\s<>\"']+"
+    r")",
     re.IGNORECASE,
 )
 URL_TRAILING_JUNK = ".,;:!?)]}>\"'"
@@ -556,9 +566,11 @@ DEMO_CALENDAR = "Demo"
 DEMO_SCHEDULE = (
     (0, (9, 30), 15, "Daily Standup", "Beitreten: https://meet.google.com/aaa-bbbb-ccc", "", False),
     (0, (14, 0), 60, "Sprint Review", "Video: https://meet.google.com/ddd-eeee-fff", "", False),
+    (0, (11, 0), 30, "Partner-Abstimmung", "https://teams.microsoft.com/l/meetup-join/demo", "", False),
     (0, (16, 30), 30, "1:1 mit der Teamleitung", "", "Besprechungsraum 2", False),
     (0, (0, 0), 1440, "Urlaub (Kollegin)", "", "", True),
     (1, (11, 0), 45, "Kundencall", "https://example.zoom.us/j/1234567890", "", False),
+    (1, (15, 0), 30, "Community-Call", "Raum: https://meet.jit.si/omeetingbar-demo", "", False),
 )
 
 
