@@ -34,12 +34,12 @@ import argparse
 import configparser
 import datetime
 import hashlib
-import html
 import json
 import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -92,12 +92,29 @@ MAX_LOOKAHEAD_MINUTES = 30 * 24 * 60
 # Six hours already covers any suspend or lock worth alerting after.
 MAX_GRACE_SECONDS = 6 * 3600
 
-# Exactly the three packages README.md and install.sh name, in the same order,
-# so the sentence the user reads here is the command they can paste.
+# Calendar data is third-party input. These bound what one hostile invite or a
+# runaway recurrence rule (FREQ=SECONDLY expands to ~600 000 instances in a
+# week) can make this script and the shell do. Service.qml caps again at 512.
+MAX_EVENTS = 512
+MAX_INSTANCES_PER_CALENDAR = 2000
+MAX_URL_CHARS = 2048
+# Total budget for the pushed network refresh across all calendars, and for
+# all ICS downloads: the service kills the fetcher at 45 s, and a killed run
+# writes no cache at all, so every blocking call needs a deadline well inside.
+REFRESH_BUDGET_SECONDS = 15
+ICS_BUDGET_SECONDS = 30
+# A pushed refresh that has not succeeded for this long means EDS is serving
+# its old local copy (revoked token, VPN down) and the user has to be told.
+REFRESH_STALE_SECONDS = 1800
+
+# Exactly the packages README.md and install.sh name, in the same order, so
+# the sentence the user reads here is the command they can paste.
 # gnome-online-accounts-gtk is the GOA dialog on this machine and a separate
 # package from the gnome-online-accounts library, so it has to be listed.
+# python-gobject is in Omarchy's base set, but nothing in the other three
+# depends on it and the eds backend cannot start without it.
 EDS_PACKAGES = ("sudo pacman -S --needed gnome-online-accounts "
-                "gnome-online-accounts-gtk evolution-data-server")
+                "gnome-online-accounts-gtk evolution-data-server python-gobject")
 GOA_DIALOG = "gnome-online-accounts-gtk"
 ICS_PACKAGES = "sudo pacman -S python-icalendar python-recurring-ical-events"
 
@@ -128,20 +145,39 @@ def typelib_package(namespace):
 # Slack and Discord also carry plain links to messages and servers, so for them
 # only a huddle, a voice channel or an invite counts. Providers.js maps the same
 # hosts to a glyph and a brand colour; keep the two lists in step.
+# The host has to END after the allow-listed name (a port may follow): without
+# the lookahead, "zoom.us.evil.example" matched as zoom.us. A URL also ends at
+# Markdown emphasis, at a backslash (browsers read it as "/") and at the
+# zero-width characters that invite bodies pasted from chat tools carry.
+_URL_END = r"[^\s<>\"'*|\\​‌‍﻿]"
 JOIN_URL_RE = re.compile(
     r"https://(?:"
     r"(?:[A-Za-z0-9-]+\.)*"
     r"(?:meet\.google\.com|zoom\.us|zoomgov\.com|teams\.microsoft\.com|teams\.live\.com"
     r"|webex\.com|meet\.jit\.si|8x8\.vc|whereby\.com"
     r"|gotomeeting\.com|meet\.goto\.com|gotomeet\.me)"
-    r"(?:/[^\s<>\"']*)?"
-    r"|app\.slack\.com/huddle/[^\s<>\"']+"
-    r"|(?:discord|discordapp)\.com/channels/[^\s<>\"']+"
-    r"|discord\.gg/[^\s<>\"']+"
+    r"(?::\d{1,5})?(?![A-Za-z0-9.-])"
+    r"(?:[/?#]" + _URL_END + r"*)?"
+    r"|app\.slack\.com/huddle/" + _URL_END + r"+"
+    r"|(?:discord|discordapp)\.com/channels/" + _URL_END + r"+"
+    r"|discord\.gg/" + _URL_END + r"+"
     r")",
     re.IGNORECASE,
 )
-URL_TRAILING_JUNK = ".,;:!?)]}>\"'"
+URL_TRAILING_JUNK = ".,;:!?)]}>\"'*_~|​‌‍﻿"
+# html.unescape() also decodes legacy entities WITHOUT a semicolon, so a plain
+# "?pwd=x&region=eu" in a description came back as "®ion=eu" (same for &para,
+# &copy, &sect, &not, &deg). Only the entities an HTML-escaped description can
+# actually contain are undone; &amp; last, so "&amp;lt;" ends as the literal
+# "&lt;" and not as "<".
+_HTML_ENTITIES = (("&lt;", "<"), ("&gt;", ">"), ("&quot;", '"'), ("&#39;", "'"),
+                  ("&apos;", "'"), ("&nbsp;", " "), ("&amp;", "&"))
+
+
+def unescape_html(text):
+    for entity, char in _HTML_ENTITIES:
+        text = text.replace(entity, char)
+    return text
 
 
 class BackendError(Exception):
@@ -163,6 +199,13 @@ def _int(value, default=0):
 def _short(value, limit=140):
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _scrub(value):
+    """Error text meant for the user's screen (widget tooltip, `status`): URLs
+    -- CalDAV errors quote the request -- and addresses are blanked first."""
+    text = re.sub(r"https?://\S+", "<url>", str(value))
+    return re.sub(r"\S+@\S+", "<adresse>", text)
 
 
 def _call(obj, name, default=None):
@@ -259,10 +302,12 @@ def load_config(path):
 # --- event construction (pure) ----------------------------------------------
 
 
-def event_id(uid, start_epoch):
+def event_id(uid, start_epoch, title=""):
     """sha1(uid + "@" + instance_start)[:16]. Must be byte-identical for the
-    same occurrence on every run, otherwise Service.qml re-fires the alert."""
-    key = "%s@%d" % (uid or "", int(start_epoch))
+    same occurrence on every run, otherwise Service.qml re-fires the alert. An
+    event without a UID falls back to its title, so two UID-less meetings at the
+    same time are not merged into one by the de-duplication."""
+    key = "%s@%d" % (uid or ("~" + (title or "")), int(start_epoch))
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
 
 
@@ -281,13 +326,15 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
     if end < start:
         end = start
     return {
-        "id": event_id(uid, start),
+        "id": event_id(uid, start, title),
         "title": _short(title or "(ohne Titel)", 200),
         "start": start,
         "end": end,
         "all_day": bool(all_day),
         "declined": bool(declined),
-        "url": url or "",
+        # Over-long URLs make the notification's --exec argv fail (E2BIG) and
+        # the toast vanish silently; Service.qml drops them too.
+        "url": url if url and len(url) <= MAX_URL_CHARS else "",
         "calendar": _short(calendar or "", 120),
         "location": _short(location or "", 200),
         "_join_path": join_path,
@@ -295,23 +342,39 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
 
 
 def clean_url(value):
-    """https-only, trailing sentence punctuation removed. Descriptions wrap
-    links in prose, so "…/abc-defg-hij." must not become part of the room id."""
+    """https-only, no whitespace, no backslash, bounded length, trailing
+    sentence punctuation removed -- the same test the QML side applies
+    (invariant 3). Descriptions wrap links in prose, so "…/abc-defg-hij." must
+    not become part of the room id. The backslash matters because browsers read
+    it as "/": "https://evil.example\\@meet.google.com" passes any host check
+    that splits on "@" and lands on evil.example."""
     value = (value or "").strip().rstrip(URL_TRAILING_JUNK)
-    return value if value[:8].lower() == "https://" else ""
+    if len(value) > MAX_URL_CHARS or not re.fullmatch(r"https://[^\s\\]+", value):
+        return ""
+    return value
+
+
+def provider_url(value):
+    """A CONFERENCE / X-GOOGLE-CONFERENCE value counts only if the whole value is
+    a provider URL by the same rule as the regex path. The two properties come
+    from the invite like everything else, and an unknown host there would reach
+    the browser on Enter while the alert could name no provider."""
+    url = clean_url(value)
+    return url if url and JOIN_URL_RE.fullmatch(url) else ""
 
 
 def pick_join_url(conference, x_google_conference, location, description):
     """-> (url, path). Precedence per spec: RFC 7986 CONFERENCE, then
     X-GOOGLE-CONFERENCE, then a provider-host regex over LOCATION, then over
-    DESCRIPTION. The iCalendar URL property is deliberately not consulted: for
-    Google events it is the calendar web page, not the meeting room.
+    DESCRIPTION -- every path allow-lists the host. The iCalendar URL property
+    is deliberately not consulted: for Google events it is the calendar web
+    page, not the meeting room.
 
     Pure -- no gi, no I/O -- so the precedence can be reasoned about on its own.
     """
     for value, path in ((conference, "conference"),
                         (x_google_conference, "x-google-conference")):
-        url = clean_url(value)
+        url = provider_url(value)
         if url:
             return url, path
     # In practice this is the path that fires: whether Google's CalDAV emits the
@@ -319,7 +382,7 @@ def pick_join_url(conference, x_google_conference, location, description):
     # Descriptions arrive HTML-escaped, so &amp; has to be undone before matching
     # or a Zoom link loses its ?pwd= parameter.
     for text, path in ((location, "location-regex"), (description, "description-regex")):
-        match = JOIN_URL_RE.search(html.unescape(text or ""))
+        match = JOIN_URL_RE.search(unescape_html(text or ""))
         if match:
             url = clean_url(match.group(0))
             if url:
@@ -425,11 +488,23 @@ def previous_events(cache):
     return kept
 
 
-def build_payload(backend, status, error, warning, events, refreshed_at, stale, now):
+def stale_events(cache, config, now, window_start, window_end):
+    """The last known good list as the fallback for a failed run. The user's
+    current filters still apply to it, and occurrences that ended before the
+    agenda window are gone -- a backend down for days must not keep showing
+    last week's meetings."""
+    events = apply_filters(previous_events(cache), config, now, window_end)
+    return [event for event in events if max(event["end"], event["start"]) >= window_start]
+
+
+def build_payload(backend, status, error, warning, events, refreshed_at, refresh_ok_at,
+                  stale, now):
     """`error` belongs to status "error" alone. `warning` is the separate channel
     for "usable but degraded" -- a partial calendar failure, a rejected config
     value, a test event outside the window -- and stays "" when there is none, so
-    a consumer can treat any non-empty warning as something to surface."""
+    a consumer can treat any non-empty warning as something to surface.
+    `refreshed_at` is the last ATTEMPTED network refresh (the throttle),
+    `refresh_ok_at` the last one that succeeded (the freshness)."""
     payload = {
         "schema": SCHEMA_VERSION,
         "backend": backend,
@@ -438,6 +513,7 @@ def build_payload(backend, status, error, warning, events, refreshed_at, stale, 
         "warning": warning,
         "generated_at": int(now),
         "refreshed_at": int(refreshed_at or 0),
+        "refresh_ok_at": int(refresh_ok_at or 0),
         "events": [{key: value for key, value in event.items() if not key.startswith("_")}
                    for event in events],
     }
@@ -451,11 +527,16 @@ def write_cache(path, payload, prefix=".events-"):
     never sees a half-written cache. The directory lives on tmpfs on purpose.
     Also used for the inject marker, which needs the same treatment."""
     directory = os.path.dirname(path) or "."
+    created = not os.path.isdir(directory)
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
+    # 0700 is enforced on the directory this script owns -- the runtime dir, or
+    # one it has just created -- never on an arbitrary --out parent (or the cwd
+    # for a bare file name), which used to lose its group/other bits silently.
+    if created or os.path.realpath(directory) == os.path.realpath(runtime_dir()):
+        try:
+            os.chmod(directory, 0o700)
+        except OSError:
+            pass
     descriptor, tmp_path = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
     try:
         os.fchmod(descriptor, 0o600)
@@ -546,14 +627,18 @@ def merge_inject(events, injected, config, now, window_end):
     """-> (events, warning). Merged on EVERY run and on every code path, the
     error one included: on a machine without EDS a plain run ends in the
     BackendError branch, and the test alert has to survive that too. A stale
-    cache can already carry the previous run's copy, hence the de-dup by id."""
+    cache can already carry the previous run's copy, hence the de-dup by id.
+
+    Only the window applies to the marker: a title_blocklist entry such as
+    "test" or a min_duration_minutes above its length must not make the test
+    vanish behind a warning that blames the window. The grace side is
+    load_inject's -- an expired marker never gets here. `config` and `now` stay
+    in the signature for the callers' sake."""
     events = [event for event in events if event["id"] != injected["id"]]
-    survivors = apply_filters([injected], config, now, window_end)
-    events = sorted(events + survivors, key=lambda event: (event["start"], event["id"]))
-    if survivors:
-        return events, ""
-    return events, ("Der Testtermin aus --in-seconds liegt außerhalb von "
-                    "lookahead_minutes/grace_seconds und wird nicht ausgeliefert.")
+    if injected["start"] >= window_end:
+        return events, ("Der Testtermin aus --in-seconds liegt außerhalb von "
+                        "lookahead_minutes und wird nicht ausgeliefert.")
+    return sorted(events + [injected], key=lambda event: (event["start"], event["id"])), ""
 
 
 # --- backend: demo ----------------------------------------------------------
@@ -622,10 +707,10 @@ def _network_detail(exc):
     return type(exc).__name__
 
 
-def _http_get_ics(url):
+def _http_get_ics(url, timeout=ICS_TIMEOUT_SECONDS):
     request = urllib.request.Request(url, headers={"User-Agent": "omeetingbar/1"})
     opener = urllib.request.build_opener(HttpsOnlyRedirectHandler)
-    with opener.open(request, timeout=ICS_TIMEOUT_SECONDS) as response:
+    with opener.open(request, timeout=timeout) as response:
         payload = response.read(MAX_ICS_BYTES + 1)
     if len(payload) > MAX_ICS_BYTES:
         raise ValueError("feed larger than %d bytes" % MAX_ICS_BYTES)
@@ -661,6 +746,9 @@ def _dt_to_epoch(value):
 
 def ics_component_to_event(component, calendar_name):
     """Pure: takes an already-parsed component, returns a cache entry or None."""
+    # A cancelled occurrence the feed still lists must not blank the screen.
+    if _ics_text(component, "STATUS").strip().upper() == "CANCELLED":
+        return None
     start_value = getattr(_ics_property(component, "DTSTART"), "dt", None)
     start = _dt_to_epoch(start_value)
     if start is None:
@@ -708,24 +796,46 @@ def read_ics(config, window_start, window_end):
 
     events = []
     failures = []
+    # ICS_TIMEOUT_SECONDS is per socket operation, so a slow-drip server or
+    # three feeds could outlast the service's 45 s watchdog; one monotonic
+    # deadline across all sources keeps the whole run inside it.
+    deadline = time.monotonic() + ICS_BUDGET_SECONDS
     for index, url in enumerate(urls, start=1):
         if url[:8].lower() != "https://":
             failures.append("Quelle %d: nur https ist erlaubt" % index)
             continue
+        remaining = deadline - time.monotonic()
+        if remaining < 1:
+            failures.append("Quelle %d: Zeitbudget erschöpft" % index)
+            continue
         try:
-            text = _http_get_ics(url)
+            text = _http_get_ics(url, min(ICS_TIMEOUT_SECONDS, remaining))
         except Exception as exc:
             failures.append("Quelle %d: %s" % (index, _network_detail(exc)))
             continue
         try:
             calendar = icalendar.Calendar.from_ical(text)
             name = _ics_text(calendar, "X-WR-CALNAME") or "ICS %d" % index
-            for component in recurring_ical_events.of(calendar).between(from_time, to_time):
-                event = ics_component_to_event(component, name)
-                if event is not None:
-                    events.append(event)
+            occurrences = recurring_ical_events.of(calendar).between(from_time, to_time)
         except Exception as exc:
             failures.append("Quelle %d: nicht auswertbar (%s)" % (index, type(exc).__name__))
+            continue
+        broken = 0
+        for count, component in enumerate(occurrences, start=1):
+            if count > MAX_INSTANCES_PER_CALENDAR:
+                failures.append("Quelle %d: mehr als %d Termine im Fenster, gekürzt"
+                                % (index, MAX_INSTANCES_PER_CALENDAR))
+                break
+            # One malformed component must not take the rest of its feed down.
+            try:
+                event = ics_component_to_event(component, name)
+            except Exception:
+                broken += 1
+                continue
+            if event is not None:
+                events.append(event)
+        if broken:
+            failures.append("Quelle %d: %d Einträge nicht auswertbar" % (index, broken))
 
     if failures and not events:
         raise BackendError("Kein ICS-Feed lesbar – " + "; ".join(failures))
@@ -765,12 +875,12 @@ def import_eds():
                ", ".join(packages), GOA_DIALOG, EDS_PACKAGES))
 
     try:
-        from gi.repository import ECal, EDataServer, GLib, ICalGLib
+        from gi.repository import ECal, EDataServer, Gio, GLib, ICalGLib
     except (ImportError, ValueError) as exc:
         raise BackendError(
             "evolution-data-server ist nicht nutzbar (%s). Installieren: %s"
             % (_short(exc, 80), EDS_PACKAGES)) from None
-    return EDataServer, ECal, ICalGLib, GLib
+    return EDataServer, ECal, ICalGLib, GLib, Gio
 
 
 def ical_time_to_epoch(value, ical):
@@ -892,6 +1002,12 @@ def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, 
     start = ical_time_to_epoch(instance_start, ical)
     if start is None:
         return None
+    # A cancelled occurrence that the backend still hands over must not blank
+    # the screen. Only the exact status counts; a missing getter reads as "not
+    # cancelled", since a lost meeting is worse than a cancelled one listed.
+    cancelled = getattr(ical.PropertyStatus, "CANCELLED", None)
+    if cancelled is not None and _call(icomp, "get_status") == cancelled:
+        return None
     texts = component_texts(icomp, ical)
     url, path = pick_join_url(texts["conference"], texts["x_google_conference"],
                               texts["location"], texts["description"])
@@ -908,22 +1024,29 @@ def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, 
 
 
 def generate_instances(client, ical, glib, window_start, window_end, calendar_name, identities):
-    """-> (events, problem). generate_instances_sync is what actually expands
-    recurrences; get_object_list_as_comps_sync hands back the masters instead."""
+    """-> (events, problem, capped). generate_instances_sync is what actually
+    expands recurrences; get_object_list_as_comps_sync hands back the masters
+    instead. `capped` means the calendar hit MAX_INSTANCES_PER_CALENDAR and the
+    expansion was stopped -- a runaway rule, not a failure."""
     collected = []
     trouble = []
+    capped = []
 
     def on_instance(icomp, instance_start, instance_end, *_rest):
         # ECalRecurInstanceCb also passes user_data and a GCancellable; *_rest
         # absorbs whichever arity the installed binding uses. An exception here
-        # would unwind through C, so nothing may escape.
+        # would unwind through C, so nothing may escape. Returning False stops
+        # the expansion.
+        if len(collected) >= MAX_INSTANCES_PER_CALENDAR:
+            capped.append(True)
+            return False
         try:
             event = instance_to_event(icomp, instance_start, instance_end, ical,
                                       calendar_name, identities)
             if event is not None:
                 collected.append(event)
         except Exception as exc:
-            trouble.append("%s: %s" % (type(exc).__name__, _short(exc, 60)))
+            trouble.append("%s: %s" % (type(exc).__name__, _scrub(_short(exc, 60))))
         return True
 
     start, end = int(window_start), int(window_end)
@@ -933,8 +1056,10 @@ def generate_instances(client, ical, glib, window_start, window_end, calendar_na
         except TypeError:
             client.generate_instances_sync(start, end, None, on_instance, None)
     except glib.Error as exc:
-        return collected, _short(getattr(exc, "message", exc), 80)
-    return collected, trouble[0] if trouble else ""
+        return collected, _scrub(_short(getattr(exc, "message", exc), 80)), bool(capped)
+    except Exception as exc:
+        return collected, type(exc).__name__, bool(capped)
+    return collected, (trouble[0] if trouble else ""), bool(capped)
 
 
 def google_collection_roots(registry):
@@ -1006,12 +1131,14 @@ def open_registry(eds, glib):
                            % _short(getattr(exc, "message", exc), 80)) from None
 
 
-def read_eds(config, now, window_start, window_end, cache, force_refresh):
-    """-> (events, refreshed_at, failure, warnings). Raises BackendError when
-    there is no usable calendar at all. A single failing calendar only fills
-    `failure`, which the caller reports as a warning -- or, when nothing
-    survives filtering, as status "error" (D2)."""
-    eds, ecal, ical, glib = import_eds()
+def read_eds(config, now, window_start, window_end, cache, cache_path, force_refresh):
+    """-> (events, refreshed_at, failure, warnings, refresh_ok_at). Raises
+    BackendError when there is no usable calendar at all. A single failing
+    calendar only fills `failure`, which the caller reports as a warning -- or,
+    when nothing survives filtering, as status "error" (D2) -- and keeps its
+    events from the previous cache. `cache_path` is where the refresh stamp is
+    persisted ahead of the refresh; None (diagnose) writes nothing."""
+    eds, ecal, ical, glib, gio = import_eds()
     registry = open_registry(eds, glib)
 
     # These two strings are what the widget and `omeetingbar status` put in front of
@@ -1046,58 +1173,131 @@ def read_eds(config, now, window_start, window_end, cache, force_refresh):
     # for a meeting alarm, so a network refresh is pushed by hand -- but only
     # every refresh_seconds, since the fetcher itself runs every minute.
     refreshed_at = _int(cache.get("refreshed_at"))
+    refresh_ok_at = _int(cache.get("refresh_ok_at"))
     refresh_due = force_refresh or (now - refreshed_at) >= max(config["refresh_seconds"], 0)
+    if refresh_due:
+        # Stamp the ATTEMPT, not the success, and persist it BEFORE refreshing:
+        # a refresh that hangs into the service's watchdog is killed before this
+        # run writes its cache, and without the stamp the next run would hang
+        # again, for ever, while the local copy stayed perfectly readable.
+        refreshed_at = now
+        if cache and cache_path:
+            try:
+                write_cache(cache_path, dict(cache, refreshed_at=now))
+            except (OSError, ValueError):
+                pass
 
     events = []
     failures = []
-    for source in sources:
-        name = source.get_display_name() or ""
+    failed_names = set()
+    refresh_tried = 0
+    refresh_failed = 0
+    deadline = time.monotonic() + REFRESH_BUDGET_SECONDS
+    for index, source in enumerate(sources, start=1):
+        name = _short(source.get_display_name() or "", 120)
         if calendar_excluded(source, excluded):
             continue
+        # Calendars are named by position in anything user-facing: display
+        # names are often an address or a colleague's name, and these strings
+        # reach the widget tooltip and `omeetingbar status`.
+        label = "Kalender %d" % index
         try:
             client = ecal.Client.connect_sync(source, ecal.ClientSourceType.EVENTS,
                                               CONNECT_TIMEOUT_SECONDS, None)
         except glib.Error as exc:
-            failures.append("%s (%s)" % (name, _short(getattr(exc, "message", exc), 60)))
+            failures.append("%s (%s)" % (label, _scrub(_short(getattr(exc, "message", exc), 60))))
+            failed_names.add(name)
+            continue
+        except Exception as exc:
+            # Anything else from one calendar is that calendar's problem, not
+            # the run's: it used to abort everything via main()'s last resort.
+            failures.append("%s (%s)" % (label, type(exc).__name__))
+            failed_names.add(name)
             continue
 
         if refresh_due:
             try:
                 if client.check_refresh_supported():
-                    client.refresh_sync(None)
-            except glib.Error:
-                pass  # a failed refresh still leaves the locally cached copy readable
-            # Stamp the ATTEMPT, not the success. With the stamp inside the try
-            # after refresh_sync(), a calendar that fails or does not support
-            # refresh left refreshed_at untouched, so the throttle never engaged
-            # and every 60 s run blocked on another refresh of every calendar.
-            refreshed_at = now
+                    refresh_tried += 1
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("refresh budget spent")
+                    # A cancellable fired from a timer is the only deadline
+                    # refresh_sync offers; an unreachable backend (VPN down,
+                    # captive portal) otherwise blocks until the watchdog.
+                    cancellable = gio.Cancellable()
+                    timer = threading.Timer(remaining, cancellable.cancel)
+                    timer.daemon = True
+                    timer.start()
+                    try:
+                        client.refresh_sync(cancellable)
+                    finally:
+                        timer.cancel()
+            except Exception:
+                # The locally cached copy stays readable; the failure is counted
+                # and surfaced below instead of being swallowed.
+                refresh_failed += 1
 
-        collected, problem = generate_instances(client, ical, glib, window_start, window_end,
-                                                name, identities)
+        collected, problem, capped = generate_instances(client, ical, glib, window_start,
+                                                        window_end, name, identities)
         events.extend(collected)
         if problem:
-            failures.append("%s (%s)" % (name, problem))
+            failures.append("%s (%s)" % (label, problem))
+            failed_names.add(name)
+        if capped:
+            warnings.append("%s: mehr als %d Termine im Fenster, Liste gekürzt."
+                            % (label, MAX_INSTANCES_PER_CALENDAR))
+
+    # A refresh that keeps failing (revoked token, VPN down) used to be
+    # invisible: EDS served its old local copy as `status: "ok"` with a fresh
+    # refreshed_at, and meetings added or moved since never reached the cache.
+    if refresh_due:
+        if refresh_tried == 0 or refresh_failed == 0:
+            refresh_ok_at = now  # nothing to refresh, or all of it worked
+        elif refresh_failed == refresh_tried:
+            warnings.append("Kalender-Sync fehlgeschlagen – es gilt die lokale Kopie.")
+        else:
+            refresh_ok_at = now
+            warnings.append("Kalender-Sync teilweise fehlgeschlagen (%d von %d)."
+                            % (refresh_failed, refresh_tried))
+    if refresh_ok_at and now - refresh_ok_at > REFRESH_STALE_SECONDS:
+        warnings.append("Letzter erfolgreicher Kalender-Sync vor %s – Termine können "
+                        "veraltet sein." % human_delta(now - refresh_ok_at))
+
+    if failed_names:
+        # A calendar that failed this run keeps its last known events instead of
+        # vanishing for a minute: Service.qml withdraws a queued alert whose
+        # event is gone from a healthy cache, and the agenda would lose its rows.
+        known = {event["id"] for event in events}
+        carried = 0
+        for event in previous_events(cache):
+            if event["calendar"] in failed_names and event["id"] not in known:
+                event["_join_path"] = "cache"
+                events.append(event)
+                carried += 1
+        if carried:
+            failures.append("%d Termine aus dem letzten Lauf übernommen" % carried)
 
     if failures and not events:
         raise BackendError("Kalender nicht lesbar – " + "; ".join(failures))
     failure = ("Teilweise fehlgeschlagen: " + "; ".join(failures)) if failures else ""
-    return events, refreshed_at, failure, warnings
+    return events, refreshed_at, failure, warnings, refresh_ok_at
 
 
 # --- fetch dispatch ---------------------------------------------------------
 
 
-def fetch(config, backend, args, now, window_start, window_end, cache):
-    """-> (events, refreshed_at, failure, warnings). Raises BackendError when the
-    backend produced nothing trustworthy at all. `failure` non-empty means the
-    backend delivered only part of its data; `warnings` are non-fatal notes."""
+def fetch(config, backend, args, now, window_start, window_end, cache, cache_path=None):
+    """-> (events, refreshed_at, failure, warnings, refresh_ok_at). Raises
+    BackendError when the backend produced nothing trustworthy at all. `failure`
+    non-empty means the backend delivered only part of its data; `warnings` are
+    non-fatal notes. `cache_path` None means "write nothing" (diagnose)."""
     if backend == "demo":
-        return demo_events(now), now, "", []
+        return demo_events(now), now, "", [], now
     if backend == "ics":
         events, failure = read_ics(config, window_start, window_end)
-        return events, now, failure, []
-    return read_eds(config, now, window_start, window_end, cache, args.refresh)
+        return events, now, failure, [], now
+    return read_eds(config, now, window_start, window_end, cache, cache_path, args.refresh)
 
 
 def window_for(config, now):
@@ -1193,7 +1393,7 @@ def goa_google_accounts():
 
 def diagnose_calendars(config):
     try:
-        eds, _ecal, _ical, glib = import_eds()
+        eds, _ecal, _ical, glib, _gio = import_eds()
         registry = open_registry(eds, glib)
     except BackendError as exc:
         return ["  nicht prüfbar: %s" % exc.message]
@@ -1240,8 +1440,11 @@ def diagnose_cache(path, cache, now):
         lines.append("  Warnung:              %s" % _short(cache.get("warning"), 200))
     events = cache.get("events")
     lines.append("  Termine im Cache:     %d" % (len(events) if isinstance(events, list) else 0))
-    lines.append("  Letzter Netz-Sync:    %s"
+    lines.append("  Letzter Netz-Sync:    %s (Versuch)"
                  % (human_delta(now - refreshed) + " her" if refreshed else "nie"))
+    refresh_ok = _int(cache.get("refresh_ok_at"))
+    lines.append("  Letzter Erfolg:       %s"
+                 % (human_delta(now - refresh_ok) + " her" if refresh_ok else "nie"))
     return lines
 
 
@@ -1250,8 +1453,8 @@ def diagnose_join_paths(config, backend, args, now, cache):
     titles, no times, and above all never the URL itself."""
     window_start, window_end = window_for(config, now)
     try:
-        events, _refreshed, failure, warnings = fetch(config, backend, args, now,
-                                                      window_start, window_end, cache)
+        events, _refreshed, failure, warnings, _ok = fetch(config, backend, args, now,
+                                                           window_start, window_end, cache)
     except BackendError as exc:
         return ["  Backend-Fehler: %s" % exc.message]
     except Exception as exc:
@@ -1344,7 +1547,9 @@ def parse_args(argv):
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, metavar="PATH",
                         help="config file (default: %s)" % DEFAULT_CONFIG_PATH)
     parser.add_argument("--out", default=None, metavar="PATH",
-                        help="cache file (default: $XDG_RUNTIME_DIR/omeetingbar/events.json)")
+                        help="cache file (default: $XDG_RUNTIME_DIR/omeetingbar/events.json, "
+                             "or /run/user/<uid>/omeetingbar/events.json without "
+                             "XDG_RUNTIME_DIR)")
     parser.add_argument("--backend", choices=BACKENDS, default=None,
                         help="override the configured backend")
     parser.add_argument("--in-seconds", type=int, default=None, metavar="N",
@@ -1355,7 +1560,8 @@ def parse_args(argv):
     parser.add_argument("--refresh", action="store_true",
                         help="force a network refresh, ignoring refresh_seconds")
     parser.add_argument("--diagnose", action="store_true",
-                        help="print a readiness report and exit; writes nothing")
+                        help="print a readiness report and exit; reads the calendar "
+                             "(a due network refresh included) but writes no cache")
     parser.add_argument("--print", dest="print_json", action="store_true",
                         help="write the JSON to stdout instead of the cache file")
     return parser.parse_args(argv)
@@ -1382,18 +1588,24 @@ def main(argv=None):
                              % (inject_path, _short(exc, 100)))
             return 1
     injected = load_inject(inject_path, now, max(config["grace_seconds"], 0))
+    if args.in_seconds is not None and injected is None:
+        # write_inject armed it and load_inject spent it in the same run: the
+        # start was already more than grace_seconds in the past.
+        warnings.append("Der Testtermin aus --in-seconds liegt bereits außerhalb von "
+                        "grace_seconds und wurde verworfen.")
 
     window_start, window_end = window_for(config, now)
     status, error, failure, stale = "ok", "", "", False
     refreshed_at = now
+    refresh_ok_at = _int(cache.get("refresh_ok_at"))
     try:
-        events, refreshed_at, failure, backend_warnings = fetch(
-            config, backend, args, now, window_start, window_end, cache)
+        events, refreshed_at, failure, backend_warnings, refresh_ok_at = fetch(
+            config, backend, args, now, window_start, window_end, cache, out_path)
         warnings.extend(backend_warnings)
         events = apply_filters(events, config, now, window_end)
     except BackendError as exc:
         status, error = "error", exc.message
-        events = previous_events(cache)
+        events = stale_events(cache, config, now, window_start, window_end)
         stale = bool(events)
         refreshed_at = _int(cache.get("refreshed_at"))
     except Exception as exc:
@@ -1401,20 +1613,24 @@ def main(argv=None):
         # traceback on the service's stderr and an unchanged stale file.
         status = "error"
         error = ("Unerwarteter Fehler im Backend '%s' (%s: %s)."
-                 % (backend, type(exc).__name__, _short(exc, 100)))
-        events = previous_events(cache)
+                 % (backend, type(exc).__name__, _scrub(_short(exc, 100))))
+        events = stale_events(cache, config, now, window_start, window_end)
         stale = bool(events)
         refreshed_at = _int(cache.get("refreshed_at"))
 
+    if len(events) > MAX_EVENTS:
+        warnings.append("Nur die ersten %d Termine werden ausgeliefert." % MAX_EVENTS)
+        events = events[:MAX_EVENTS]
+
     if failure:
-        # D2, decided AFTER filtering and on the backend's own events: a partial
-        # failure that leaves nothing behind is not a usable result and must not
-        # reach the user as "no meetings today" on a status-ok cache. With events
-        # left it is only a warning -- the list is usable, just incomplete.
-        # No stale fallback here on purpose: unlike a total failure we do know
-        # that the calendars we could read are empty, and resurrecting old events
-        # would alert for meetings that may well be gone. The test marker is
-        # merged below, so arming one cannot hide a half-failed calendar read.
+        # D2, decided AFTER filtering: a partial failure that leaves nothing
+        # behind is not a usable result and must not reach the user as "no
+        # meetings today" on a status-ok cache. With events left it is only a
+        # warning -- the list is usable, just incomplete. The eds backend
+        # carries a failed calendar's previous events forward itself, so a
+        # one-minute hiccup in one calendar neither empties the agenda nor
+        # withdraws a queued alert. The test marker is merged below, so arming
+        # one cannot hide a half-failed calendar read.
         if events:
             warnings.append(failure)
         else:
@@ -1426,7 +1642,7 @@ def main(argv=None):
             warnings.append(inject_warning)
 
     payload = build_payload(backend, status, error, " ".join(warnings), events,
-                            refreshed_at, stale, now)
+                            refreshed_at, refresh_ok_at, stale, now)
 
     if args.print_json:
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
@@ -1434,7 +1650,9 @@ def main(argv=None):
     else:
         try:
             write_cache(out_path, payload)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError covers a lone surrogate under ensure_ascii=False; the
+            # message carries a position, never content.
             sys.stderr.write("omeetingbar-fetch: cannot write %s: %s\n"
                              % (out_path, _short(exc, 100)))
             return 1

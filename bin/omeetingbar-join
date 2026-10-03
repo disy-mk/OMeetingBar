@@ -9,7 +9,16 @@
 url=$1
 end=$2
 
-[ -n "$url" ] || exit 0
+# Defence in depth: Service.qml only hands over validated https URLs, but this
+# is the last hop before a browser launcher that takes options, so the same
+# rule is applied again (https, no whitespace, no backslash).
+case $url in
+  https://*) ;;
+  *) exit 0 ;;
+esac
+case $url in
+  *[[:space:]\\]*) exit 0 ;;
+esac
 case $end in
   '' | *[!0-9]*) ;;
   *) [ "$(date +%s)" -ge "$end" ] && exit 0 ;;
