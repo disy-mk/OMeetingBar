@@ -229,9 +229,10 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   `~/.local/state/omarchy/notifications/`, where they survive a reboot. A toast replaced by
   "Meeting ended" reaches Omarchy's history without content; one you closed or clicked earlier
   keeps its text there — on disk under `~/.local/state/omarchy/notifications/history/`, the
-  newest 10, across reboots (`omarchy-shell notifications clear` empties it). Set `notify_details` to
-  `false` to send toasts without meeting content (only "Meeting"/"Termin", the countdown and
-  the time range), or `notify` to `false` to send none. The join URL never reaches the daemon.
+  newest 10, across reboots (`omarchy-shell notifications clear` empties it). Set
+  `notify_details` to `false` to send toasts without meeting content (only "Meeting"/"Termin",
+  the countdown and the time range), or `notify` to `false` to send none. The join URL never
+  reaches the daemon.
 - The plugin's own processes never carry calendar content in their arguments, where any local
   user could read it from `/proc`: notifications go to a small helper over stdin, the click
   action carries only the event id and the grace window, and the join link leaves the 0600
@@ -239,12 +240,12 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   back to a content-free toast (time only).
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
 - The fullscreen alert ignores keys and clicks for its first second, so input in flight can
-  neither join a meeting from an invite you have not seen nor clear the alert unread. Alerts are bounded: at most 8 wait in the queue, at
-  most 3 meetings per minute get their own notification (the rest share one), at most 512
-  occurrences are read from the cache.
+  neither join a meeting from an invite you have not seen nor clear the alert unread. Alerts
+  are bounded: at most 8 wait in the queue, at most 3 meetings per minute get their own
+  notification (the rest share one), at most 512 occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 5,700 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
+  about 7,300 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 
@@ -274,9 +275,10 @@ mit `notify_details: false` nur "Termin", Countdown und Uhrzeit.
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
 `./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die noch
 fehlenden der benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
-`gnome-online-accounts-gtk`, `python-gobject`), die Anleitung, das Google-Konto in `gnome-online-accounts-gtk`
-zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es das `demo`-Backend vor. Für
-Pakete und Konto ist kein Shell-Neustart nötig, der nächste Abruf übernimmt beide.
+`gnome-online-accounts-gtk`, `python-gobject`), die Anleitung, das Google-Konto in
+`gnome-online-accounts-gtk` zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es
+das `demo`-Backend vor. Für Pakete und Konto ist kein Shell-Neustart nötig, der nächste Abruf
+übernimmt beide.
 
 Update: `omarchy plugin update io.github.disy-mk.omeetingbar && omarchy restart shell`, bei
 entsperrtem Bildschirm (eine gesperrte Shell startet Omarchy nicht neu). Erst der
