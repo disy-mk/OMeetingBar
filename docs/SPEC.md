@@ -11,7 +11,7 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 
 | Path | Kind | Owner |
 |---|---|---|
-| `manifest.json` | — | schemaVersion 1, kinds `["service","overlay","bar-widget"]` |
+| `manifest.json` | — | schemaVersion 1, kinds `["service","overlay","bar-widget"]`; `version` must equal `Service.qml`'s `codeVersion` (release rule, see *Version and updates*) |
 | `Service.qml` | `service` | the brain: fetch loop, 1 Hz wall-clock tick, firing, inhibitor, IPC |
 | `Alert.qml` | `overlay` | the fullscreen alert surface |
 | `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
@@ -19,8 +19,8 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
 | `Strings.js` | — | every QML-side UI string in German and English, plus the language rule (`pick`); imported by all four QML files |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
-| `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: looks the event up by id in the 0600 cache and opens its link only while the meeting is on |
-| `bin/omeetingbar-notify` | — | python3 (Gio D-Bus), sends or replaces a notification from a JSON payload on **stdin**, so no toast text or link is ever a process argument; prints the notification id |
+| `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: `omeetingbar-join <event id> [<grace seconds>]` looks the event up by id in the 0600 cache and opens its link only until the meeting ends (a zero-length one until `start + grace`); the legacy form `omeetingbar-join <url> <end>` is still accepted for one or two releases (firing step 2) |
+| `bin/omeetingbar-notify` | — | python3 (Gio D-Bus), sends or replaces a notification from a JSON payload on **stdin**, so no toast text or link is ever an argument of a plugin process; prints the notification id |
 | `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
 | `README.md` | — | user-facing docs incl. the Google Workspace setup |
@@ -93,6 +93,7 @@ supply these defaults and never crash on a missing/broken file:
   "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
   "language": "auto",
   "notify": true,
+  "notify_details": true,
   "wake_display": true,
   "skip_all_day": true,
   "skip_declined": true,
@@ -124,6 +125,11 @@ Semantics:
 - `auto_dismiss_seconds` — 0 means "stay until dismissed", bounded by the overlay's 600 s hard
   dismiss (see the overlay contract).
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
+- `notify_details` — default `true`: a meeting's toast carries the title plus the location, or
+  the calendar name when there is no location. `false` sends a toast without title, location
+  or calendar name — summary "Termin"/"Meeting", body the countdown and the time range — with
+  the same click action, because the toast text leaves the plugin's control in Omarchy's
+  daemon (firing step 2). `notify: false` sends no toast at all.
 - `language` — `"de"`, `"en"` or `"auto"` (default). Resolved in exactly two places with the
   same rule: `Strings.pick(override, Qt.locale().name)` in `Strings.js` (Widget, Popup via the
   widget, Service; the alert gets the result in its payload as `lang`) and `pick_language()` in
@@ -150,8 +156,13 @@ Semantics:
 
 Written **only** by `bin/omeetingbar-fetch`: mode 0600, atomic (tmp in the same dir + `os.replace`),
 dir mode 0700. On tmpfs on purpose — nothing this plugin writes survives a reboot. One thing
-outside its control does: the critical notification carries title and location, and Omarchy keeps
-dismissed notifications in its history under `~/.local/state/omarchy/notifications/`.
+outside its control does: the critical notification carries the title plus the location, or the
+calendar name when there is no location (often an account address). Omarchy keeps every open
+toast under `~/.local/state/omarchy/notifications/`, where it survives a reboot; a toast the
+service replaced with "Meeting ended" reaches the history without content, but one the user
+closed or clicked earlier keeps its text in Omarchy's history, which is on disk too (`history/`
+in the same directory, the newest 10, surviving a reboot; `omarchy-shell notifications clear`
+empties it). `notify_details: false` keeps meeting content out of the toast, `notify: false` sends none.
 
 ```json
 {
@@ -199,6 +210,10 @@ dismissed notifications in its history under `~/.local/state/omarchy/notificatio
   has not succeeded for over 30 min, a calendar hit the instance cap, or an option was ignored
   because it does not apply to the active backend. `status` stays `"ok"`, and the text is in
   the UI language (see `language`), short and content-free (same privacy rules as `error`).
+  One warning is not about the run at all: the restart notice (see *Restart notice* under the
+  fetcher). It comes first and is set whatever `status` is; `restart_notice`, present only then,
+  repeats its text so that a reader can cut it again, and `restart_shell_pid` names the process
+  that started the run (the desktop shell, for every run of the service).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
   its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
@@ -229,8 +244,9 @@ restart during a lock.
 ```
 
 - `events` — three independent timestamps per occurrence, 0 meaning "not yet":
-  - `notified`: the once-per-occurrence side effects are done (display wake, critical
-    notification, sound). Persisted **before** they run, so a crash mid-fire cannot loop.
+  - `notified`: the once-per-occurrence side effects are done (critical notification, sound).
+    Persisted **before** they run, so a crash mid-fire cannot loop. The display wake is not one
+    of them: `drainQueue` does it right before the alert is first summoned (firing step 4).
   - `shown`: the fullscreen overlay was confirmed on screen — by the overlay itself
     (`Alert.open()` calls `service.overlayShown(id)` with the queue id carried in the payload),
     or, as a fallback, by the host's `isPluginOpen` once `confirmGraceSeconds` (2 s) have passed
@@ -274,7 +290,7 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 
 | Call | Effect |
 |---|---|
-| `omarchy-shell omeetingbar status` | JSON string: backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths. Events and queue entries carry ids and times only, never titles or calendar names — `status` is what ends up in bug reports |
+| `omarchy-shell omeetingbar status` | JSON string: `version` (the code answering, `codeVersion`), `installedVersion` (the manifest the host last read, `""` when unknown) and `restartNeeded` (`installedVersion` non-empty and different from `version`; see *Version and updates*), backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths. Events and queue entries carry ids and times only, never titles or calendar names — `status` is what ends up in bug reports |
 | `omarchy-shell omeetingbar refresh` | run the fetcher now |
 | `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
 | `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
@@ -310,10 +326,14 @@ Requirements:
   location if present, and the join hint when a URL exists.
 - Keys: Return/Enter/Space → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
   dismiss; Escape or any other key → dismiss. Full-size `MouseArea` → dismiss.
-- Key guard: every key inside `keyGuardMs` (1000 ms) after `open()` is swallowed. The overlay
-  takes exclusive keyboard focus the instant it appears, and a Space or Enter already on its way
-  down must not join a meeting — the invite's URL — that the user has not read yet. `open()`
-  restamps the time for a queued follow-up alert, which re-arms the guard.
+- Input guard: keys and clicks within the first second — `keyGuardMs` (1000 ms) after `open()` —
+  are ignored. The overlay takes exclusive keyboard focus the instant it appears, and a Space or
+  Enter already on its way down must not join a meeting — the invite's URL — that the user has
+  not read yet; it can also map between the two clicks of a double-click, whose second click
+  must not clear the alert unread. A click is judged at its press, because it only reports at
+  the release, which may come after the guard. A negative age (the wall clock stepped back since
+  `open()`) ends the guard, so no clock correction can lock input out. `open()` restamps the
+  time for a queued follow-up alert, which re-arms the guard.
 - Every way the overlay closes (`opened` → false: a key, a click, auto-dismiss, the host's
   `hide()`) calls `service.stopSound()`, so Esc silences the alarm too. `service` is the plugin's
   own Service.qml instance, which the host injects into a declared `property var service`.
@@ -462,6 +482,26 @@ file talks to the outside world.
   watchdog a single hung fetcher holds the re-entrancy guard forever and the cache silently stops
   updating. Note the watchdog is a backstop, not the fix for a slow backend: see the
   `wait_for_connected_seconds` note below, and remember the `ics` backend talks to the network.
+- **Version and updates**: `omarchy plugin update` fast-forwards the plugin's git checkout and
+  ends with `omarchy-shell shell rescanPlugins`; the plugin registry's file watcher triggers the
+  same reload when the files change. A reload destroys and recreates the service
+  (`unloadPluginServices`, then `ensureService` in `shell.qml`), but from the engine's
+  component cache: `finishPluginReload` clears it only if `Qt.clearComponentCache` exists, and
+  Qt 6.11 has none. So after an update `manifest.version` names the installed version while the
+  old `Service.qml` and `Widget.qml` code runs on until `omarchy restart shell` (which Omarchy
+  refuses while the session is locked); in-memory state such as summon attempts starts over,
+  and the state file carries the rest. `codeVersion`, a
+  constant in `Service.qml`, is the only thing that says which code is running. `status` reports
+  `version` (`codeVersion`), `installedVersion` and `restartNeeded`, and every fetch gets
+  `OMEETINGBAR_SERVICE=<codeVersion>` added to the inherited environment: the fetcher is read
+  from disk on every run, so it is the new code first and raises the restart notice (see
+  *Restart notice* under the fetcher). **Release rule**: `codeVersion` in `Service.qml` must
+  equal `version` in `manifest.json`; bump both together. A mismatch reports
+  `restartNeeded: true` and a fetcher warning on every run, and no restart clears either. QML
+  files that were not cached yet when the update landed — `Alert.qml` if no alert, test or
+  preview has been shown since the shell started, `Popup.qml` if the agenda was never opened —
+  load as new code beside the old `Service.qml` and `Widget.qml`, so a release must keep them
+  compatible with the previous version's alert payload and popup bindings.
 - **Firing** every alertable event (invariant 1) with `start - now <= alert_lead_seconds` and
   `now - start <= grace_seconds` whose id is not in `notified` — all of them on the same tick,
   not only the earliest, bounded at 8 per tick. All-day events are skipped here unconditionally
@@ -469,59 +509,76 @@ file talks to the outside world.
   fetch is still running: the cache then predates the sleep, and a meeting cancelled or moved
   while the machine slept must not wake the display, notify and ring.
   1. persist the id to `notified` in the state file first (so a crash cannot cause a re-fire loop),
-  2. if `wake_display`: `omarchy-brightness-display on` (NOT `hyprctl dispatch dpms on` — that
-     dispatcher no longer exists in Hyprland 0.56),
-  3. if `notify`: a critical toast through `bin/omeetingbar-notify`, run as a child `Process`
+  2. if `notify`: a critical toast through `bin/omeetingbar-notify`, run as a child `Process`
      one at a time (`notifyQueue`) with the payload written to its **stdin** — title, body,
      glyph `󰃭`, urgency, and, only when a URL exists, the click action
-     `["<plugin>/bin/omeetingbar-join", "<event id>"]`. **Nothing from the calendar may ever be a
-     process argument**: `omarchy-notification-send` and `busctl` put summary, body and `--exec`
-     into argv, which any local user can read from `/proc/<pid>/cmdline` while they run (the
-     marketplace review of 2026-10-04 flagged exactly that). The helper calls
-     `org.freedesktop.Notifications.Notify` over Gio with the hints Omarchy's daemon reads
-     (`urgency` byte, `omarchy-glyph`, `omarchy-exec-argv` as a JSON string) and `app_name`
-     `omarchy-action` (the daemon's DND bypass), and prints the notification id, which lands in
-     the toast's `nid`. Without Gio it falls back to `omarchy-notification-send` with the
-     content-free `safe` text (the word "Meeting" and the time range). `omeetingbar-join <id>`
-     reads URL, start and end from the 0600 cache when clicked and opens the URL with
-     `omarchy-launch-browser` only while the meeting is on (`end`, or `start + 300 s` for a
-     zero-length occurrence); after that, or when the event is gone from the cache, a click just
-     closes the toast. So the URL never appears on a command line, nor in Omarchy's persisted
-     notification files, before the browser launch itself. Location and calendar name are
-     markup-escaped (`& < >`) because Omarchy renders the body as `StyledText`; the headline is
-     plain text there and needs none. Only the first `maxToastsPerTick` (3) meetings due in one
-     tick get their own toast; the rest share one summary toast ("N weitere Termine", no join
-     link, tracked under its own id until the last of them ends) — N same-minute invites must not
-     mean N critical, never-expiring toasts,
-  4. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
+     `["<plugin>/bin/omeetingbar-join", "<event id>", "<grace seconds>"]`. **No process of this
+     plugin may ever carry calendar content in its arguments**: `omarchy-notification-send` and
+     `busctl` put summary, body and `--exec` into argv, which any local user can read from
+     `/proc/<pid>/cmdline` while they run (the marketplace review of 2026-10-04 flagged exactly
+     that). The helper calls `org.freedesktop.Notifications.Notify` over Gio with the hints
+     Omarchy's daemon reads (`urgency` byte, `omarchy-glyph`, `omarchy-exec-argv` as a JSON
+     string) and `app_name` `omarchy-action` (the daemon's DND bypass), and prints the
+     notification id, which lands in the toast's `nid`. Without Gio it falls back to
+     `omarchy-notification-send` with the content-free `safe` text (the word "Meeting" and the
+     time range). Past the helper the text is out of the plugin's hands: Omarchy's daemon saves
+     every toast it shows (`persistPopupFile`) by handing summary, body and click argv as one
+     JSON string to a short-lived `bash -c` job as an argument, so title and location, or the
+     calendar name, are briefly readable in that job's `/proc/<pid>/cmdline`, and the popup file
+     keeps them (see the event cache). `notify_details: false` sends "Termin"/"Meeting" with the
+     countdown and the time range instead. The click argv carries no URL either way, so the join
+     URL never reaches the daemon. `omeetingbar-join <id> <grace>` reads URL, start and end from
+     the 0600 cache when clicked and opens the URL with `omarchy-launch-browser` until the
+     meeting ends, before its start too (`end`; for a zero-length occurrence `start + grace`, the
+     same window its toast lives; a grace that is not a plain decimal 0–3600 means 300); after
+     that, or when the event is gone from the cache, a click just closes the toast. So the URL
+     never appears on a command line, nor in Omarchy's persisted notification files, before the
+     browser launch itself. The legacy form `omeetingbar-join <url> <end>` is still accepted for
+     one or two releases, with its 1.0.x rules (https, no whitespace or backslash, nothing once a
+     numeric `end` has passed): toasts from a service that has not been restarted since the
+     update, and toasts Omarchy restores from disk, still call it that way. Location and
+     calendar name are markup-escaped (`& < >`) because Omarchy renders the body as
+     `StyledText`; the headline is plain text there and needs none. Only the first
+     `maxToastsPerTick` (3) meetings due in one tick get their own toast; the rest share one
+     summary toast ("N weitere Termine", no join link, tracked under its own id until the last of
+     them ends) — N same-minute invites must not mean N critical, never-expiring toasts,
+  3. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
      detached, so closing the overlay can stop it; a sound still playing is not restarted by a
      second meeting in the same minute,
-  5. append the payload to the state file's `queue` in every case and start a lock probe. The
+  4. append the payload to the state file's `queue` in every case and start a lock probe. The
      queue is capped at `maxQueueLength` (8): a ninth alert waiting is a flood, not a schedule,
      and is recorded as `failed` without blanking the screen. `drainQueue` summons the head
      (`shell.summon(manifest.id, JSON.stringify(payload))`) only once a lock answer at most
      `lockStaleSeconds` old says the session is unlocked — nothing draws over `WlSessionLock` —
      and as long as `untilSec` has not passed; `shown` is recorded only on a witness (see the
-     state file). A queued alert is only ever *shown* late — the notification and the sound in
-     steps 2–4 have already happened at the right moment, which is why the timestamps are
-     separate.
-  6. a queued alert whose event has disappeared from a fresh, healthy, non-stale cache (cancelled,
+     state file). Right before the head's first summon, past that fresh "unlocked" answer, it
+     wakes the display if `wake_display`: `omarchy-brightness-display on` (NOT
+     `hyprctl dispatch dpms on` — that dispatcher no longer exists in Hyprland 0.56). Never under
+     the lock: a wake there lights the panels, and Omarchy's one-shot blank timer never turns
+     them off again. Re-summons leave the display alone (the attempt count is not persisted, so
+     a reload re-arms the wake once), and test and preview alerts never wake it. A queued alert
+     is only ever *shown* late — the notification and the sound in steps 2–3 have already
+     happened at the right moment, which is why the timestamps are separate.
+  5. a queued alert whose event has disappeared from a fresh, healthy, non-stale cache (cancelled,
      or moved out of the window) is dropped as `failed` instead of blanking the screen. Only an
      `ok` and non-stale cache may withdraw an alert: an error or stale cache is missing events for
      its own reasons. A withdrawn alert also takes its toast down (`withdrawToast`: the recorded
-     toast's `end` is pulled to now, and the next tick's toast cleanup dismisses it under the
-     usual needle rules), so no live join link is left behind for a meeting that is off.
+     toast's `end` is pulled to now, and the next tick's toast cleanup replaces it by
+     notification id, see *Toast cleanup*), so no live join link is left behind for a meeting
+     that is off.
 - **Bounds on calendar input**: `normalizeEvents` keeps at most `maxEvents` (512) occurrences,
-  earliest first, and drops a URL longer than `maxUrlChars` (2048) — a hostile `FREQ=SECONDLY`
-  rule expands to hundreds of thousands of instances, and an over-long URL makes the toast's
-  `--exec` argv fail with E2BIG. The fetcher caps on its side too; this is the second line.
+  earliest first, and drops a URL longer than `maxUrlChars` (2048). Both bound hostile input: a
+  `FREQ=SECONDLY` rule expands to hundreds of thousands of instances, and an invite can carry a
+  URL of any length. No argv limit is at stake: no notification carries a URL (the click action
+  carries the event id), and the browser launch takes it as one argument far below any limit. The fetcher caps on its side too; this is the second line.
 - **Toast cleanup**: critical toasts never expire in Omarchy, so a meeting notification would
   stay on screen until clicked — and a stale one, clicked after a meeting taken on the phone,
   used to reopen the call. Once `now >= end` of a recorded toast, the service **replaces** it by
   notification id (`replaces_id = nid`) through the same helper with a low-urgency "Meeting
-  beendet" / "Meeting ended", empty body and `toastReplaceExpireMs` (1500 ms); Omarchy's daemon
-  lets a low-urgency toast expire, and it moves to the notification history. The entry is then
-  forgotten.
+  beendet" / "Meeting ended", empty body and an expiry of `toastReplaceExpireMs` (1500 ms). That
+  is only a request: Omarchy shows a low-urgency toast for at least 5 s (`lowPopupDuration`, its
+  floor), then lets it expire into the notification history — rewritten by the replacement, so
+  that history entry carries no meeting content. The entry is then forgotten.
   - Why replace: a freedesktop `CloseNotification(id)` leaves an Omarchy popup on screen
     (measured on 4.x: the server object closes, the popup row stays), and the only IPC that
     closes one — `omarchy-shell notifications dismiss "<summary substring>"` — would put the
@@ -531,11 +588,13 @@ file talks to the outside world.
     popup state directory (`~/.local/state/omarchy/notifications/<timestamp>-<id>.json` exists
     while a toast is on screen) and answers `gone` without sending; an unknown layout reads as
     "open", so the replace is still sent.
-  - A toast without an id — the helper failed, or the entry was recorded under another shell
-    process (`toastsShellPid`) — is forgotten without a dismiss. It still closes by click
-    (`omeetingbar-join`, which checks the end itself) or by right click, which Omarchy maps to
-    "close without action". Every title is tracked, including empty ones: without a substring
-    needle there is nothing to collide.
+  - A toast without an id — the helper failed or fell back to `omarchy-notification-send`
+    without Gio (which reports none), or the entry was recorded under another shell process
+    (`toastsShellPid`), i.e. before a shell restart — is forgotten without a dismiss, so such
+    toasts, like those from before a reboot (below), are not taken down. It still closes by
+    click (`omeetingbar-join`, which checks the end itself) or by right click, which Omarchy maps
+    to "close without action". Every title is tracked, including empty ones; headlines are kept
+    for state only and are never used to dismiss.
   - Nothing is replaced during the first 30 s after the service starts, so a hot reload (same
     shell process, same ids) does not race Omarchy's asynchronous restore of its toasts. The
     state file is tmpfs, so after a reboot nothing is recorded; `omeetingbar-join` is the fallback.
@@ -593,11 +652,35 @@ CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [-
   `warning`; the marker is subject to the window only, never to `title_blocklist` or
   `min_duration_minutes`.
 - `--diagnose`: print a human-readable readiness report (packages, typelibs, GOA accounts,
-  calendars found, last sync attempt and last success) — no event content. It reads the calendar
-  like a normal run, a due network refresh included, but writes no cache.
+  calendars found, last sync attempt and last success, the installed plugin version beside
+  `OMEETINGBAR_SERVICE`) — no event content. It reads the calendar like a normal run, a due
+  network refresh included, but writes no cache.
 - `--print`: write the JSON to stdout instead of the cache file (full event content — an explicit
   opt-in, the one exception to the privacy rule above).
 - Exit 0 on success; on failure still write a cache with `status: "error"` and exit non-zero.
+- **Restart notice**: the environment variable `OMEETINGBAR_SERVICE` names the version of the
+  service that started the run (see *Version and updates*). When it differs from `version` in
+  the `manifest.json` of the plugin directory the script lives in (resolved through its real
+  path), the run puts `restartNeeded` ("OMeetingBar was updated – restart the shell (omarchy
+  restart shell) to run the new version.") **first** into `warning`, ahead of the config
+  warning: the widget cuts a long warning to 140 characters in its tooltip, and this is the one
+  that a single command clears. An empty value counts as set and differs. Unset is either a
+  service from before 1.1.0, recognised by its parent process being the desktop shell
+  (`/proc/<ppid>/comm` is `quickshell` or `qs`), which warns too, or a run from a terminal, which
+  must not. A manifest that cannot be read, or has no non-empty string `version`, leaves nothing
+  to compare and skips the check. `--diagnose` does not run the check itself (it prints the cache's last
+  `warning`, which may carry the notice) and prints both versions.
+  The notice is meant for the shell that ran the fetch, but the cache outlives that shell: right
+  after `omarchy restart shell` the new code reads it until its first fetch replaces it, and
+  would ask for the restart that has just happened. So the run also writes the notice's text to
+  `restart_notice` and its parent's pid (`os.getppid()`, taken with the check) to
+  `restart_shell_pid`. `Service.qml` and `Widget.qml` cut that text from the start of `warning`,
+  keeping the rest, only when that pid is a positive number other than their own
+  `Quickshell.processId` — the same test the alert state uses for `toastsShellPid`. A rescan, a
+  rebuilt bar or a new monitor keeps the shell process and with it the notice, a wall-clock step
+  changes nothing, and a missing or malformed pid keeps the notice. A run from a terminal that
+  sets `OMEETINGBAR_SERVICE` by hand names the terminal, so the readers cut its notice. Readers
+  from before 1.1.0 ignore both fields and show `warning` as it is, which is what they need.
 - **Bounds** (calendar data is third-party input): at most 2000 instances per calendar or feed
   (the expansion is stopped, `warning` says so), at most 512 events in the cache (earliest
   first), URLs over 2048 characters are dropped. Service.qml caps again on its side.

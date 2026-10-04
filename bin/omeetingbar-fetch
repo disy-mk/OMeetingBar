@@ -178,11 +178,13 @@ MESSAGES = {
         "partialFailure": "Teilweise fehlgeschlagen: %s",
         "unexpectedBackendError": "Unerwarteter Fehler im Backend '%s' (%s: %s).",
         "maxEvents": "Nur die ersten %d Termine werden ausgeliefert.",
+        "restartNeeded": "OMeetingBar wurde aktualisiert – Shell neu starten (omarchy restart shell), damit die neue Version läuft.",
         # --diagnose
         "diagTitle": "OMeetingBar – Bereitschaftsprüfung",
         "diagEnv": "Umgebung",
         "diagTime": "  Zeit:                 %s (%s)",
         "diagPython": "  Python:               %s (%s)",
+        "diagVersion": "  Plugin-Version:       %s (OMEETINGBAR_SERVICE: %s)",
         "diagConfig": "Konfiguration",
         "diagFile": "  Datei:                %s%s",
         "diagMissingSuffix": "  (fehlt)",
@@ -289,11 +291,13 @@ MESSAGES = {
         "partialFailure": "Partly failed: %s",
         "unexpectedBackendError": "Unexpected error in backend '%s' (%s: %s).",
         "maxEvents": "Only the first %d events are delivered.",
+        "restartNeeded": "OMeetingBar was updated – restart the shell (omarchy restart shell) to run the new version.",
         # --diagnose
         "diagTitle": "OMeetingBar – readiness check",
         "diagEnv": "Environment",
         "diagTime": "  Time:                 %s (%s)",
         "diagPython": "  Python:               %s (%s)",
+        "diagVersion": "  Plugin version:       %s (OMEETINGBAR_SERVICE: %s)",
         "diagConfig": "Configuration",
         "diagFile": "  File:                 %s%s",
         "diagMissingSuffix": "  (missing)",
@@ -411,17 +415,27 @@ def typelib_package(namespace):
 # Markdown emphasis, at a backslash (browsers read it as "/") and at the
 # zero-width characters that invite bodies pasted from chat tools carry.
 _URL_END = r"[^\s<>\"'*|\\​‌‍﻿]"
+# Hosts fold case in ASCII only, inside (?a:...) groups. Plain IGNORECASE folds
+# by Unicode, where the dotless "ı" and the dotted "İ" equal "i", the long "ſ"
+# equals "s" and the Kelvin sign (U+212A) equals "k": so "teams.lıve.com" or
+# "zoom.uſ" passed the allow-list while the browser opens another, IDN-encoded
+# host. The scheme does not fold at all: clean_url, like every later check,
+# takes a lowercase "https://" only, so a "httpſ://" or "HTTPS://" match was a
+# decoy that hid the real link after it. The port takes ASCII digits only.
+# Not a global re.ASCII: \s in _URL_END would then miss NBSP and U+3000, and a
+# link would no longer end there. The lookahead stays Unicode on purpose, so a
+# lookalike letter right after the name rejects the host instead of cutting it.
 JOIN_URL_RE = re.compile(
-    r"https://(?:"
-    r"(?:[A-Za-z0-9-]+\.)*"
+    r"(?-i:https://)(?:"
+    r"(?a:(?:[A-Za-z0-9-]+\.)*"
     r"(?:meet\.google\.com|zoom\.us|zoomgov\.com|teams\.microsoft\.com|teams\.live\.com"
     r"|webex\.com|meet\.jit\.si|8x8\.vc|whereby\.com"
-    r"|gotomeeting\.com|meet\.goto\.com|gotomeet\.me)"
-    r"(?::\d{1,5})?(?![A-Za-z0-9.-])"
+    r"|gotomeeting\.com|meet\.goto\.com|gotomeet\.me))"
+    r"(?::[0-9]{1,5})?(?![A-Za-z0-9.-])"
     r"(?:[/?#]" + _URL_END + r"*)?"
-    r"|app\.slack\.com/huddle/" + _URL_END + r"+"
-    r"|(?:discord|discordapp)\.com/channels/" + _URL_END + r"+"
-    r"|discord\.gg/" + _URL_END + r"+"
+    r"|(?a:app\.slack\.com/huddle/)" + _URL_END + r"+"
+    r"|(?a:(?:discord|discordapp)\.com/channels/)" + _URL_END + r"+"
+    r"|(?a:discord\.gg/)" + _URL_END + r"+"
     r")",
     re.IGNORECASE,
 )
@@ -589,8 +603,8 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
         "end": end,
         "all_day": bool(all_day),
         "declined": bool(declined),
-        # Over-long URLs make the notification's --exec argv fail (E2BIG) and
-        # the toast vanish silently; Service.qml drops them too.
+        # A bound on hostile input, not an argv limit: a notification carries
+        # only the event id, never the URL. Service.qml drops over-long URLs too.
         "url": url if url and len(url) <= MAX_URL_CHARS else "",
         "calendar": _short(calendar or "", 120),
         "location": _short(location or "", 200),
@@ -629,13 +643,15 @@ def pick_join_url(conference, x_google_conference, location, description):
 
     Pure -- no gi, no I/O -- so the precedence can be reasoned about on its own.
     """
+    # On Google, X-GOOGLE-CONFERENCE is what carries the Meet link: verified
+    # against a real account on 2026-09-10, Google's CalDAV emits it, and it
+    # matched on every event in the window.
     for value, path in ((conference, "conference"),
                         (x_google_conference, "x-google-conference")):
         url = provider_url(value)
         if url:
             return url, path
-    # In practice this is the path that fires: whether Google's CalDAV emits the
-    # two properties above is unverified, and the invite body always has the link.
+    # The regex is the fallback, for accounts and events without either property.
     # Descriptions arrive HTML-escaped, so &amp; has to be undone before matching
     # or a Zoom link loses its ?pwd= parameter.
     for text, path in ((location, "location-regex"), (description, "description-regex")):
@@ -755,13 +771,18 @@ def stale_events(cache, config, now, window_start, window_end):
 
 
 def build_payload(backend, status, error, warning, events, refreshed_at, refresh_ok_at,
-                  stale, now):
+                  stale, now, restart_notice="", restart_shell_pid=0):
     """`error` belongs to status "error" alone. `warning` is the separate channel
     for "usable but degraded" -- a partial calendar failure, a rejected config
     value, a test event outside the window -- and stays "" when there is none, so
     a consumer can treat any non-empty warning as something to surface.
     `refreshed_at` is the last ATTEMPTED network refresh (the throttle),
-    `refresh_ok_at` the last one that succeeded (the freshness)."""
+    `refresh_ok_at` the last one that succeeded (the freshness).
+    `restart_notice` repeats the text `warning` starts with when the service
+    that ran this fetch is outdated, and `restart_shell_pid` names the process
+    that started the run -- the desktop shell for every run of the service --
+    so that a reader in another shell process, i.e. after a restart, can cut
+    exactly that text again (see restart_needed)."""
     payload = {
         "schema": SCHEMA_VERSION,
         "backend": backend,
@@ -776,6 +797,9 @@ def build_payload(backend, status, error, warning, events, refreshed_at, refresh
     }
     if stale:
         payload["stale"] = True
+    if restart_notice:
+        payload["restart_notice"] = restart_notice
+        payload["restart_shell_pid"] = int(restart_shell_pid)
     return payload
 
 
@@ -1567,6 +1591,48 @@ def window_for(config, now):
             max(end, now + config["lookahead_minutes"] * 60))
 
 
+# --- update check -----------------------------------------------------------
+
+# "omarchy plugin update" replaces the files, but the running service keeps its
+# old code until "omarchy restart shell", and nothing used to tell the user. The
+# service names its own version in this variable; the installed one is the
+# manifest in the plugin directory this script lives in.
+SERVICE_VERSION_ENV = "OMEETINGBAR_SERVICE"
+MANIFEST_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                             "manifest.json")
+# /proc/<pid>/comm of the desktop shell: Quickshell's binary and its short alias.
+SHELL_PROCESS_NAMES = ("quickshell", "qs")
+
+
+def installed_version():
+    """The plugin version on disk, "" when the manifest cannot be read."""
+    version = load_cache(MANIFEST_PATH).get("version")  # same tolerant JSON reader
+    return version.strip() if isinstance(version, str) else ""
+
+
+def parent_process_name():
+    try:
+        with open("/proc/%d/comm" % os.getppid(), "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def restart_needed(environ):
+    """True when the service that ran this fetch is older than the installed
+    plugin. A service from before the variable existed passes none; it is
+    recognised by the desktop shell being the parent, because a run from a
+    terminal has no service behind it and must not warn. Without a readable
+    manifest there is nothing to compare, so nothing is said."""
+    installed = installed_version()
+    if not installed:
+        return False
+    running = environ.get(SERVICE_VERSION_ENV)
+    if running is None:
+        return parent_process_name() in SHELL_PROCESS_NAMES
+    return running.strip() != installed
+
+
 # --- diagnose ---------------------------------------------------------------
 
 
@@ -1717,6 +1783,8 @@ def diagnose(args, config, config_warning, out_path, cache, now):
     lines.append(_("diagEnv"))
     lines.append(_("diagTime", stamp.strftime("%Y-%m-%d %H:%M:%S"), stamp.tzname()))
     lines.append(_("diagPython", sys.version.split()[0], sys.executable))
+    lines.append(_("diagVersion", installed_version() or "-",
+                   os.environ.get(SERVICE_VERSION_ENV) or "-"))
     lines.append("")
 
     lines.append(_("diagConfig"))
@@ -1809,7 +1877,13 @@ def main(argv=None):
     if args.diagnose:
         return diagnose(args, config, config_warning, out_path, cache, now)
 
-    warnings = [config_warning] if config_warning else []
+    # The restart notice goes first: the widget cuts a long warning short in
+    # its tooltip, and this is the one that a single command clears.
+    restart_notice = _("restartNeeded") if restart_needed(os.environ) else ""
+    restart_shell_pid = os.getppid() if restart_notice else 0
+    warnings = [restart_notice] if restart_notice else []
+    if config_warning:
+        warnings.append(config_warning)
     if args.in_seconds is not None:
         try:
             write_inject(inject_path, now, args.in_seconds)
@@ -1870,7 +1944,8 @@ def main(argv=None):
             warnings.append(inject_warning)
 
     payload = build_payload(backend, status, error, " ".join(warnings), events,
-                            refreshed_at, refresh_ok_at, stale, now)
+                            refreshed_at, refresh_ok_at, stale, now, restart_notice,
+                            restart_shell_pid)
 
     if args.print_json:
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)

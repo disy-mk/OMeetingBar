@@ -21,6 +21,21 @@ Item {
   property var pluginRegistry: null
   property string omarchyPath: Quickshell.env("OMARCHY_PATH")
 
+  // The version of this code; keep it equal to manifest.json's "version".
+  // `omarchy plugin update` ends with a plugin rescan, which destroys and
+  // recreates this service -- but from the engine's component cache, which Qt
+  // 6.11 offers no way to clear (Qt.clearComponentCache does not exist), so the
+  // old code runs on until `omarchy restart shell` while root.manifest already
+  // names the installed version. Only this constant says which code is running.
+  readonly property string codeVersion: "1.1.0"
+  // Handed to every fetch. The fetcher is read from disk on every run, so after
+  // an update it is already the new code while this service may still be the
+  // old one; this tells it which service started it (one before 1.1.0 sets
+  // nothing). A property rather than an inline literal only because qmllint
+  // types the literal as QVariantMap against Process.environment's
+  // QVariantHash; Quickshell takes either.
+  readonly property var fetchEnvironment: ({ OMEETINGBAR_SERVICE: root.codeVersion })
+
   readonly property string home: Quickshell.env("HOME")
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR")
   readonly property bool runtimeReady: runtimeDir !== ""
@@ -62,8 +77,9 @@ Item {
   // Meetings due in the same tick beyond this share one summary toast instead
   // of each sending a critical, never-expiring one.
   readonly property int maxToastsPerTick: 3
-  // How long the "meeting ended" replacement toast stays before Omarchy lets it
-  // expire (low urgency honours the request; critical never expires).
+  // The expiry the "meeting ended" replacement toast asks for. Omarchy takes it
+  // as a request and enforces its own minimum for low urgency
+  // (lowPopupDuration, 5 s), so the replacement stays at least that long.
   readonly property int toastReplaceExpireMs: 1500
   // The host reports an overlay "open" from the moment a summon is accepted,
   // before Alert.qml has loaded. Its witness only counts once a failed load
@@ -91,6 +107,13 @@ Item {
     // "en" pins it. Read by Widget.qml and bin/omeetingbar-fetch as well.
     language: "auto",
     notify: true,
+    // Off, a meeting's toast says "Termin"/"Meeting" and the time instead of
+    // title and location. This plugin's own processes never carry that text,
+    // but Omarchy's notification daemon passes each toast's summary and body
+    // to a short-lived bash job as an argument (readable in
+    // /proc/<pid>/cmdline) when it saves the toast, and a closed toast stays
+    // in its history.
+    notify_details: true,
     wake_display: true,
     // On (the default) a declined meeting never blanks the screen; it stays in
     // the agenda, struck through. Off, it is treated like any other meeting.
@@ -120,6 +143,7 @@ Item {
   readonly property string runningColor: colorConfig("running", "#FF9500")
   readonly property string upcomingColor: colorConfig("upcoming", "#00BEFF")
   readonly property bool notifyEnabled: boolConfig("notify")
+  readonly property bool notifyDetails: boolConfig("notify_details")
   readonly property bool wakeDisplayEnabled: boolConfig("wake_display")
   readonly property bool skipDeclined: boolConfig("skip_declined")
 
@@ -137,7 +161,7 @@ Item {
   property int cacheRefreshedAt: 0
 
   // Three facts per event id, all persisted:
-  //   notified — wake/notification/sound are done, never repeat them
+  //   notified — notification and sound are done, never repeat them
   //   shown    — the fullscreen overlay was confirmed on screen by the host
   //   failed   — it never got there inside its window; do not retry it
   // An id that is notified but not shown is re-summoned while it is still
@@ -156,7 +180,8 @@ Item {
   // because a re-mount must not lose the tail.
   property var alertQueue: []
 
-  // Meeting notifications this service put on screen, as { id, headline, end }.
+  // Meeting notifications this service put on screen, as { id, headline, end,
+  // nid }, nid being the notification id the helper reported (0 until then).
   // They are critical, so they never expire on their own; each one is taken
   // down once its meeting is over. Persisted, because the toasts outlive a
   // shell restart and so must the list.
@@ -313,11 +338,11 @@ Item {
       if (id === "" || !isFinite(start)) continue
       var end = epochOf(entry.end)
       var url = String(entry.url === undefined || entry.url === null ? "" : entry.url)
-      // Only https is ever handed to the browser or to a notification --exec,
-      // and every file drops the rest in its own cache parser. No backslash:
-      // browsers read it as "/", so it could hide the real host from
-      // Providers.js. The length cap keeps one URL from overflowing the
-      // notification's --exec argv (E2BIG would lose the toast silently).
+      // Only https is ever handed to the browser, and every file drops the
+      // rest in its own cache parser. No backslash: browsers read it as "/",
+      // so it could hide the real host from Providers.js. The length cap is a
+      // bound on hostile input like maxEvents; no URL travels in a
+      // notification, whose click action carries the event id instead.
       if (url.length > root.maxUrlChars || !/^https:\/\/[^\s\\]+$/i.test(url)) url = ""
       out.push({
         id: id,
@@ -352,6 +377,23 @@ Item {
     if (message === root.lastCacheLogged) return
     root.lastCacheLogged = message
     logState("cache", message)
+  }
+
+  // `restart_notice` repeats the text `warning` starts with when the service
+  // that ran the fetch was outdated (see codeVersion), and `restart_shell_pid`
+  // names the shell process that ran it. The notice is meant for that shell:
+  // read in another one -- `omarchy restart shell` has happened since -- it is
+  // cut and the rest of the warning kept. A rescan or a rebuilt bar keeps the
+  // shell and so the notice; without a usable pid it is kept too. Widget.qml
+  // reads the cache by the same rule.
+  function cacheWarningOf(parsed) {
+    var warning = String(parsed.warning === undefined || parsed.warning === null ? "" : parsed.warning)
+    var notice = typeof parsed.restart_notice === "string" ? parsed.restart_notice : ""
+    var pid = parsed.restart_shell_pid
+    if (notice === "" || warning.indexOf(notice) !== 0
+      || typeof pid !== "number" || !(pid > 0) || pid === Quickshell.processId)
+      return warning
+    return warning.slice(notice.length).trim()
   }
 
   function applyCache(raw) {
@@ -392,7 +434,7 @@ Item {
     // "usable but degraded" channel and is read whatever the status is.
     root.cacheError = status === "error"
       ? String(parsed.error === undefined || parsed.error === null ? "" : parsed.error) : ""
-    root.cacheWarning = String(parsed.warning === undefined || parsed.warning === null ? "" : parsed.warning)
+    root.cacheWarning = cacheWarningOf(parsed)
     root.cacheStale = parsed.stale === true
     var generated = epochOf(parsed.generated_at)
     var refreshed = epochOf(parsed.refreshed_at)
@@ -546,7 +588,8 @@ Item {
   //   { "schema": 2,
   //     "events": { "<id>": { "notified": ts, "shown": ts, "failed": ts } },
   //     "queue":  [ { <alert payload>, "untilSec": ts, "notifiedAt": ts } ],
-  //     "toasts": [ { "id": id, "headline": text, "end": ts } ],
+  //     "toasts": [ { "id": id, "headline": text, "end": ts, "nid": n } ],
+  //     "toastsShellPid": pid,       // the shell process the nids belong to
   //     "fired":  { "<id>": ts } }   // schema-1 mirror, written for readers of
   //                                  // the old format, never read back here
   // A schema-1 file only knew "fired". Those ids count as notified AND shown,
@@ -853,9 +896,10 @@ Item {
   }
 
   // The headline reaches D-Bus as a plain string through bin/omeetingbar-notify
-  // (stdin JSON, never argv), so no option parser ever sees it. The leading
-  // space in front of a dash stays for the Gio-less fallback inside that helper,
-  // which does go through omarchy-notification-send's option position.
+  // (stdin JSON, never argv), so no option parser ever sees it, and the
+  // helper's Gio-less fallback sends the content-free `safe` text instead. The
+  // leading space in front of a dash is left over from when the headline was
+  // an omarchy-notification-send argument; it does no harm.
   function notificationHeadline(title) {
     var text = String(title || "").trim()
     if (text === "") return Strings.t(root.lang, "meeting")
@@ -869,10 +913,12 @@ Item {
     return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  function notificationBody(entry, atSec) {
+  // Without details only the start and the time range: location and calendar
+  // name come from the invite.
+  function notificationBody(entry, atSec, details) {
     var parts = [Strings.t(root.lang, "starts", relativeText(entry.start - atSec)), timeRangeText(entry)]
-    if (entry.location !== "") parts.push(escapeMarkup(entry.location))
-    else if (entry.calendar !== "") parts.push(escapeMarkup(entry.calendar))
+    if (details && entry.location !== "") parts.push(escapeMarkup(entry.location))
+    else if (details && entry.calendar !== "") parts.push(escapeMarkup(entry.calendar))
     return parts.join(" · ")
   }
 
@@ -882,21 +928,26 @@ Item {
     return Math.max(entry.end, entry.start + root.graceSeconds)
   }
 
-  // Nothing from the calendar goes on a command line: the helper reads this
-  // payload from stdin, and the click action carries the event id only --
-  // bin/omeetingbar-join looks the URL up in the 0600 cache when clicked, and
-  // only while the meeting is on. `safe` is the content-free text the helper
-  // falls back to without Gio.
+  // No process of this plugin carries calendar content on its command line:
+  // the helper reads this payload from stdin, and the click action carries the
+  // event id and the grace window only -- bin/omeetingbar-join looks the URL
+  // up in the 0600 cache when clicked, and only until the meeting ends, before
+  // its start too (one without a real end until start + grace). Omarchy's daemon does put summary
+  // and body on a bash command line when it saves the toast, and keeps closed
+  // toasts in its history; notify_details off sends "Termin"/"Meeting" and the
+  // time there instead of title and location. `safe` is the content-free text
+  // the helper falls back to without Gio.
   function sendNotification(entry, atSec) {
-    var headline = notificationHeadline(entry.title)
+    var details = root.notifyDetails
+    var headline = details ? notificationHeadline(entry.title) : Strings.t(root.lang, "meeting")
     var payload = {
       summary: headline,
-      body: notificationBody(entry, atSec),
+      body: notificationBody(entry, atSec, details),
       glyph: "󰃭",
       urgency: "critical",
       safe: { summary: Strings.t(root.lang, "meeting"), body: timeRangeText(entry) }
     }
-    if (entry.url !== "") payload.exec = [root.joinPath, String(entry.id)]
+    if (entry.url !== "") payload.exec = [root.joinPath, String(entry.id), String(root.graceSeconds)]
     trackToast(entry, headline)
     enqueueNotify(payload, String(entry.id))
   }
@@ -960,10 +1011,11 @@ Item {
   }
 
   // Once a meeting is over its toast is replaced, by notification id, with a
-  // low-urgency "meeting ended" that Omarchy lets expire after
-  // toastReplaceExpireMs -- no title, no IPC argument. A toast without an id
-  // (the helper failed, or the shell restarted since) is forgotten; it still
-  // closes by click or right click, and the join script checks the end anyway.
+  // low-urgency "meeting ended" that Omarchy lets expire after its own 5 s
+  // minimum (toastReplaceExpireMs is only the request) -- no title, no IPC
+  // argument. A toast without an id (the helper failed, or the shell restarted
+  // since) is forgotten; it still closes by click or right click, and the join
+  // script checks the end anyway.
   function clearEndedToasts(atSec) {
     if (root.openToasts.length === 0) return
     // startedAtSec is 0 until Component.onCompleted; a tick before that must
@@ -1104,13 +1156,13 @@ Item {
 
   function fireEvent(entry, atSec, ordinal) {
     // "notified" is persisted before any side effect: a crash below must not
-    // repeat the wake, the notification or the sound, on this tick or after a
-    // hot reload.
+    // repeat the notification or the sound, on this tick or after a hot
+    // reload. The display is not woken here but in drainQueue, right before
+    // the alert is first summoned on an unlocked session.
     setAlertState(entry.id, { notified: atSec })
     saveState()
     logState("notified", "id=" + entry.id + " lead=" + (entry.start - atSec) + "s")
 
-    if (root.wakeDisplayEnabled) Quickshell.execDetached(["omarchy-brightness-display", "on"])
     // Beyond maxToastsPerTick in one tick, tick() sends one summary toast.
     if (root.notifyEnabled && (ordinal || 0) < root.maxToastsPerTick) sendNotification(entry, atSec)
     playSound()
@@ -1242,6 +1294,12 @@ Item {
       return
     }
 
+    // The display is woken once per alert, right before its first summon, and
+    // only past a fresh "unlocked" answer: under the lock a wake lights the
+    // panels, and Omarchy's one-shot blank timer never turns them off again.
+    // Re-summons leave it alone; test and preview alerts never come here.
+    if (head.attempts === 0 && root.wakeDisplayEnabled)
+      Quickshell.execDetached(["omarchy-brightness-display", "on"])
     head.attempts += 1
     head.summonedAtSec = atSec
     var accepted = summonAlert(head, false, "queue")
@@ -1416,8 +1474,15 @@ Item {
       if (isAlertable(root.events[i], atSec)) alertableCount += 1
     }
     var head = root.alertQueue.length > 0 ? root.alertQueue[0] : null
+    var installedVersion = String((root.manifest && root.manifest.version) || "")
     return JSON.stringify({
       pluginId: root.pluginId(),
+      // `version` is the code answering this call, `installedVersion` what the
+      // host last read from disk (see codeVersion); they differ after an
+      // update until the shell restarts.
+      version: root.codeVersion,
+      installedVersion: installedVersion,
+      restartNeeded: installedVersion !== "" && installedVersion !== root.codeVersion,
       message: root.statusMessage,
       backend: root.cacheBackend,
       cacheStatus: root.cacheStatus,
@@ -1488,6 +1553,7 @@ Item {
         resummonIntervalSeconds: root.resummonIntervalSeconds,
         maxSummonAttempts: root.maxSummonAttempts,
         notify: root.notifyEnabled,
+        notifyDetails: root.notifyDetails,
         wakeDisplay: root.wakeDisplayEnabled,
         skipDeclined: root.skipDeclined,
         sound: root.soundPath,
@@ -1600,6 +1666,8 @@ Item {
   Process {
     id: fetchProcess
     command: ["/usr/bin/python3", root.fetcherPath]
+    // Added on top of the inherited environment (clearEnvironment stays off).
+    environment: root.fetchEnvironment
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { id: fetchStderr; waitForEnd: true }
     onExited: function(exitCode) {
@@ -1657,8 +1725,10 @@ Item {
   }
 
   // One notification at a time through bin/omeetingbar-notify. The content is
-  // written to its stdin once it runs, so no toast text or join link is ever
-  // visible in /proc/<pid>/cmdline; its stdout is the notification id.
+  // written to its stdin once it runs, so no process of this plugin shows
+  // toast text or a join link in /proc/<pid>/cmdline (Omarchy's daemon briefly
+  // shows the toast text when it saves the toast, see notify_details); its
+  // stdout is the notification id.
   Process {
     id: notifySender
     stdinEnabled: true

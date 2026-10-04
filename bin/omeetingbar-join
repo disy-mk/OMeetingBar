@@ -1,14 +1,41 @@
 #!/bin/sh
-# Click action of an OMeetingBar notification: omeetingbar-join EVENT_ID
+# Click action of an OMeetingBar notification:
+#   omeetingbar-join EVENT_ID [GRACE_SECONDS]
 #
 # Looks the meeting up in the plugin's 0600 event cache and opens its join link
-# while the meeting is still on. Once it is over -- or the event is gone from
-# the cache -- it does nothing; the notification closes on click either way, so
-# a stale toast just clears instead of reopening a call that is over.
+# until the meeting ends, before its start too. Once it is over -- or the event
+# is gone from the cache -- it does nothing; the notification closes on click
+# either way, so a stale toast just clears instead of reopening a call that is
+# over.
 #
-# Only the event id travels in the notification: the URL never appears on a
-# command line (or in Omarchy's notification history on disk) before the
-# browser itself is launched with it.
+# Only the event id and the grace window travel in the notification: the URL
+# never appears on a command line (or in Omarchy's notification history on
+# disk) before the browser itself is launched with it.
+#
+# The older form "omeetingbar-join URL END" exists for the transition from
+# 1.0.x only and is to be removed after one or two releases: a service started
+# before "omarchy plugin update" keeps running until "omarchy restart shell",
+# and Omarchy restores old toasts from disk, so both still call it that way.
+
+# Older form first. Event ids are 16 lowercase hex digits and never start with
+# https://, so the two cannot be mistaken for each other. The URL form keeps
+# the rules it always had: no whitespace, no backslash, and an END that is not
+# a number opens the link, because a missed join is worse than an unneeded one.
+if [ $# -ge 2 ]; then
+  case $1 in
+    https://*)
+      case $1 in
+        *[[:space:]\\]*) exit 0 ;;
+      esac
+      case $2 in
+        '' | *[!0-9]*) ;;
+        *) [ "$(date +%s)" -ge "$2" ] && exit 0 ;;
+      esac
+      exec omarchy-launch-browser "$1"
+      ;;
+  esac
+fi
+
 id=$1
 [ -n "$id" ] || exit 0
 cache="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omeetingbar/events.json"
@@ -30,11 +57,19 @@ case $url in
   *[[:space:]\\]*) exit 0 ;;
 esac
 
-# A meeting without a real end (end <= start) is treated as still joinable for
-# five minutes after its start, the service's default grace window.
+# A meeting without a real end (end <= start) stays joinable for GRACE_SECONDS
+# after its start, exactly as long as the service keeps its toast up. Only a
+# plain decimal up to 3600, the service's own cap, is taken -- a leading zero
+# would be octal to the arithmetic below -- and anything else means the
+# service's default of 300.
+case $2 in
+  [0-9] | [1-9][0-9] | [1-9][0-9][0-9] | [1-9][0-9][0-9][0-9]) grace=$2 ;;
+  *) grace=300 ;;
+esac
+[ "$grace" -le 3600 ] || grace=300
 case $start$end in
   *[!0-9]*) exit 0 ;;
 esac
-[ "$end" -gt "$start" ] || end=$((start + 300))
+[ "$end" -gt "$start" ] || end=$((start + grace))
 [ "$(date +%s)" -lt "$end" ] || exit 0
 exec omarchy-launch-browser "$url"

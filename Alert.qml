@@ -46,9 +46,11 @@ Item {
   // locale and carried in the payload; a summon without it (test, preview from
   // the shell) resolves it here the same way.
   property string lang: Strings.pick("", Qt.locale().name)
-  // The overlay takes exclusive keyboard focus the moment it appears, mid-
-  // sentence if need be. Keys inside this window after open() are swallowed,
-  // so a keystroke already on its way down cannot join a meeting unread.
+  // Input guard: the overlay takes exclusive keyboard focus the moment it
+  // appears, mid-sentence if need be, and maps under a pointer that may be
+  // mid-double-click. Keys and clicks pressed inside this window after open()
+  // are swallowed, so input already on its way can neither join a meeting nor
+  // clear the alert unread.
   readonly property int keyGuardMs: 1000
   property int autoDismissSeconds: 90
   // Defaults, so a hand-made summon without a colours block still renders.
@@ -316,6 +318,14 @@ Item {
     Quickshell.execDetached([launcher, target])
   }
 
+  // A negative age means the wall clock stepped back since open(). That ends
+  // the guard rather than stretching it by the step, so no clock correction
+  // can lock the keyboard and the mouse out of the alert.
+  function inputGuarded() {
+    var age = Date.now() - root.openedAtMs
+    return age >= 0 && age < root.keyGuardMs
+  }
+
   // Wall-clock enforcement of the two D7 budgets, driven by the 1 Hz tick (which
   // runs whenever the overlay is up, including with auto_dismiss 0): the
   // inhibitor is released first, the overlay is torn down last.
@@ -404,11 +414,19 @@ Item {
         borderSpec: root.frameSpec
       }
 
-      // Any click anywhere dismisses — the alert has to clear without aiming.
+      // Any click anywhere dismisses — the alert has to clear without aiming —
+      // unless it was pressed inside the input guard: the overlay can map
+      // between the two clicks of a double-click. Judged at the press, because
+      // a click only reports at the release, which may come after the guard.
       MouseArea {
+        id: clickCatcher
+        property bool pressGuarded: false
         anchors.fill: parent
         acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-        onClicked: root.dismiss()
+        onPressed: clickCatcher.pressGuarded = root.inputGuarded()
+        onClicked: {
+          if (!clickCatcher.pressGuarded) root.dismiss()
+        }
       }
 
       Item {
@@ -426,9 +444,9 @@ Item {
             return
           event.accepted = true
           // open() restamps openedAtMs for a queued follow-up alert too, which
-          // re-arms the guard: an Enter meant for the previous alert must not
-          // join the next one.
-          if (Date.now() - root.openedAtMs < root.keyGuardMs) return
+          // re-arms the input guard: an Enter meant for the previous alert must
+          // not join the next one.
+          if (root.inputGuarded()) return
           if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) root.join()
           else root.dismiss()
         }
