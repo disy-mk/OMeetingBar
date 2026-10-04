@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 import qs.Commons
+import "Strings.js" as Strings
 
 // The brain of OMeetingBar. Reads the event cache written by
 // bin/omeetingbar-fetch, decides on a 1 Hz wall clock when a meeting is close
@@ -85,6 +86,9 @@ Item {
     inhibit_lead_seconds: 600,
     grace_seconds: 300,
     sound: "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+    // "auto" follows the session locale (de* → German, else English); "de" or
+    // "en" pins it. Read by Widget.qml and bin/omeetingbar-fetch as well.
+    language: "auto",
     notify: true,
     wake_display: true,
     // On (the default) a declined meeting never blanks the screen; it stays in
@@ -111,6 +115,7 @@ Item {
   readonly property int inhibitLeadSeconds: intConfig("inhibit_lead_seconds", 0, 7200)
   readonly property int graceSeconds: intConfig("grace_seconds", 0, 3600)
   readonly property string soundPath: stringConfig("sound")
+  readonly property string lang: Strings.pick(stringConfig("language"), Qt.locale().name)
   readonly property string runningColor: colorConfig("running", "#FF9500")
   readonly property string upcomingColor: colorConfig("upcoming", "#00BEFF")
   readonly property bool notifyEnabled: boolConfig("notify")
@@ -194,17 +199,18 @@ Item {
   property var logStates: ({})
 
   readonly property string statusMessage: {
-    if (!root.runtimeReady) return "XDG_RUNTIME_DIR ist nicht gesetzt"
-    if (!root.configValid) return "omeetingbar.json ist unlesbar — Standardwerte aktiv"
-    if (root.cacheStatus === "unknown") return "Cache wird gelesen"
-    if (root.cacheStatus === "missing") return "Noch kein Cache — Abruf läuft"
-    if (root.cacheStatus === "invalid") return "Cache ist unlesbar"
-    if (root.cacheStatus === "error") return root.cacheError !== "" ? root.cacheError : "Kalenderabruf fehlgeschlagen"
-    // A warning on an otherwise usable cache means "eingeschränkt nutzbar" and
+    if (!root.runtimeReady) return Strings.t(root.lang, "statusRuntimeMissing")
+    if (!root.configValid) return Strings.t(root.lang, "statusConfigUnreadable")
+    if (root.cacheStatus === "unknown") return Strings.t(root.lang, "statusCacheReading")
+    if (root.cacheStatus === "missing") return Strings.t(root.lang, "statusCacheMissing")
+    if (root.cacheStatus === "invalid") return Strings.t(root.lang, "statusCacheUnreadable")
+    if (root.cacheStatus === "error")
+      return root.cacheError !== "" ? root.cacheError : Strings.t(root.lang, "statusFetchFailed")
+    // A warning on an otherwise usable cache means "usable but degraded" and
     // must be visible, so it outranks the everyday messages below.
-    if (root.cacheWarning !== "") return "Eingeschränkt: " + root.cacheWarning
-    if (root.events.length === 0) return "Keine Termine im Vorschaufenster"
-    return "Bereit"
+    if (root.cacheWarning !== "") return Strings.t(root.lang, "limited", root.cacheWarning)
+    if (root.events.length === 0) return Strings.t(root.lang, "statusNoneInWindow")
+    return Strings.t(root.lang, "statusReady")
   }
 
   function pluginId() {
@@ -817,14 +823,14 @@ Item {
   }
 
   function relativeText(seconds) {
-    if (seconds <= 0) return "jetzt"
-    if (seconds < 60) return "in " + seconds + " s"
+    if (seconds <= 0) return Strings.t(root.lang, "now")
+    if (seconds < 60) return Strings.t(root.lang, "inSec", seconds)
     var minutes = Math.round(seconds / 60)
-    return "in " + minutes + (minutes === 1 ? " Minute" : " Minuten")
+    return Strings.t(root.lang, "inX", Strings.count(root.lang, minutes, "oneMinute", "nMinutes"))
   }
 
   function timeRangeText(entry) {
-    if (entry.allDay) return "ganztägig"
+    if (entry.allDay) return Strings.t(root.lang, "allDay")
     var from = Qt.formatDateTime(new Date(entry.start * 1000), "HH:mm")
     if (entry.end <= entry.start) return from
     return from + "–" + Qt.formatDateTime(new Date(entry.end * 1000), "HH:mm")
@@ -838,7 +844,7 @@ Item {
   // script passes the headline through to D-Bus as a plain string.
   function notificationHeadline(title) {
     var text = String(title || "").trim()
-    if (text === "") return "Termin"
+    if (text === "") return Strings.t(root.lang, "meeting")
     return /^-/.test(text) ? " " + text : text
   }
 
@@ -850,7 +856,7 @@ Item {
   }
 
   function notificationBody(entry, atSec) {
-    var parts = ["Beginnt " + relativeText(entry.start - atSec), timeRangeText(entry)]
+    var parts = [Strings.t(root.lang, "starts", relativeText(entry.start - atSec)), timeRangeText(entry)]
     if (entry.location !== "") parts.push(escapeMarkup(entry.location))
     else if (entry.calendar !== "") parts.push(escapeMarkup(entry.calendar))
     return parts.join(" · ")
@@ -882,9 +888,9 @@ Item {
   function sendSummaryNotification(extra, atSec) {
     var latestEnd = atSec
     for (var i = 0; i < extra.length; i++) latestEnd = Math.max(latestEnd, toastEnd(extra[i]))
-    var headline = extra.length + " weitere Termine"
+    var headline = Strings.t(root.lang, "moreMeetings", extra.length)
     Quickshell.execDetached(["omarchy-notification-send", "-u", "critical", "-g", "󰃭",
-      headline, "Beginnen in Kürze · nicht einzeln gemeldet"])
+      headline, Strings.t(root.lang, "moreMeetingsBody")])
     trackToast({ id: "summary-" + atSec, title: headline, start: atSec, end: latestEnd }, headline)
   }
 
@@ -985,6 +991,7 @@ Item {
     }
     var payload = {
       id: entry.id,
+      lang: root.lang,
       title: entry.title,
       start: entry.start,
       end: entry.end,
@@ -1430,7 +1437,8 @@ Item {
         notify: root.notifyEnabled,
         wakeDisplay: root.wakeDisplayEnabled,
         skipDeclined: root.skipDeclined,
-        sound: root.soundPath
+        sound: root.soundPath,
+        language: root.lang
       },
       paths: {
         config: root.configPath,
@@ -1452,12 +1460,12 @@ Item {
     var atSec = Math.floor(Date.now() / 1000)
     var summoned = summonAlert({
       id: "test",
-      title: "Testtermin",
+      title: Strings.t(root.lang, "testMeeting"),
       start: atSec + 60,
       end: atSec + 1860,
       allDay: false,
       url: "",
-      calendar: "Test",
+      calendar: Strings.t(root.lang, "testCalendar"),
       location: ""
     }, true, "test")
     if (summoned) playSound()

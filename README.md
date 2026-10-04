@@ -60,7 +60,10 @@ The fullscreen alert, a minute before the next meeting:
    5 min) still alerts.
 3. **The `ics` backend lags.** Google regenerates private iCal feeds roughly once a day. It
    exists as a backstop only; use `eds`.
-4. **UI strings are German.** The author is. Contributions for i18n are welcome.
+4. **Two UI languages.** German and English, picked from the session locale (`LANG` of the
+   shell: `de*` → German, everything else → English) or pinned with `language` in the config.
+   Other languages: `Strings.js` and the `MESSAGES` table in `bin/omeetingbar-fetch` are the
+   two places to add one.
 5. **The timeline strip has no hour numbers.** A `Text` in that row triggers a Qt polish loop
    on the author's machine that was bisected but not root-caused; the notches carry the hour
    grid. Details in `docs/SPEC.md`.
@@ -138,6 +141,7 @@ save.
 | `inhibit_lead_seconds` | `600` | Hold a Wayland idle inhibitor from this long before start until `start + grace`, so the session cannot lock into the alert. |
 | `grace_seconds` | `300` | A meeting whose start is at most this long ago still alerts (suspend, lock). Older ones never do. |
 | `sound` | `…/alarm-clock-elapsed.oga` | Played with `pw-play`. Empty string = silent. |
+| `language` | `"auto"` | `"de"`, `"en"` or `"auto"` (session locale: `de*` → German, else English). Bar, popup, alert, notifications and the fetcher's messages follow it; dates and weekday names too. Times stay 24 h. |
 | `notify` | `true` | Also send `omarchy-notification-send -u critical` (bypasses DND). |
 | `wake_display` | `true` | `omarchy-brightness-display on` before the alert. |
 | `skip_all_day` | `true` | Keep all-day entries out of the cache. All-day entries never alert either way. |
@@ -238,7 +242,8 @@ Shell-Neustart ist nicht nötig, der nächste Abruf übernimmt Pakete und Konto.
 
 Grenzen: über einen **gesperrten** Bildschirm kann kein Plugin zeichnen — der Alarm wird dann
 nach dem Entsperren nachgezogen, Notification und Ton kommen trotzdem; ein Laptop im Suspend
-wird nicht geweckt; die Oberfläche ist deutsch. Alle Einstellungen stehen in
+wird nicht geweckt. Die Oberfläche ist deutsch oder englisch, je nach Systemsprache
+(`language` in der Config erzwingt eine). Alle Einstellungen stehen in
 `~/.config/omarchy/omeetingbar.json` (Tabelle oben), testen kannst du mit
 `omarchy-shell omeetingbar test`.
 

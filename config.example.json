@@ -13,6 +13,7 @@
   "inhibit_lead_seconds": 600,
   "grace_seconds": 300,
   "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+  "language": "auto",
   "notify": true,
   "wake_display": true,
   "skip_all_day": true,
