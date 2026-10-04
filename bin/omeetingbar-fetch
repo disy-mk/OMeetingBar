@@ -771,13 +771,18 @@ def stale_events(cache, config, now, window_start, window_end):
 
 
 def build_payload(backend, status, error, warning, events, refreshed_at, refresh_ok_at,
-                  stale, now):
+                  stale, now, restart_notice="", restart_shell_pid=0):
     """`error` belongs to status "error" alone. `warning` is the separate channel
     for "usable but degraded" -- a partial calendar failure, a rejected config
     value, a test event outside the window -- and stays "" when there is none, so
     a consumer can treat any non-empty warning as something to surface.
     `refreshed_at` is the last ATTEMPTED network refresh (the throttle),
-    `refresh_ok_at` the last one that succeeded (the freshness)."""
+    `refresh_ok_at` the last one that succeeded (the freshness).
+    `restart_notice` repeats the text `warning` starts with when the service
+    that ran this fetch is outdated, and `restart_shell_pid` names the process
+    that started the run -- the desktop shell for every run of the service --
+    so that a reader in another shell process, i.e. after a restart, can cut
+    exactly that text again (see restart_needed)."""
     payload = {
         "schema": SCHEMA_VERSION,
         "backend": backend,
@@ -792,6 +797,9 @@ def build_payload(backend, status, error, warning, events, refreshed_at, refresh
     }
     if stale:
         payload["stale"] = True
+    if restart_notice:
+        payload["restart_notice"] = restart_notice
+        payload["restart_shell_pid"] = int(restart_shell_pid)
     return payload
 
 
@@ -1871,7 +1879,9 @@ def main(argv=None):
 
     # The restart notice goes first: the widget cuts a long warning short in
     # its tooltip, and this is the one that a single command clears.
-    warnings = [_("restartNeeded")] if restart_needed(os.environ) else []
+    restart_notice = _("restartNeeded") if restart_needed(os.environ) else ""
+    restart_shell_pid = os.getppid() if restart_notice else 0
+    warnings = [restart_notice] if restart_notice else []
     if config_warning:
         warnings.append(config_warning)
     if args.in_seconds is not None:
@@ -1934,7 +1944,8 @@ def main(argv=None):
             warnings.append(inject_warning)
 
     payload = build_payload(backend, status, error, " ".join(warnings), events,
-                            refreshed_at, refresh_ok_at, stale, now)
+                            refreshed_at, refresh_ok_at, stale, now, restart_notice,
+                            restart_shell_pid)
 
     if args.print_json:
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)

@@ -418,6 +418,21 @@ BarWidget {
     events = list
   }
 
+  // Same rule as Service.qml's cacheWarningOf: the restart notice that
+  // `restart_notice` names at the start of `warning` is meant for the shell
+  // process in `restart_shell_pid`, so read in another one (the shell has been
+  // restarted since) it is cut and the rest kept. A rebuilt bar or a new
+  // monitor keeps the shell, and with it the notice.
+  function warningOf(json) {
+    var warning = json.warning === undefined || json.warning === null ? "" : String(json.warning)
+    var notice = typeof json.restart_notice === "string" ? json.restart_notice : ""
+    var pid = json.restart_shell_pid
+    if (notice === "" || warning.indexOf(notice) !== 0
+      || typeof pid !== "number" || !(pid > 0) || pid === Quickshell.processId)
+      return warning
+    return warning.slice(notice.length).trim()
+  }
+
   function applyCache(body) {
     var text = String(body || "").trim()
     if (text === "") {
@@ -437,7 +452,7 @@ BarWidget {
     var generatedAt = Number(json.generated_at)
     if (!isFinite(generatedAt) || generatedAt < 0) generatedAt = 0
     var list = parseEvents(json.events)
-    var warning = shortError(json.warning)
+    var warning = shortError(warningOf(json))
     var error = shortError(json.error)
     if (String(json.status || "") === "ok") {
       // `error` belongs to status "error", but a cache that claims "ok" and

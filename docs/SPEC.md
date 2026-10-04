@@ -211,7 +211,9 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   because it does not apply to the active backend. `status` stays `"ok"`, and the text is in
   the UI language (see `language`), short and content-free (same privacy rules as `error`).
   One warning is not about the run at all: the restart notice (see *Restart notice* under the
-  fetcher). It comes first and is set whatever `status` is.
+  fetcher). It comes first and is set whatever `status` is; `restart_notice`, present only then,
+  repeats its text so that a reader can cut it again, and `restart_shell_pid` names the process
+  that started the run (the desktop shell, for every run of the service).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
   its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
@@ -668,6 +670,17 @@ CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [-
   must not. A manifest that cannot be read, or has no non-empty string `version`, leaves nothing
   to compare and skips the check. `--diagnose` does not run the check itself (it prints the cache's last
   `warning`, which may carry the notice) and prints both versions.
+  The notice is meant for the shell that ran the fetch, but the cache outlives that shell: right
+  after `omarchy restart shell` the new code reads it until its first fetch replaces it, and
+  would ask for the restart that has just happened. So the run also writes the notice's text to
+  `restart_notice` and its parent's pid (`os.getppid()`, taken with the check) to
+  `restart_shell_pid`. `Service.qml` and `Widget.qml` cut that text from the start of `warning`,
+  keeping the rest, only when that pid is a positive number other than their own
+  `Quickshell.processId` — the same test the alert state uses for `toastsShellPid`. A rescan, a
+  rebuilt bar or a new monitor keeps the shell process and with it the notice, a wall-clock step
+  changes nothing, and a missing or malformed pid keeps the notice. A run from a terminal that
+  sets `OMEETINGBAR_SERVICE` by hand names the terminal, so the readers cut its notice. Readers
+  from before 1.1.0 ignore both fields and show `warning` as it is, which is what they need.
 - **Bounds** (calendar data is third-party input): at most 2000 instances per calendar or feed
   (the expansion is stopped, `warning` says so), at most 512 events in the cache (earliest
   first), URLs over 2048 characters are dropped. Service.qml caps again on its side.

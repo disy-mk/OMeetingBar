@@ -379,6 +379,23 @@ Item {
     logState("cache", message)
   }
 
+  // `restart_notice` repeats the text `warning` starts with when the service
+  // that ran the fetch was outdated (see codeVersion), and `restart_shell_pid`
+  // names the shell process that ran it. The notice is meant for that shell:
+  // read in another one -- `omarchy restart shell` has happened since -- it is
+  // cut and the rest of the warning kept. A rescan or a rebuilt bar keeps the
+  // shell and so the notice; without a usable pid it is kept too. Widget.qml
+  // reads the cache by the same rule.
+  function cacheWarningOf(parsed) {
+    var warning = String(parsed.warning === undefined || parsed.warning === null ? "" : parsed.warning)
+    var notice = typeof parsed.restart_notice === "string" ? parsed.restart_notice : ""
+    var pid = parsed.restart_shell_pid
+    if (notice === "" || warning.indexOf(notice) !== 0
+      || typeof pid !== "number" || !(pid > 0) || pid === Quickshell.processId)
+      return warning
+    return warning.slice(notice.length).trim()
+  }
+
   function applyCache(raw) {
     var text = String(raw || "").trim()
     root.cacheLoaded = true
@@ -417,7 +434,7 @@ Item {
     // "usable but degraded" channel and is read whatever the status is.
     root.cacheError = status === "error"
       ? String(parsed.error === undefined || parsed.error === null ? "" : parsed.error) : ""
-    root.cacheWarning = String(parsed.warning === undefined || parsed.warning === null ? "" : parsed.warning)
+    root.cacheWarning = cacheWarningOf(parsed)
     root.cacheStale = parsed.stale === true
     var generated = epochOf(parsed.generated_at)
     var refreshed = epochOf(parsed.refreshed_at)
