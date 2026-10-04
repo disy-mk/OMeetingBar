@@ -328,25 +328,25 @@ next_step() {
   printf '\n  %d. %s\n' "$step_number" "$*"
 }
 
-printf '\n==> Nächste Schritte\n'
+printf '\n==> Next steps\n'
 
 if (( ${#missing_packages[@]} )); then
-  next_step "Fehlende Pakete installieren:"
+  next_step "Install the missing packages:"
   say "       sudo pacman -S --needed ${missing_packages[*]}"
 fi
 
-next_step "Google-Workspace-Konto verbinden:"
+next_step "Connect your Google (Workspace) account:"
 say "       gnome-online-accounts-gtk"
-say '     Google auswählen, anmelden, "Kalender" einschalten.'
+say '     Pick Google, sign in, switch on "Calendar".'
 
 if (( demo_advised )) || [[ $config_backend == "demo" ]]; then
-  next_step "Backend von demo auf eds umstellen (erst wenn die Schritte oben erledigt sind):"
+  next_step "Switch the backend from demo to eds (once the steps above are done):"
   say "       (umask 077; jq '.backend = \"eds\"' \"$CONFIG_FILE\" > \"$CONFIG_FILE.tmp\") \\"
   say "         && mv \"$CONFIG_FILE.tmp\" \"$CONFIG_FILE\""
 fi
 
-next_step "Testen:"
-say "       omarchy-shell omeetingbar test    # Vollbild-Alarm sofort, ohne Kalender"
-say "       omarchy-shell omeetingbar status  # Backend-Status, Cache-Alter, nächster Termin"
-say "       omeetingbar-fetch --diagnose      # Pakete, Typelibs, GOA-Konten, Kalender"
+next_step "Test:"
+say "       omarchy-shell omeetingbar test    # fullscreen alert right now, no calendar needed"
+say "       omarchy-shell omeetingbar status  # backend state, cache age, alert state"
+say "       omeetingbar-fetch --diagnose      # packages, typelibs, GOA accounts, calendars"
 printf '\n'

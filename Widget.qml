@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Strings.js" as Strings
 
 // Next-meeting label for the bar, and the host of the agenda popup.
 //
@@ -45,6 +46,11 @@ BarWidget {
   // blanks the screen while it is on, but stays in the agenda), and a bar
   // layout entry must not be able to disagree with what the service does.
   readonly property bool skipDeclined: Style.boolToken(fileConfig.skip_declined, true)
+  // ---- UI language: omeetingbar.json's `language` ("de" | "en" | "auto"),
+  //      else the session locale, else English. Pushed to the popup; the
+  //      service resolves it the same way for the alert and the notifications.
+  readonly property string lang: Strings.pick(fileConfig.language, Qt.locale().name)
+  readonly property var uiLocale: Qt.locale(Strings.localeName(lang))
   // ---- Cache state. "unknown" until the first read resolves, so a present
   //      cache never flashes the placeholder on startup.
   property string cacheState: "unknown"
@@ -118,50 +124,50 @@ BarWidget {
 
   // One place for the hint, so it can never promise a binding the button
   // below does not have.
-  readonly property string clickHint: "Links: Agenda öffnen · Rechts/Mitte: aktualisieren"
+  readonly property string clickHint: Strings.t(root.lang, "clickHint")
 
   // The tooltip names the next meeting and every reason the data may be
   // wrong. The list of what comes after it belongs to the popup now — a
   // hover that repeats the panel is just two places to keep in step.
   readonly property string tooltipText: {
     if (runtimeMissing)
-      return "OMeetingBar: XDG_RUNTIME_DIR ist nicht gesetzt, der Termin-Cache ist nicht lesbar."
+      return Strings.t(root.lang, "runtimeMissing")
     if (pending) return ""
 
     var lines = []
     if (cacheState === "missing") {
-      lines.push("Noch keine Termindaten.")
-      lines.push("Der Kalender ist wahrscheinlich noch nicht verbunden — siehe README.")
+      lines.push(Strings.t(root.lang, "noDataYet"))
+      lines.push(Strings.t(root.lang, "notConnected"))
       lines.push(clickHint)
       return lines.join("\n")
     }
     if (cacheState === "corrupt") {
-      lines.push("Termin-Cache ist unlesbar.")
+      lines.push(Strings.t(root.lang, "cacheUnreadable"))
       lines.push(cachePath)
       lines.push(clickHint)
       return lines.join("\n")
     }
     if (cacheState === "error") {
-      lines.push("Kalenderfehler: " + cacheError)
-      if (cacheStale) lines.push("Angezeigt werden die letzten bekannten Termine.")
+      lines.push(Strings.t(root.lang, "calendarError", cacheError))
+      if (cacheStale) lines.push(Strings.t(root.lang, "lastKnown"))
     }
     if (cacheWarning !== "")
-      lines.push("Eingeschränkt: " + cacheWarning)
+      lines.push(Strings.t(root.lang, "limited", cacheWarning))
     if (cacheOutdated)
-      lines.push("Daten sind " + minutesWord(Math.floor(cacheAge / 60)) + " alt — läuft der OMeetingBar-Dienst?")
+      lines.push(Strings.t(root.lang, "dataAge", minutesWord(Math.floor(cacheAge / 60))))
     if (!hasEvent) {
-      lines.push("Kein anstehender Termin.")
+      lines.push(Strings.t(root.lang, "noUpcomingDot"))
       // Without this line a bar showing "—" over a popup full of rows looks
       // like a bug rather than like a day that is already done.
       if (events.length > 0)
-        lines.push("Die Agenda zeigt " + eventsWord(events.length) + " (auch erledigte und abgelehnte).")
+        lines.push(Strings.t(root.lang, "agendaLists", eventsWord(events.length)))
       lines.push(clickHint)
       return lines.join("\n")
     }
 
     var day = dayPrefix(nextEvent)
-    if (day !== "" && day !== "morgen")
-      day = new Date(Number(nextEvent.start) * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")
+    if (day !== "" && day !== Strings.t(root.lang, "tomorrow"))
+      day = new Date(Number(nextEvent.start) * 1000).toLocaleDateString(root.uiLocale, Strings.t(root.lang, "dateShort"))
     lines.push((day === "" ? "" : day + "  ") + timeRange(nextEvent) + "  " + truncate(nextEvent.title, 64))
     var meta = []
     if (nextEvent.calendar !== "") meta.push(nextEvent.calendar)
@@ -264,6 +270,7 @@ BarWidget {
     pushBinding(target, "cacheOutdated", function() { return root.cacheOutdated })
     pushBinding(target, "degraded", function() { return root.degraded })
     pushBinding(target, "pending", function() { return root.pending })
+    pushBinding(target, "lang", function() { return root.lang })
   }
 
   function pushBinding(target, key, getter) {
@@ -325,25 +332,25 @@ BarWidget {
     return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset).getTime() / 1000)
   }
 
-  // "" today, "morgen" tomorrow, else the short weekday — the bar always names
-  // the next meeting even when it is on Monday, and a bare "09:00" for a
-  // Monday meeting read on Friday would be a lie. Explicit de_DE locale: the
-  // system locale is en_US.
+  // "" today, "tomorrow" for tomorrow, else the short weekday — the bar always
+  // names the next meeting even when it is on Monday, and a bare "09:00" for a
+  // Monday meeting read on Friday would be a lie. The weekday follows the UI
+  // language (uiLocale), not the session locale.
   function dayPrefix(event) {
     var start = Number(event.start)
     if (start < dayStartSec(1)) return ""
-    if (start < dayStartSec(2)) return "morgen"
-    return new Date(start * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd")
+    if (start < dayStartSec(2)) return Strings.t(root.lang, "tomorrow")
+    return new Date(start * 1000).toLocaleDateString(root.uiLocale, "ddd")
   }
 
   function timeLabel(event) {
     var prefix = dayPrefix(event)
-    var time = event.allDay ? "ganztägig" : clockTime(event.start)
+    var time = event.allDay ? Strings.t(root.lang, "allDay") : clockTime(event.start)
     return prefix === "" ? time : prefix + " " + time
   }
 
   function timeRange(event) {
-    if (event.allDay) return "ganztägig"
+    if (event.allDay) return Strings.t(root.lang, "allDay")
     // A zero-length occurrence (end == start, the invariant-2 fallback) reads
     // as one time, the way the popup and the notification already print it.
     if (!(event.end > event.start)) return clockTime(event.start)
@@ -351,8 +358,8 @@ BarWidget {
   }
 
   function shortCountdown(delta) {
-    if (delta < -60) return "läuft"
-    if (delta < 60) return "jetzt"
+    if (delta < -60) return Strings.t(root.lang, "running")
+    if (delta < 60) return Strings.t(root.lang, "now")
     var minutes = Math.floor(delta / 60)
     if (minutes < 60) return minutes + "m"
     var hours = Math.floor(minutes / 60)
@@ -364,23 +371,24 @@ BarWidget {
   }
 
   function longCountdown(delta) {
-    if (delta < -60) return "Läuft seit " + minutesWord(Math.floor(-delta / 60)) + "."
-    if (delta < 60) return "Beginnt jetzt."
+    if (delta < -60) return Strings.t(root.lang, "runningForDot", minutesWord(Math.floor(-delta / 60)))
+    if (delta < 60) return Strings.t(root.lang, "startsNow")
     var minutes = Math.floor(delta / 60)
-    if (minutes < 60) return "Beginnt in " + minutesWord(minutes) + "."
+    if (minutes < 60) return Strings.t(root.lang, "startsIn", minutesWord(minutes))
     if (minutes >= 24 * 60) {
       var days = Math.round(delta / 86400)
-      return "Beginnt in " + (days === 1 ? "1 Tag" : days + " Tagen") + "."
+      return Strings.t(root.lang, "startsIn", Strings.count(root.lang, days, "oneDay", "nDays"))
     }
-    return "Beginnt in " + Math.floor(minutes / 60) + " h " + (minutes % 60) + " min."
+    return Strings.t(root.lang, "startsIn",
+      Strings.t(root.lang, "hoursMin", Math.floor(minutes / 60), minutes % 60))
   }
 
   function minutesWord(minutes) {
-    return minutes === 1 ? "1 Minute" : minutes + " Minuten"
+    return Strings.count(root.lang, minutes, "oneMinute", "nMinutes")
   }
 
   function eventsWord(count) {
-    return count === 1 ? "1 Termin" : count + " Termine"
+    return Strings.count(root.lang, count, "oneMeeting", "nMeetings")
   }
 
   // ---- Parsing
@@ -460,7 +468,7 @@ BarWidget {
       if (!isFinite(end) || end < start) end = start
       out.push({
         id: String(raw.id || ""),
-        title: collapse(raw.title) || "Ohne Titel",
+        title: collapse(raw.title) || Strings.t(root.lang, "untitled"),
         start: start,
         end: end,
         allDay: raw.all_day === true,

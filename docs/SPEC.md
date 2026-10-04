@@ -17,6 +17,7 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
 | `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
 | `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
+| `Strings.js` | — | every QML-side UI string in German and English, plus the language rule (`pick`); imported by all four QML files |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
 | `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: opens the link only while the meeting is on |
 | `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
@@ -89,6 +90,7 @@ supply these defaults and never crash on a missing/broken file:
   "inhibit_lead_seconds": 600,
   "grace_seconds": 300,
   "sound": "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga",
+  "language": "auto",
   "notify": true,
   "wake_display": true,
   "skip_all_day": true,
@@ -121,6 +123,16 @@ Semantics:
 - `auto_dismiss_seconds` — 0 means "stay until dismissed", bounded by the overlay's 600 s hard
   dismiss (see the overlay contract).
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
+- `language` — `"de"`, `"en"` or `"auto"` (default). Resolved in exactly two places with the
+  same rule: `Strings.pick(override, Qt.locale().name)` in `Strings.js` (Widget, Popup via the
+  widget, Service; the alert gets the result in its payload as `lang`) and `pick_language()` in
+  the fetcher (`LC_ALL`, `LC_MESSAGES`, `LANG`). "auto" means `de*` → German, everything else →
+  English; English is also the fallback for a missing key. Every user-facing string lives in
+  `Strings.js` (QML) or the fetcher's `MESSAGES` table, key-for-key identical in both languages
+  with the same placeholders — never inline. Dates and weekday names follow the UI language
+  (`Qt.locale("de_DE")` / `Qt.locale("en_US")`, so a German UI on an en_US session still says
+  "Mo"), times stay 24 h in both like Omarchy's own bar clock, the ISO week reads "KW 40" /
+  "W 40". Manifest texts (the bar's settings UI) cannot be localised and are English.
 - `fetch_interval_seconds` — how often the QML service runs the fetcher (local read).
 - `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it.
   Default 7 days, because the bar's promise is to *always* name the next meeting: on a Friday
@@ -184,8 +196,8 @@ dismissed notifications in its history under `~/.local/state/omarchy/notificatio
   and the documented defaults were used, one of several calendars failed while the others
   delivered (its previous events were carried forward), the pushed network refresh failed or
   has not succeeded for over 30 min, a calendar hit the instance cap, or an option was ignored
-  because it does not apply to the active backend. `status` stays `"ok"`, and the text is
-  German, short and content-free (same privacy rules as `error`).
+  because it does not apply to the active backend. `status` stays `"ok"`, and the text is in
+  the UI language (see `language`), short and content-free (same privacy rules as `error`).
   A non-empty `warning` **must be surfaced**: the widget shows a calm marker plus the reason in
   its tooltip, and `omeetingbar status` reports it. Without that, a typo in `omeetingbar.json` runs on
   defaults forever without anyone noticing.
@@ -413,8 +425,9 @@ file talks to the outside world.
   against `Color.popups.background` (WCAG's figure for non-text UI); a provider without a reliable
   brand colour (Whereby) keeps the muted theme colour. Brand colour is deliberately confined to
   the glyph: the time column keeps the two signal colours (running/upcoming).
-- German strings need an explicit locale — the system locale is en_US:
-  `d.toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")` → `Do., 10. Sept.`.
+- Dates are formatted with the UI language's locale, never the session's (`uiLocale`,
+  `Qt.locale(Strings.localeName(lang))`): `toLocaleDateString(uiLocale, Strings.t(lang,
+  "dateShort"))` → `Do., 10. Sept.` in German, `Thu, Sep 10` in English.
 - Sizes come from `Style.space()` / `Style.font.*` only, never a bare pixel number. Width
   `fittedContentWidth(Style.space(380))` like every anchored first-party panel, height
   `fittedContentHeight(column.implicitHeight, Style.space(560))`.

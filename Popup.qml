@@ -3,6 +3,7 @@ import Quickshell
 import qs.Commons
 import qs.Ui
 import "Providers.js" as Providers
+import "Strings.js" as Strings
 
 // The agenda popup: today's and tomorrow's meetings under a timeline strip.
 //
@@ -47,6 +48,10 @@ Item {
   property bool cacheOutdated: false
   property bool degraded: false
   property bool pending: false
+  // UI language, resolved by the widget from omeetingbar.json and the session
+  // locale. The default only matters when this file renders on its own.
+  property string lang: Strings.pick("", Qt.locale().name)
+  readonly property var uiLocale: Qt.locale(Strings.localeName(lang))
 
   // Not pushed by the host, so it is derived rather than injected: the widget
   // already resolved it out of omeetingbar.json and the bar's layout entry, and
@@ -329,33 +334,33 @@ Item {
   readonly property real nextEndSec: hasNext ? Math.max(Number(nextEvent.end), nextStartSec) : 0
 
   readonly property string heroTitle: {
-    if (root.pending) return "Termine werden geladen …"
-    if (root.hasNext) return String(root.nextEvent.title || "Ohne Titel")
-    if (root.degraded) return "Keine Termindaten"
+    if (root.pending) return Strings.t(root.lang, "loading")
+    if (root.hasNext) return String(root.nextEvent.title || Strings.t(root.lang, "untitled"))
+    if (root.degraded) return Strings.t(root.lang, "noData")
     // The alertable view is empty, but the agenda underneath may well list the
     // day: "no meetings" over four finished rows read as a contradiction.
-    return root.hasAgenda ? "Kein anstehender Termin" : "Keine Termine"
+    return root.hasAgenda ? Strings.t(root.lang, "noUpcoming") : Strings.t(root.lang, "noMeetings")
   }
 
-  function countPhrase(n, singular, plural) {
-    return n + " " + (n === 1 ? singular : plural)
+  function countPhrase(n) {
+    return Strings.count(root.lang, n, "oneMeeting", "nMeetings")
   }
 
   readonly property string heroMeta: {
     if (root.pending) return ""
     if (!root.hasNext) {
       if (root.degraded) return ""
-      if (!root.hasAgenda) return "keine Termine heute und morgen"
-      return countPhrase(root.todayEvents.length, "Termin", "Termine") + " heute · "
+      if (!root.hasAgenda) return Strings.t(root.lang, "noneTodayTomorrow")
+      return countPhrase(root.todayEvents.length) + " " + Strings.t(root.lang, "today") + " · "
         + (root.tomorrowEvents.length > 0
-          ? countPhrase(root.tomorrowEvents.length, "Termin", "Termine") + " morgen"
-          : "keine morgen")
+          ? countPhrase(root.tomorrowEvents.length) + " " + Strings.t(root.lang, "tomorrow")
+          : Strings.t(root.lang, "noneTomorrow"))
     }
     var parts = []
     var prefix = dayPrefixFor(root.nextStartSec)
     if (prefix !== "") parts.push(prefix)
     if (root.nextEvent.allDay === true) {
-      parts.push("ganztägig")
+      parts.push(Strings.t(root.lang, "allDay"))
     } else {
       parts.push(clockTime(root.nextStartSec) + "–" + clockTime(root.nextEndSec))
       parts.push(countdownPhrase(root.nextStartSec - root.nowSec))
@@ -365,27 +370,27 @@ Item {
 
   readonly property string heroDetail: root.hasNext ? String(root.nextEvent.calendar || "") : ""
 
-  // ---- Degraded state. Same German the widget's tooltip uses, so the two
+  // ---- Degraded state. Same strings the widget's tooltip uses, so the two
   //      never explain the same cache differently.
   readonly property var noticeLines: {
     var lines = []
     if (root.pending) {
-      lines.push("Termindaten werden gelesen …")
+      lines.push(Strings.t(root.lang, "reading"))
       return lines
     }
     if (root.cacheState === "missing") {
-      lines.push("Noch keine Termindaten.")
-      lines.push("Der Kalender ist wahrscheinlich noch nicht verbunden — siehe README.")
+      lines.push(Strings.t(root.lang, "noDataYet"))
+      lines.push(Strings.t(root.lang, "notConnected"))
     } else if (root.cacheState === "corrupt") {
-      lines.push("Termin-Cache ist unlesbar.")
+      lines.push(Strings.t(root.lang, "cacheUnreadable"))
     } else if (root.cacheState === "error") {
-      lines.push("Kalenderfehler: " + root.cacheError)
-      if (root.cacheStale) lines.push("Angezeigt werden die letzten bekannten Termine.")
+      lines.push(Strings.t(root.lang, "calendarError", root.cacheError))
+      if (root.cacheStale) lines.push(Strings.t(root.lang, "lastKnown"))
     } else if (root.degraded) {
-      lines.push("Termindaten sind nicht lesbar.")
+      lines.push(Strings.t(root.lang, "dataUnreadable"))
     }
-    if (root.cacheWarning !== "") lines.push("Eingeschränkt: " + root.cacheWarning)
-    if (root.cacheOutdated) lines.push("Termindaten sind veraltet — läuft der OMeetingBar-Dienst?")
+    if (root.cacheWarning !== "") lines.push(Strings.t(root.lang, "limited", root.cacheWarning))
+    if (root.cacheOutdated) lines.push(Strings.t(root.lang, "dataOutdated"))
     return lines
   }
 
@@ -519,14 +524,16 @@ Item {
   readonly property var footerActions: [
     {
       key: "join",
-      label: root.joinUrl === "" ? "Kein Meeting-Link"
-        : (Providers.name(root.joinUrl) !== "" ? "In " + Providers.name(root.joinUrl) + " beitreten" : "Meeting öffnen"),
+      label: root.joinUrl === "" ? Strings.t(root.lang, "noJoinLink")
+        : (Providers.name(root.joinUrl) !== ""
+          ? Strings.t(root.lang, "joinVia", Providers.name(root.joinUrl))
+          : Strings.t(root.lang, "openMeeting")),
       icon: root.joinUrl !== "" ? Providers.glyph(root.joinUrl) : root.glyphVideo,
       enabled: root.joinUrl !== ""
     },
-    { key: "create", label: "Termin anlegen", icon: root.glyphCalendarPlus, enabled: true },
-    { key: "refresh", label: "Jetzt aktualisieren", icon: root.glyphRefresh, enabled: true },
-    { key: "calendar", label: "Kalender öffnen", icon: root.glyphOpenExternal, enabled: true }
+    { key: "create", label: Strings.t(root.lang, "createEvent"), icon: root.glyphCalendarPlus, enabled: true },
+    { key: "refresh", label: Strings.t(root.lang, "refreshNow"), icon: root.glyphRefresh, enabled: true },
+    { key: "calendar", label: Strings.t(root.lang, "openCalendar"), icon: root.glyphOpenExternal, enabled: true }
   ]
 
   function footerActivate(index) {
@@ -573,8 +580,8 @@ Item {
     return brand !== "" ? Qt.color(brand) : root.mutedFg
   }
 
-  // ---- Formatting. German needs the locale spelled out — the system locale
-  //      is en_US.
+  // ---- Formatting. Dates follow the UI language (uiLocale), not the session
+  //      locale; times stay 24 h in both, like Omarchy's own bar clock.
   function clockTime(sec) {
     return Qt.formatTime(new Date(sec * 1000), "HH:mm")
   }
@@ -593,15 +600,15 @@ Item {
   }
 
   function weekTag(sec) {
-    return " (KW " + isoWeek(sec) + ")"
+    return Strings.t(root.lang, "weekTag", isoWeek(sec))
   }
 
   function dayShort(sec) {
-    return new Date(sec * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd")
+    return new Date(sec * 1000).toLocaleDateString(root.uiLocale, "ddd")
   }
 
   function dayLabel(sec) {
-    return new Date(sec * 1000).toLocaleDateString(Qt.locale("de_DE"), "ddd, d. MMM")
+    return new Date(sec * 1000).toLocaleDateString(root.uiLocale, Strings.t(root.lang, "dateShort"))
   }
 
   // The hero's meta line is one elided row: "SO., 13. SEPT. · 10:15–12:45 ·
@@ -610,33 +617,34 @@ Item {
   // their tooltips carry the full date.
   function dayPrefixFor(sec) {
     if (sec < root.tomorrowStartSec) return ""
-    if (sec < root.dayAfterStartSec) return "morgen"
+    if (sec < root.dayAfterStartSec) return Strings.t(root.lang, "tomorrow")
     return dayShort(sec)
   }
 
   function timeRangeText(ev) {
-    if (ev.allDay === true) return "ganztägig"
+    if (ev.allDay === true) return Strings.t(root.lang, "allDay")
     var start = Number(ev.start)
     var end = Math.max(Number(ev.end), start)
     return end > start ? clockTime(start) + "–" + clockTime(end) : clockTime(start)
   }
 
   function countdownPhrase(delta) {
-    if (delta <= -60) return "läuft seit " + minutesPhrase(Math.floor(-delta / 60))
-    if (delta < 60) return "jetzt"
+    if (delta <= -60) return Strings.t(root.lang, "runningFor", minutesPhrase(Math.floor(-delta / 60)))
+    if (delta < 60) return Strings.t(root.lang, "now")
     var minutes = Math.floor(delta / 60)
-    if (minutes < 60) return "in " + minutesPhrase(minutes)
+    if (minutes < 60) return Strings.t(root.lang, "inX", minutesPhrase(minutes))
     var hours = Math.floor(minutes / 60)
     if (hours >= 24) {
       var days = Math.round(delta / 86400)
-      return "in " + (days === 1 ? "1 Tag" : days + " Tagen")
+      return Strings.t(root.lang, "inX", Strings.count(root.lang, days, "oneDay", "nDays"))
     }
     var rest = minutes % 60
-    return rest > 0 ? "in " + hours + " h " + rest + " min" : "in " + hours + " h"
+    return Strings.t(root.lang, "inX", rest > 0
+      ? Strings.t(root.lang, "hoursMin", hours, rest) : Strings.t(root.lang, "hoursOnly", hours))
   }
 
   function minutesPhrase(minutes) {
-    return minutes === 1 ? "1 Minute" : minutes + " Minuten"
+    return Strings.count(root.lang, minutes, "oneMinute", "nMinutes")
   }
 
   // The plugin's two signal colours, with exactly the meaning they carry in
@@ -686,7 +694,7 @@ Item {
 
     PanelActionButton {
       iconText: root.glyphRefresh
-      tooltipText: "Jetzt aktualisieren"
+      tooltipText: Strings.t(root.lang, "refreshNow")
       foreground: root.fg
       hoverColor: root.fg
       fontFamily: root.fontFamily
@@ -867,7 +875,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "HEUTE · " + root.dayLabel(root.todayStartSec).toUpperCase() + root.weekTag(root.todayStartSec)
+              text: Strings.t(root.lang, "sectionToday") + " · " + root.dayLabel(root.todayStartSec).toUpperCase() + root.weekTag(root.todayStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -889,7 +897,7 @@ Item {
               textFormat: Text.PlainText
               visible: root.todayEvents.length === 0
               width: parent.width
-              text: "Keine Termine heute."
+              text: Strings.t(root.lang, "noneTodayDot")
               color: root.metaFg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -909,7 +917,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "MORGEN · " + root.dayLabel(root.tomorrowStartSec).toUpperCase() + root.weekTag(root.tomorrowStartSec)
+              text: Strings.t(root.lang, "sectionTomorrow") + " · " + root.dayLabel(root.tomorrowStartSec).toUpperCase() + root.weekTag(root.tomorrowStartSec)
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -931,7 +939,7 @@ Item {
               textFormat: Text.PlainText
               visible: root.tomorrowEvents.length === 0
               width: parent.width
-              text: "Keine Termine morgen."
+              text: Strings.t(root.lang, "noneTomorrowDot")
               color: root.metaFg
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
@@ -953,7 +961,7 @@ Item {
             spacing: Style.spacing.rowGap
 
             PanelSectionHeader {
-              text: "DEMNÄCHST"
+              text: Strings.t(root.lang, "sectionLater")
               foreground: root.fg
               fontFamily: root.fontFamily
             }
@@ -1017,7 +1025,7 @@ Item {
             textFormat: Text.PlainText
             visible: root.showEmptyMessage
             width: parent.width
-            text: "Keine Termine heute und morgen."
+            text: Strings.t(root.lang, "noneTodayTomorrowDot")
             color: root.metaFg
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
@@ -1100,15 +1108,16 @@ Item {
 
     readonly property string rowTooltip: {
       var lines = [(row.showDay ? root.dayLabel(row.startSec) + "  " : "")
-        + root.timeRangeText(row.ev) + "  " + String(row.ev.title || "Ohne Titel")]
+        + root.timeRangeText(row.ev) + "  " + String(row.ev.title || Strings.t(root.lang, "untitled"))]
       var meta = []
       if (String(row.ev.calendar || "") !== "") meta.push(String(row.ev.calendar))
       if (String(row.ev.location || "") !== "") meta.push(String(row.ev.location))
       if (meta.length > 0) lines.push(meta.join(" · "))
-      if (row.declined) lines.push("Abgelehnt")
+      if (row.declined) lines.push(Strings.t(root.lang, "declined"))
       if (row.joinTarget !== "")
         lines.push(Providers.name(row.joinTarget) !== ""
-          ? "Klick: in " + Providers.name(row.joinTarget) + " beitreten" : "Klick: Meeting öffnen")
+          ? Strings.t(root.lang, "clickJoinVia", Providers.name(row.joinTarget))
+          : Strings.t(root.lang, "clickOpenMeeting"))
       return lines.join("\n")
     }
 
@@ -1209,7 +1218,7 @@ Item {
         anchors.rightMargin: Style.space(4)
         anchors.verticalCenter: parent.verticalCenter
         // Meeting titles are untrusted third-party input: PlainText, always.
-        text: String(row.ev.title || "Ohne Titel")
+        text: String(row.ev.title || Strings.t(root.lang, "untitled"))
         color: row.running ? Qt.color(root.runningColor) : root.fg
         font.family: root.fontFamily
         font.pixelSize: Style.font.body

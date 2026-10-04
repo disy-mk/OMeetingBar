@@ -19,7 +19,7 @@
   },
   "barWidget": {
     "displayName": "OMeetingBar",
-    "description": "Nächster Termin in der Bar. Linksklick öffnet die Agenda für heute und morgen, Rechts- oder Mittelklick lädt neu.",
+    "description": "Your next meeting in the bar. Left click opens the agenda for today and tomorrow, right or middle click refreshes.",
     "category": "Time",
     "allowMultiple": false,
     "defaultSection": "center",
@@ -32,8 +32,8 @@
       {
         "key": "warn_minutes",
         "type": "integer",
-        "label": "Volle Farbstärke ab (Minuten)",
-        "description": "So lange vor dem Start zeigt der Bar-Eintrag seine Farbe in voller Stärke, davor leicht abgedimmt.",
+        "label": "Full colour from (minutes)",
+        "description": "This long before the start the bar entry shows its colour at full strength; before that it is slightly dimmed.",
         "min": 0,
         "max": 120,
         "step": 1,
@@ -42,8 +42,8 @@
       {
         "key": "max_title_chars",
         "type": "integer",
-        "label": "Maximale Titellänge (Zeichen)",
-        "description": "Längere Meeting-Titel werden in der Bar gekürzt.",
+        "label": "Maximum title length (characters)",
+        "description": "Longer meeting titles are truncated in the bar.",
         "min": 8,
         "max": 120,
         "step": 1,
@@ -52,8 +52,8 @@
       {
         "key": "hide_when_empty",
         "type": "boolean",
-        "label": "Ausblenden, wenn die Agenda leer ist",
-        "description": "Aus: der Eintrag bleibt immer sichtbar. An: er verschwindet erst, wenn weder heute noch morgen Termine enthalten – solange die Agenda etwas zeigt, bleibt er als gedimmter Platzhalter erreichbar.",
+        "label": "Hide when the agenda is empty",
+        "description": "Off: the entry is always visible. On: it disappears only once the agenda holds no meetings at all – while it shows anything, the entry stays reachable as a dimmed placeholder.",
         "defaultValue": true
       }
     ]

@@ -71,6 +71,9 @@ DEFAULTS = {
     "min_duration_minutes": 0,
     "title_blocklist": [],
     "calendars_exclude": [],
+    # "auto" follows the session locale (de* -> German, else English); "de" or
+    # "en" pins it. Strings.js applies the same rule on the QML side.
+    "language": "auto",
 }
 
 # ECal.Client.connect_sync's wait_for_connected_seconds is not an upper bound —
@@ -117,6 +120,264 @@ EDS_PACKAGES = ("sudo pacman -S --needed gnome-online-accounts "
                 "gnome-online-accounts-gtk evolution-data-server python-gobject")
 GOA_DIALOG = "gnome-online-accounts-gtk"
 ICS_PACKAGES = "sudo pacman -S python-icalendar python-recurring-ical-events"
+
+# --- language ---------------------------------------------------------------
+#
+# Everything this script says to a person -- `error` and `warning` in the
+# cache, the --diagnose report, the demo and test events -- comes from this
+# table, in German and English. Same rule as Strings.js on the QML side:
+# omeetingbar.json's `language` ("de" | "en" | "auto"), on "auto" the session
+# locale (LC_ALL, LC_MESSAGES, LANG), English for everything else. Both blocks
+# must carry the same keys with the same %-placeholders in the same order.
+MESSAGES = {
+    "de": {
+        "cfgUnreadable": "Konfiguration %s ist nicht lesbar (%s) – es gelten Standardwerte.",
+        "cfgNotObject": "Konfiguration %s ist kein JSON-Objekt – es gelten Standardwerte.",
+        "cfgInvalid": "Ungültige Werte in %s: %s – dort gelten Standardwerte.",
+        "cfgLookaheadCap": "lookahead_minutes ist auf %d min (30 Tage) begrenzt.",
+        "cfgGraceCap": "grace_seconds ist auf %d s (6 Stunden) begrenzt.",
+        "untitled": "(ohne Titel)",
+        "injectTitle": "TEST-Termin (OMeetingBar)",
+        "injectLocation": "Arbeitszimmer",
+        "injectOutsideWindow": "Der Testtermin aus --in-seconds liegt außerhalb von lookahead_minutes und wird nicht ausgeliefert.",
+        "injectExpired": "Der Testtermin aus --in-seconds liegt bereits außerhalb von grace_seconds und wurde verworfen.",
+        "demoStandup": "Daily Standup",
+        "demoSprintReview": "Sprint Review",
+        "demoPartner": "Partner-Abstimmung",
+        "demoOneOnOne": "1:1 mit der Teamleitung",
+        "demoVacation": "Urlaub (Kollegin)",
+        "demoCustomer": "Kundencall",
+        "demoCommunity": "Community-Call",
+        "demoRoom": "Besprechungsraum 2",
+        "networkError": "Netzwerkfehler (%s)",
+        "icsNoUrls": "Backend 'ics' ist aktiv, aber 'ics_urls' ist leer. Privaten iCal-Link aus Google Kalender dort eintragen – oder besser \"backend\": \"eds\" nutzen.",
+        "icsPackagesMissing": "Python-Pakete für das ICS-Backend fehlen (%s). Installieren: %s – oder \"backend\": \"eds\" nutzen.",
+        "srcHttpsOnly": "Quelle %d: nur https ist erlaubt",
+        "srcBudget": "Quelle %d: Zeitbudget erschöpft",
+        "srcDetail": "Quelle %d: %s",
+        "srcUnparseable": "Quelle %d: nicht auswertbar (%s)",
+        "srcCapped": "Quelle %d: mehr als %d Termine im Fenster, gekürzt",
+        "srcBroken": "Quelle %d: %d Einträge nicht auswertbar",
+        "icsNoneReadable": "Kein ICS-Feed lesbar – %s",
+        "icsProblems": "ICS-Probleme: %s",
+        "giMissing": "Python-Modul 'gi' fehlt – installieren: sudo pacman -S python-gobject",
+        "typelibsMissing": "Kalender-Bibliotheken fehlen: %s (aus %s). Installieren, dann ein Google-Konto in GNOME Online Accounts anlegen (%s): %s",
+        "typelibName": "%s-Typelib",
+        "edsUnusable": "evolution-data-server ist nicht nutzbar (%s). Installieren: %s",
+        "registryDown": "Evolution Data Server antwortet nicht (%s). Dienst prüfen: systemctl --user status evolution-source-registry",
+        "noGoogleAccount": "Kein Google-Konto gefunden. In GNOME Online Accounts anlegen: %s",
+        "noEnabledCalendar": "Google-Konto vorhanden, aber kein aktivierter Kalender – Kalender in GNOME Online Accounts einschalten: %s",
+        "skipDeclinedNoIdentity": "skip_declined ist aktiv, aber im Konto ist keine eigene Adresse hinterlegt – abgelehnte Termine lösen weiterhin einen Alarm aus.",
+        "calendarLabel": "Kalender %d",
+        "calCapped": "%s: mehr als %d Termine im Fenster, Liste gekürzt.",
+        "syncFailed": "Kalender-Sync fehlgeschlagen – es gilt die lokale Kopie.",
+        "syncPartial": "Kalender-Sync teilweise fehlgeschlagen (%d von %d).",
+        "syncStale": "Letzter erfolgreicher Kalender-Sync vor %s – Termine können veraltet sein.",
+        "carried": "%d Termine aus dem letzten Lauf übernommen",
+        "calendarsUnreadable": "Kalender nicht lesbar – %s",
+        "partialFailure": "Teilweise fehlgeschlagen: %s",
+        "unexpectedBackendError": "Unerwarteter Fehler im Backend '%s' (%s: %s).",
+        "maxEvents": "Nur die ersten %d Termine werden ausgeliefert.",
+        # --diagnose
+        "diagTitle": "OMeetingBar – Bereitschaftsprüfung",
+        "diagEnv": "Umgebung",
+        "diagTime": "  Zeit:                 %s (%s)",
+        "diagPython": "  Python:               %s (%s)",
+        "diagConfig": "Konfiguration",
+        "diagFile": "  Datei:                %s%s",
+        "diagMissingSuffix": "  (fehlt)",
+        "diagProblem": "  PROBLEM:              %s",
+        "diagBackend": "  Backend:              %s%s",
+        "diagViaFlag": "  (per --backend)",
+        "diagWindow": "  Vorschau / Nachlauf:  %d min / %d s",
+        "diagLead": "  Alarm-Vorlauf:        %d s",
+        "diagRefresh": "  Netz-Refresh:         alle %d s",
+        "diagIcsSources": "  ICS-Quellen:          %d konfiguriert",
+        "diagPackages": "Pakete  (linke Spalte = pacman-Paketname)",
+        "diagOk": "ok",
+        "diagMissing": "FEHLT",
+        "diagIcsOnly": "%s (nur Backend ics)",
+        "diagTypelibPath": "  Typelib-Suchpfad: %s",
+        "gobjectMissing": "python-gobject fehlt",
+        "alsoChecked": " (auch %s geprüft)",
+        "presentNotLoadable": "%s vorhanden, aber nicht ladbar%s",
+        "fileMissing": "%s fehlt%s",
+        "notInstalled": "nicht installiert",
+        "present": "vorhanden",
+        "goaFileMissing": "%s fehlt",
+        "goaUnreadable": "nicht lesbar (%s)",
+        "goaTotal": "%d GOA-Konto/-Konten insgesamt",
+        "diagGoogle": "Google-Konto (GNOME Online Accounts)",
+        "diagGoogleAccounts": "  Google-Konten:        %d  (%s)",
+        "diagCalendars": "Kalender",
+        "calNotCheckable": "  nicht prüfbar: %s",
+        "calQueryFailed": "  Abfrage fehlgeschlagen: %s",
+        "calAccounts": "  Google-Konten:        %d",
+        "calEnabled": "  Kalender aktiviert:   %d",
+        "calExcluded": "  davon ausgeschlossen: %d",
+        "calIdentities": "  eigene Adressen:      %d (für skip_declined)",
+        "diagCache": "Cache",
+        "cacheFile": "  Datei:                %s",
+        "cacheAbsent": "  Zustand:              noch nicht vorhanden",
+        "cacheMode": "  Rechte:               %04o (Verzeichnis %04o, erwartet 0600 / 0700)",
+        "cacheAge": "  Alter:                %s",
+        "cacheContent": "  Inhalt:               unlesbar oder kein JSON-Objekt",
+        "cacheSchema": "  Schema / Backend:     %s / %s",
+        "cacheStatus": "  Status:               %s%s",
+        "staleSuffix": " (stale)",
+        "cacheError": "  Fehler:               %s",
+        "cacheWarning": "  Warnung:              %s",
+        "cacheCount": "  Termine im Cache:     %d",
+        "cacheSync": "  Letzter Netz-Sync:    %s (Versuch)",
+        "cacheSyncOk": "  Letzter Erfolg:       %s",
+        "ago": "%s her",
+        "never": "nie",
+        "diagJoin": "Beitritts-URL: welcher Pfad greift (ohne URL-Inhalt)",
+        "joinBackendError": "  Backend-Fehler: %s",
+        "joinUnexpected": "  unerwarteter Fehler: %s: %s",
+        "joinNote": "  Hinweis: %s",
+        "joinEvent": "  Termin %d: %s%s",
+        "joinNoUrl": "  (keine Beitritts-URL)",
+        "joinNone": "  keine anstehenden Termine im Fenster",
+        "joinCount": "  (%d Termine im Fenster, angezeigt: %d)",
+    },
+    "en": {
+        "cfgUnreadable": "Config %s is unreadable (%s) – using defaults.",
+        "cfgNotObject": "Config %s is not a JSON object – using defaults.",
+        "cfgInvalid": "Invalid values in %s: %s – defaults apply there.",
+        "cfgLookaheadCap": "lookahead_minutes is capped at %d min (30 days).",
+        "cfgGraceCap": "grace_seconds is capped at %d s (6 hours).",
+        "untitled": "(untitled)",
+        "injectTitle": "TEST meeting (OMeetingBar)",
+        "injectLocation": "Home office",
+        "injectOutsideWindow": "The --in-seconds test event lies beyond lookahead_minutes and is not delivered.",
+        "injectExpired": "The --in-seconds test event is already past grace_seconds and was discarded.",
+        "demoStandup": "Daily Standup",
+        "demoSprintReview": "Sprint Review",
+        "demoPartner": "Partner sync",
+        "demoOneOnOne": "1:1 with the team lead",
+        "demoVacation": "Vacation (colleague)",
+        "demoCustomer": "Customer call",
+        "demoCommunity": "Community call",
+        "demoRoom": "Meeting room 2",
+        "networkError": "Network error (%s)",
+        "icsNoUrls": "Backend 'ics' is active but 'ics_urls' is empty. Add the private iCal link from Google Calendar there – or better, use \"backend\": \"eds\".",
+        "icsPackagesMissing": "Python packages for the ICS backend are missing (%s). Install: %s – or use \"backend\": \"eds\".",
+        "srcHttpsOnly": "Source %d: https only",
+        "srcBudget": "Source %d: time budget spent",
+        "srcDetail": "Source %d: %s",
+        "srcUnparseable": "Source %d: unparseable (%s)",
+        "srcCapped": "Source %d: more than %d events in the window, truncated",
+        "srcBroken": "Source %d: %d entries unparseable",
+        "icsNoneReadable": "No ICS feed readable – %s",
+        "icsProblems": "ICS problems: %s",
+        "giMissing": "Python module 'gi' is missing – install: sudo pacman -S python-gobject",
+        "typelibsMissing": "Calendar libraries are missing: %s (from %s). Install them, then add a Google account in GNOME Online Accounts (%s): %s",
+        "typelibName": "%s typelib",
+        "edsUnusable": "evolution-data-server is not usable (%s). Install: %s",
+        "registryDown": "Evolution Data Server is not responding (%s). Check the service: systemctl --user status evolution-source-registry",
+        "noGoogleAccount": "No Google account found. Add one in GNOME Online Accounts: %s",
+        "noEnabledCalendar": "Google account present but no calendar enabled – switch on Calendar in GNOME Online Accounts: %s",
+        "skipDeclinedNoIdentity": "skip_declined is on, but the account carries no own address – declined meetings still trigger an alert.",
+        "calendarLabel": "Calendar %d",
+        "calCapped": "%s: more than %d events in the window, list truncated.",
+        "syncFailed": "Calendar sync failed – using the local copy.",
+        "syncPartial": "Calendar sync partly failed (%d of %d).",
+        "syncStale": "Last successful calendar sync %s ago – meetings may be outdated.",
+        "carried": "%d events carried over from the previous run",
+        "calendarsUnreadable": "Calendars unreadable – %s",
+        "partialFailure": "Partly failed: %s",
+        "unexpectedBackendError": "Unexpected error in backend '%s' (%s: %s).",
+        "maxEvents": "Only the first %d events are delivered.",
+        # --diagnose
+        "diagTitle": "OMeetingBar – readiness check",
+        "diagEnv": "Environment",
+        "diagTime": "  Time:                 %s (%s)",
+        "diagPython": "  Python:               %s (%s)",
+        "diagConfig": "Configuration",
+        "diagFile": "  File:                 %s%s",
+        "diagMissingSuffix": "  (missing)",
+        "diagProblem": "  PROBLEM:              %s",
+        "diagBackend": "  Backend:              %s%s",
+        "diagViaFlag": "  (via --backend)",
+        "diagWindow": "  Lookahead / grace:    %d min / %d s",
+        "diagLead": "  Alert lead:           %d s",
+        "diagRefresh": "  Network refresh:      every %d s",
+        "diagIcsSources": "  ICS sources:          %d configured",
+        "diagPackages": "Packages  (left column = pacman package name)",
+        "diagOk": "ok",
+        "diagMissing": "MISSING",
+        "diagIcsOnly": "%s (ics backend only)",
+        "diagTypelibPath": "  Typelib search path: %s",
+        "gobjectMissing": "python-gobject missing",
+        "alsoChecked": " (also checked %s)",
+        "presentNotLoadable": "%s present but not loadable%s",
+        "fileMissing": "%s missing%s",
+        "notInstalled": "not installed",
+        "present": "present",
+        "goaFileMissing": "%s missing",
+        "goaUnreadable": "unreadable (%s)",
+        "goaTotal": "%d GOA account(s) in total",
+        "diagGoogle": "Google account (GNOME Online Accounts)",
+        "diagGoogleAccounts": "  Google accounts:      %d  (%s)",
+        "diagCalendars": "Calendars",
+        "calNotCheckable": "  not checkable: %s",
+        "calQueryFailed": "  query failed: %s",
+        "calAccounts": "  Google accounts:      %d",
+        "calEnabled": "  Calendars enabled:    %d",
+        "calExcluded": "  of those excluded:    %d",
+        "calIdentities": "  own addresses:        %d (for skip_declined)",
+        "diagCache": "Cache",
+        "cacheFile": "  File:                 %s",
+        "cacheAbsent": "  State:                not present yet",
+        "cacheMode": "  Mode:                 %04o (directory %04o, expected 0600 / 0700)",
+        "cacheAge": "  Age:                  %s",
+        "cacheContent": "  Content:              unreadable or not a JSON object",
+        "cacheSchema": "  Schema / backend:     %s / %s",
+        "cacheStatus": "  Status:               %s%s",
+        "staleSuffix": " (stale)",
+        "cacheError": "  Error:                %s",
+        "cacheWarning": "  Warning:              %s",
+        "cacheCount": "  Events in cache:      %d",
+        "cacheSync": "  Last network sync:    %s (attempt)",
+        "cacheSyncOk": "  Last success:         %s",
+        "ago": "%s ago",
+        "never": "never",
+        "diagJoin": "Join URL: which path matched (no URL content)",
+        "joinBackendError": "  Backend error: %s",
+        "joinUnexpected": "  unexpected error: %s: %s",
+        "joinNote": "  Note: %s",
+        "joinEvent": "  Event %d: %s%s",
+        "joinNoUrl": "  (no join URL)",
+        "joinNone": "  no upcoming events in the window",
+        "joinCount": "  (%d events in the window, shown: %d)",
+    },
+}
+
+
+def pick_language(override, environ):
+    """"de" or "en". `override` is omeetingbar.json's `language`; anything but
+    "de"/"en" ("auto", a missing key) defers to the first locale variable set."""
+    wanted = str(override or "").strip().lower()
+    if wanted in ("de", "en"):
+        return wanted
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = environ.get(key) or ""
+        if value:
+            return "de" if value.lower().startswith("de") else "en"
+    return "en"
+
+
+# From the environment until main() has read the config; load_config's own
+# warnings therefore follow the session locale.
+LANGUAGE = pick_language("", os.environ)
+
+
+def _(key, *args):
+    text = MESSAGES.get(LANGUAGE, MESSAGES["en"]).get(key)
+    if text is None:
+        text = MESSAGES["en"].get(key, key)
+    return text % args if args else text
 
 # Namespace -> versions to try, most likely first. Arch ships ICalGLib 4.0 ONLY,
 # and it comes from libical, not from evolution-data-server:
@@ -257,11 +518,9 @@ def load_config(path):
     except FileNotFoundError:
         return config, ""
     except (OSError, ValueError) as exc:
-        return config, ("Konfiguration %s ist nicht lesbar (%s) – "
-                        "es gelten Standardwerte." % (path, _short(exc, 80)))
+        return config, _("cfgUnreadable", path, _short(exc, 80))
     if not isinstance(raw, dict):
-        return config, ("Konfiguration %s ist kein JSON-Objekt – "
-                        "es gelten Standardwerte." % path)
+        return config, _("cfgNotObject", path)
 
     rejected = []
     for key, default in DEFAULTS.items():
@@ -287,14 +546,12 @@ def load_config(path):
 
     warnings = []
     if rejected:
-        warnings.append("Ungültige Werte in %s: %s – dort gelten Standardwerte."
-                        % (path, ", ".join(sorted(set(rejected)))))
+        warnings.append(_("cfgInvalid", path, ", ".join(sorted(set(rejected)))))
     if config["lookahead_minutes"] > MAX_LOOKAHEAD_MINUTES:
-        warnings.append("lookahead_minutes ist auf %d min (30 Tage) begrenzt."
-                        % MAX_LOOKAHEAD_MINUTES)
+        warnings.append(_("cfgLookaheadCap", MAX_LOOKAHEAD_MINUTES))
         config["lookahead_minutes"] = MAX_LOOKAHEAD_MINUTES
     if config["grace_seconds"] > MAX_GRACE_SECONDS:
-        warnings.append("grace_seconds ist auf %d s (6 Stunden) begrenzt." % MAX_GRACE_SECONDS)
+        warnings.append(_("cfgGraceCap", MAX_GRACE_SECONDS))
         config["grace_seconds"] = MAX_GRACE_SECONDS
     return config, " ".join(warnings)
 
@@ -327,7 +584,7 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
         end = start
     return {
         "id": event_id(uid, start, title),
-        "title": _short(title or "(ohne Titel)", 200),
+        "title": _short(title or _("untitled"), 200),
         "start": start,
         "end": end,
         "all_day": bool(all_day),
@@ -562,9 +819,7 @@ def _unlink(path):
 
 INJECT_BASENAME = "inject.json"
 INJECT_UID = "omeetingbar-inject"
-INJECT_TITLE = "TEST-Termin (OMeetingBar)"
 INJECT_CALENDAR = "Test"
-INJECT_LOCATION = "Arbeitszimmer"
 INJECT_URL = "https://meet.google.com/tst-test-tst"
 INJECT_DURATION_SECONDS = 1800
 
@@ -594,7 +849,7 @@ def write_inject(path, now, in_seconds):
     start = int(now) + int(in_seconds)
     write_cache(path, {
         "id": event_id(INJECT_UID, start),
-        "title": INJECT_TITLE,
+        "title": _("injectTitle"),
         "start": start,
         "end": start + INJECT_DURATION_SECONDS,
         "url": INJECT_URL,
@@ -614,10 +869,10 @@ def load_inject(path, now, grace):
     if now - start > max(grace, 0):
         _unlink(path)
         return None
-    event = make_event(INJECT_UID, str(marker.get("title") or INJECT_TITLE), start,
+    event = make_event(INJECT_UID, str(marker.get("title") or _("injectTitle")), start,
                        _int(marker.get("end"), start), False,
                        clean_url(str(marker.get("url") or "")), INJECT_CALENDAR,
-                       INJECT_LOCATION, "inject")
+                       _("injectLocation"), "inject")
     if isinstance(marker.get("id"), str) and marker["id"]:
         event["id"] = marker["id"]
     return event
@@ -636,8 +891,7 @@ def merge_inject(events, injected, config, now, window_end):
     in the signature for the callers' sake."""
     events = [event for event in events if event["id"] != injected["id"]]
     if injected["start"] >= window_end:
-        return events, ("Der Testtermin aus --in-seconds liegt außerhalb von "
-                        "lookahead_minutes und wird nicht ausgeliefert.")
+        return events, _("injectOutsideWindow")
     return sorted(events + [injected], key=lambda event: (event["start"], event["id"])), ""
 
 
@@ -645,17 +899,18 @@ def merge_inject(events, injected, config, now, window_end):
 
 DEMO_CALENDAR = "Demo"
 
-# days from today, (hour, minute), minutes, title, link text, location, all-day.
-# The link is handed to pick_join_url as if it were the invite body, so the demo
-# exercises the same extraction path the real backends use.
+# days from today, (hour, minute), minutes, title key, link text, location key,
+# all-day. Titles and locations are MESSAGES keys so the demo speaks the UI
+# language; the link is handed to pick_join_url as if it were the invite body,
+# so the demo exercises the same extraction path the real backends use.
 DEMO_SCHEDULE = (
-    (0, (9, 30), 15, "Daily Standup", "Beitreten: https://meet.google.com/aaa-bbbb-ccc", "", False),
-    (0, (14, 0), 60, "Sprint Review", "Video: https://meet.google.com/ddd-eeee-fff", "", False),
-    (0, (11, 0), 30, "Partner-Abstimmung", "https://teams.microsoft.com/l/meetup-join/demo", "", False),
-    (0, (16, 30), 30, "1:1 mit der Teamleitung", "", "Besprechungsraum 2", False),
-    (0, (0, 0), 1440, "Urlaub (Kollegin)", "", "", True),
-    (1, (11, 0), 45, "Kundencall", "https://example.zoom.us/j/1234567890", "", False),
-    (1, (15, 0), 30, "Community-Call", "Raum: https://meet.jit.si/omeetingbar-demo", "", False),
+    (0, (9, 30), 15, "demoStandup", "Join: https://meet.google.com/aaa-bbbb-ccc", "", False),
+    (0, (14, 0), 60, "demoSprintReview", "Video: https://meet.google.com/ddd-eeee-fff", "", False),
+    (0, (11, 0), 30, "demoPartner", "https://teams.microsoft.com/l/meetup-join/demo", "", False),
+    (0, (16, 30), 30, "demoOneOnOne", "", "demoRoom", False),
+    (0, (0, 0), 1440, "demoVacation", "", "", True),
+    (1, (11, 0), 45, "demoCustomer", "https://example.zoom.us/j/1234567890", "", False),
+    (1, (15, 0), 30, "demoCommunity", "Room: https://meet.jit.si/omeetingbar-demo", "", False),
 )
 
 
@@ -670,14 +925,17 @@ def demo_events(now):
     event any longer: it is a marker file that every backend merges in."""
     events = []
     today = datetime.date.fromtimestamp(now)
-    for offset, (hour, minute), minutes, title, link, location, all_day in DEMO_SCHEDULE:
+    for offset, (hour, minute), minutes, title_key, link, location_key, all_day in DEMO_SCHEDULE:
         day = today + datetime.timedelta(days=offset)
         start = _local_epoch(day, hour, minute)
+        location = _(location_key) if location_key else ""
         url, path = pick_join_url("", "", location, link)
-        # The uid is date-free: the start already varies per day, and the id
-        # mixes both, so ids stay stable within a day and differ across days.
-        uid = "omeetingbar-demo-%s" % re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
-        events.append(make_event(uid, title, start, start + minutes * 60, all_day,
+        # The uid is date-free and language-free (built from the key, not the
+        # title): the start already varies per day, and the id mixes both, so
+        # ids stay stable within a day, differ across days, and survive a
+        # language switch.
+        uid = "omeetingbar-demo-%s" % re.sub(r"[^a-z0-9]+", "-", title_key.lower()).strip("-")
+        events.append(make_event(uid, _(title_key), start, start + minutes * 60, all_day,
                                  url, DEMO_CALENDAR, location, path))
     return events
 
@@ -703,7 +961,7 @@ def _network_detail(exc):
     if isinstance(exc, urllib.error.URLError):
         reason = getattr(exc, "reason", None)
         detail = getattr(reason, "strerror", None) or type(reason).__name__
-        return "Netzwerkfehler (%s)" % _short(detail, 60)
+        return _("networkError", _short(detail, 60))
     return type(exc).__name__
 
 
@@ -778,17 +1036,13 @@ def read_ics(config, window_start, window_end):
     Feed URLs are secrets: failures are reported by list position only."""
     urls = [url.strip() for url in config["ics_urls"] if isinstance(url, str) and url.strip()]
     if not urls:
-        raise BackendError(
-            "Backend 'ics' ist aktiv, aber 'ics_urls' ist leer. Privaten iCal-Link "
-            "aus Google Kalender dort eintragen – oder besser \"backend\": \"eds\" nutzen.")
+        raise BackendError(_("icsNoUrls"))
     try:
         import icalendar
         import recurring_ical_events
     except ImportError as exc:
-        raise BackendError(
-            "Python-Pakete für das ICS-Backend fehlen (%s). Installieren: %s – "
-            "oder \"backend\": \"eds\" nutzen."
-            % (getattr(exc, "name", None) or "icalendar", ICS_PACKAGES)) from None
+        raise BackendError(_("icsPackagesMissing", getattr(exc, "name", None) or "icalendar",
+                             ICS_PACKAGES)) from None
 
     utc = datetime.timezone.utc
     from_time = datetime.datetime.fromtimestamp(window_start, tz=utc)
@@ -802,29 +1056,28 @@ def read_ics(config, window_start, window_end):
     deadline = time.monotonic() + ICS_BUDGET_SECONDS
     for index, url in enumerate(urls, start=1):
         if url[:8].lower() != "https://":
-            failures.append("Quelle %d: nur https ist erlaubt" % index)
+            failures.append(_("srcHttpsOnly", index))
             continue
         remaining = deadline - time.monotonic()
         if remaining < 1:
-            failures.append("Quelle %d: Zeitbudget erschöpft" % index)
+            failures.append(_("srcBudget", index))
             continue
         try:
             text = _http_get_ics(url, min(ICS_TIMEOUT_SECONDS, remaining))
         except Exception as exc:
-            failures.append("Quelle %d: %s" % (index, _network_detail(exc)))
+            failures.append(_("srcDetail", index, _network_detail(exc)))
             continue
         try:
             calendar = icalendar.Calendar.from_ical(text)
             name = _ics_text(calendar, "X-WR-CALNAME") or "ICS %d" % index
             occurrences = recurring_ical_events.of(calendar).between(from_time, to_time)
         except Exception as exc:
-            failures.append("Quelle %d: nicht auswertbar (%s)" % (index, type(exc).__name__))
+            failures.append(_("srcUnparseable", index, type(exc).__name__))
             continue
         broken = 0
         for count, component in enumerate(occurrences, start=1):
             if count > MAX_INSTANCES_PER_CALENDAR:
-                failures.append("Quelle %d: mehr als %d Termine im Fenster, gekürzt"
-                                % (index, MAX_INSTANCES_PER_CALENDAR))
+                failures.append(_("srcCapped", index, MAX_INSTANCES_PER_CALENDAR))
                 break
             # One malformed component must not take the rest of its feed down.
             try:
@@ -835,11 +1088,11 @@ def read_ics(config, window_start, window_end):
             if event is not None:
                 events.append(event)
         if broken:
-            failures.append("Quelle %d: %d Einträge nicht auswertbar" % (index, broken))
+            failures.append(_("srcBroken", index, broken))
 
     if failures and not events:
-        raise BackendError("Kein ICS-Feed lesbar – " + "; ".join(failures))
-    return events, ("ICS-Probleme: " + "; ".join(failures)) if failures else ""
+        raise BackendError(_("icsNoneReadable", "; ".join(failures)))
+    return events, _("icsProblems", "; ".join(failures)) if failures else ""
 
 
 # --- backend: eds (default) -------------------------------------------------
@@ -853,8 +1106,7 @@ def import_eds():
     try:
         import gi
     except ImportError:
-        raise BackendError("Python-Modul 'gi' fehlt – installieren: "
-                           "sudo pacman -S python-gobject") from None
+        raise BackendError(_("giMissing")) from None
 
     missing = []
     for namespace, versions in EDS_NAMESPACES:
@@ -868,18 +1120,14 @@ def import_eds():
             missing.append(namespace)
     if missing:
         packages = sorted({typelib_package(namespace) for namespace in missing})
-        raise BackendError(
-            "Kalender-Bibliotheken fehlen: %s (aus %s). Installieren, dann ein "
-            "Google-Konto in GNOME Online Accounts anlegen (%s): %s"
-            % (", ".join("%s-Typelib" % namespace for namespace in missing),
-               ", ".join(packages), GOA_DIALOG, EDS_PACKAGES))
+        raise BackendError(_("typelibsMissing",
+                             ", ".join(_("typelibName", namespace) for namespace in missing),
+                             ", ".join(packages), GOA_DIALOG, EDS_PACKAGES))
 
     try:
         from gi.repository import ECal, EDataServer, Gio, GLib, ICalGLib
     except (ImportError, ValueError) as exc:
-        raise BackendError(
-            "evolution-data-server ist nicht nutzbar (%s). Installieren: %s"
-            % (_short(exc, 80), EDS_PACKAGES)) from None
+        raise BackendError(_("edsUnusable", _short(exc, 80), EDS_PACKAGES)) from None
     return EDataServer, ECal, ICalGLib, GLib, Gio
 
 
@@ -1126,9 +1374,7 @@ def open_registry(eds, glib):
     try:
         return eds.SourceRegistry.new_sync(None)
     except glib.Error as exc:
-        raise BackendError("Evolution Data Server antwortet nicht (%s). Dienst prüfen: "
-                           "systemctl --user status evolution-source-registry"
-                           % _short(getattr(exc, "message", exc), 80)) from None
+        raise BackendError(_("registryDown", _short(getattr(exc, "message", exc), 80))) from None
 
 
 def read_eds(config, now, window_start, window_end, cache, cache_path, force_refresh):
@@ -1147,12 +1393,10 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
     # else.
     roots = google_collection_roots(registry)
     if not roots:
-        raise BackendError("Kein Google-Konto gefunden. In GNOME Online Accounts anlegen: %s"
-                           % GOA_DIALOG)
+        raise BackendError(_("noGoogleAccount", GOA_DIALOG))
     sources = calendar_sources(registry, roots)
     if not sources:
-        raise BackendError("Google-Konto vorhanden, aber kein aktivierter Kalender – "
-                           "Kalender in GNOME Online Accounts einschalten: %s" % GOA_DIALOG)
+        raise BackendError(_("noEnabledCalendar", GOA_DIALOG))
 
     warnings = []
     # Resolved regardless of skip_declined: the identities feed the `declined`
@@ -1164,9 +1408,7 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
         # Without an own address there is nothing to compare ATTENDEE against, so
         # the filter silently does nothing and declined meetings still raise a
         # fullscreen alert. That has to be visible, not silent.
-        warnings.append("skip_declined ist aktiv, aber im Konto ist keine eigene "
-                        "Adresse hinterlegt – abgelehnte Termine lösen weiterhin "
-                        "einen Alarm aus.")
+        warnings.append(_("skipDeclinedNoIdentity"))
     excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
 
     # EDS's own refresh interval defaults to 60 minutes, which is far too coarse
@@ -1200,7 +1442,7 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
         # Calendars are named by position in anything user-facing: display
         # names are often an address or a colleague's name, and these strings
         # reach the widget tooltip and `omeetingbar status`.
-        label = "Kalender %d" % index
+        label = _("calendarLabel", index)
         try:
             client = ecal.Client.connect_sync(source, ecal.ClientSourceType.EVENTS,
                                               CONNECT_TIMEOUT_SECONDS, None)
@@ -1245,8 +1487,7 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
             failures.append("%s (%s)" % (label, problem))
             failed_names.add(name)
         if capped:
-            warnings.append("%s: mehr als %d Termine im Fenster, Liste gekürzt."
-                            % (label, MAX_INSTANCES_PER_CALENDAR))
+            warnings.append(_("calCapped", label, MAX_INSTANCES_PER_CALENDAR))
 
     # A refresh that keeps failing (revoked token, VPN down) used to be
     # invisible: EDS served its old local copy as `status: "ok"` with a fresh
@@ -1255,14 +1496,12 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
         if refresh_tried == 0 or refresh_failed == 0:
             refresh_ok_at = now  # nothing to refresh, or all of it worked
         elif refresh_failed == refresh_tried:
-            warnings.append("Kalender-Sync fehlgeschlagen – es gilt die lokale Kopie.")
+            warnings.append(_("syncFailed"))
         else:
             refresh_ok_at = now
-            warnings.append("Kalender-Sync teilweise fehlgeschlagen (%d von %d)."
-                            % (refresh_failed, refresh_tried))
+            warnings.append(_("syncPartial", refresh_failed, refresh_tried))
     if refresh_ok_at and now - refresh_ok_at > REFRESH_STALE_SECONDS:
-        warnings.append("Letzter erfolgreicher Kalender-Sync vor %s – Termine können "
-                        "veraltet sein." % human_delta(now - refresh_ok_at))
+        warnings.append(_("syncStale", human_delta(now - refresh_ok_at)))
 
     if failed_names:
         # A calendar that failed this run keeps its last known events instead of
@@ -1276,11 +1515,11 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
                 events.append(event)
                 carried += 1
         if carried:
-            failures.append("%d Termine aus dem letzten Lauf übernommen" % carried)
+            failures.append(_("carried", carried))
 
     if failures and not events:
-        raise BackendError("Kalender nicht lesbar – " + "; ".join(failures))
-    failure = ("Teilweise fehlgeschlagen: " + "; ".join(failures)) if failures else ""
+        raise BackendError(_("calendarsUnreadable", "; ".join(failures)))
+    failure = _("partialFailure", "; ".join(failures)) if failures else ""
     return events, refreshed_at, failure, warnings, refresh_ok_at
 
 
@@ -1345,7 +1584,7 @@ def typelib_state(namespace, versions):
     try:
         import gi
     except ImportError:
-        return False, "python-gobject fehlt"
+        return False, _("gobjectMissing")
     for version in versions:
         try:
             gi.require_version(namespace, version)
@@ -1355,32 +1594,32 @@ def typelib_state(namespace, versions):
     # versions[0] is the version this machine is expected to have (ICalGLib 4.0
     # from libical); the rest are only fallbacks and are named as such.
     wanted = "%s-%s.typelib" % (namespace, versions[0])
-    also = (" (auch %s geprüft)" % ", ".join(versions[1:])) if len(versions) > 1 else ""
+    also = _("alsoChecked", ", ".join(versions[1:])) if len(versions) > 1 else ""
     on_disk = any(os.path.exists(os.path.join(path, "%s-%s.typelib" % (namespace, version)))
                   for path in typelib_search_paths() for version in versions)
     if on_disk:
-        return False, "%s vorhanden, aber nicht ladbar%s" % (wanted, also)
-    return False, "%s fehlt%s" % (wanted, also)
+        return False, _("presentNotLoadable", wanted, also)
+    return False, _("fileMissing", wanted, also)
 
 
 def module_state(name):
     try:
         module = __import__(name)
     except ImportError:
-        return False, "nicht installiert"
-    return True, str(getattr(module, "__version__", "") or "vorhanden")
+        return False, _("notInstalled")
+    return True, str(getattr(module, "__version__", "") or _("present"))
 
 
 def goa_google_accounts():
     """-> (google count, detail). Reads GOA's own config file, so this works
     without the Goa typelib. Only counts are reported, never addresses."""
     if not os.path.exists(GOA_ACCOUNTS_PATH):
-        return 0, "%s fehlt" % GOA_ACCOUNTS_PATH
+        return 0, _("goaFileMissing", GOA_ACCOUNTS_PATH)
     parser = configparser.ConfigParser(interpolation=None)
     try:
         parser.read(GOA_ACCOUNTS_PATH, encoding="utf-8")
     except (configparser.Error, OSError, UnicodeDecodeError) as exc:
-        return 0, "nicht lesbar (%s)" % type(exc).__name__
+        return 0, _("goaUnreadable", type(exc).__name__)
     total = google = 0
     for section in parser.sections():
         if not section.startswith("Account"):
@@ -1388,7 +1627,7 @@ def goa_google_accounts():
         total += 1
         if (parser.get(section, "Provider", fallback="") or "").strip().lower() == "google":
             google += 1
-    return google, "%d GOA-Konto/-Konten insgesamt" % total
+    return google, _("goaTotal", total)
 
 
 def diagnose_calendars(config):
@@ -1396,55 +1635,50 @@ def diagnose_calendars(config):
         eds, _ecal, _ical, glib, _gio = import_eds()
         registry = open_registry(eds, glib)
     except BackendError as exc:
-        return ["  nicht prüfbar: %s" % exc.message]
+        return [_("calNotCheckable", exc.message)]
     try:
         roots = google_collection_roots(registry)
         sources = calendar_sources(registry, roots)
     except Exception as exc:
-        return ["  Abfrage fehlgeschlagen: %s" % _short(exc, 80)]
+        return [_("calQueryFailed", _short(exc, 80))]
     excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
     skipped = sum(1 for source in sources if calendar_excluded(source, excluded))
     return [
-        "  Google-Konten:        %d" % len(roots),
-        "  Kalender aktiviert:   %d" % len(sources),
-        "  davon ausgeschlossen: %d" % skipped,
-        "  eigene Adressen:      %d (für skip_declined)" % len(account_identities(roots)),
+        _("calAccounts", len(roots)),
+        _("calEnabled", len(sources)),
+        _("calExcluded", skipped),
+        _("calIdentities", len(account_identities(roots))),
     ]
 
 
 def diagnose_cache(path, cache, now):
-    lines = ["  Datei:                %s" % path]
+    lines = [_("cacheFile", path)]
     try:
         info = os.stat(path)
     except OSError:
-        lines.append("  Zustand:              noch nicht vorhanden")
+        lines.append(_("cacheAbsent"))
         return lines
     try:
         dir_mode = os.stat(os.path.dirname(path) or ".").st_mode & 0o777
     except OSError:
         dir_mode = 0
-    lines.append("  Rechte:               %04o (Verzeichnis %04o, erwartet 0600 / 0700)"
-                 % (info.st_mode & 0o777, dir_mode))
-    lines.append("  Alter:                %s" % human_delta(now - int(info.st_mtime)))
+    lines.append(_("cacheMode", info.st_mode & 0o777, dir_mode))
+    lines.append(_("cacheAge", human_delta(now - int(info.st_mtime))))
     if not cache:
-        lines.append("  Inhalt:               unlesbar oder kein JSON-Objekt")
+        lines.append(_("cacheContent"))
         return lines
     refreshed = _int(cache.get("refreshed_at"))
-    lines.append("  Schema / Backend:     %s / %s"
-                 % (cache.get("schema"), cache.get("backend")))
-    lines.append("  Status:               %s%s"
-                 % (cache.get("status"), " (stale)" if cache.get("stale") else ""))
+    lines.append(_("cacheSchema", cache.get("schema"), cache.get("backend")))
+    lines.append(_("cacheStatus", cache.get("status"), _("staleSuffix") if cache.get("stale") else ""))
     if cache.get("error"):
-        lines.append("  Fehler:               %s" % _short(cache.get("error"), 200))
+        lines.append(_("cacheError", _short(cache.get("error"), 200)))
     if cache.get("warning"):
-        lines.append("  Warnung:              %s" % _short(cache.get("warning"), 200))
+        lines.append(_("cacheWarning", _short(cache.get("warning"), 200)))
     events = cache.get("events")
-    lines.append("  Termine im Cache:     %d" % (len(events) if isinstance(events, list) else 0))
-    lines.append("  Letzter Netz-Sync:    %s (Versuch)"
-                 % (human_delta(now - refreshed) + " her" if refreshed else "nie"))
+    lines.append(_("cacheCount", len(events) if isinstance(events, list) else 0))
+    lines.append(_("cacheSync", _("ago", human_delta(now - refreshed)) if refreshed else _("never")))
     refresh_ok = _int(cache.get("refresh_ok_at"))
-    lines.append("  Letzter Erfolg:       %s"
-                 % (human_delta(now - refresh_ok) + " her" if refresh_ok else "nie"))
+    lines.append(_("cacheSyncOk", _("ago", human_delta(now - refresh_ok)) if refresh_ok else _("never")))
     return lines
 
 
@@ -1456,23 +1690,22 @@ def diagnose_join_paths(config, backend, args, now, cache):
         events, _refreshed, failure, warnings, _ok = fetch(config, backend, args, now,
                                                            window_start, window_end, cache)
     except BackendError as exc:
-        return ["  Backend-Fehler: %s" % exc.message]
+        return [_("joinBackendError", exc.message)]
     except Exception as exc:
-        return ["  unerwarteter Fehler: %s: %s" % (type(exc).__name__, _short(exc, 80))]
+        return [_("joinUnexpected", type(exc).__name__, _short(exc, 80))]
     # Since schema 2 the agenda starts at local midnight, so without this the
     # report would describe the morning's finished meetings and never reach
     # the one being diagnosed.
     events = [event for event in apply_filters(events, config, now, window_end)
               if max(event["end"], event["start"]) > now]
-    lines = ["  Hinweis: %s" % note for note in ([failure] if failure else []) + warnings]
+    lines = [_("joinNote", note) for note in ([failure] if failure else []) + warnings]
     for index, event in enumerate(events[:MAX_DIAGNOSE_EVENTS], start=1):
-        lines.append("  Termin %d: %s%s" % (index, event["_join_path"],
-                                            "" if event["url"] else "  (keine Beitritts-URL)"))
+        lines.append(_("joinEvent", index, event["_join_path"],
+                       "" if event["url"] else _("joinNoUrl")))
     if not events:
-        lines.append("  keine anstehenden Termine im Fenster")
+        lines.append(_("joinNone"))
     else:
-        lines.append("  (%d Termine im Fenster, angezeigt: %d)"
-                     % (len(events), min(len(events), MAX_DIAGNOSE_EVENTS)))
+        lines.append(_("joinCount", len(events), min(len(events), MAX_DIAGNOSE_EVENTS)))
     return lines
 
 
@@ -1480,57 +1713,52 @@ def diagnose(args, config, config_warning, out_path, cache, now):
     stamp = datetime.datetime.fromtimestamp(now).astimezone()
     backend = args.backend or config["backend"]
 
-    lines = ["OMeetingBar – Bereitschaftsprüfung", ""]
-    lines.append("Umgebung")
-    lines.append("  Zeit:                 %s (%s)"
-                 % (stamp.strftime("%Y-%m-%d %H:%M:%S"), stamp.tzname()))
-    lines.append("  Python:               %s (%s)"
-                 % (sys.version.split()[0], sys.executable))
+    lines = [_("diagTitle"), ""]
+    lines.append(_("diagEnv"))
+    lines.append(_("diagTime", stamp.strftime("%Y-%m-%d %H:%M:%S"), stamp.tzname()))
+    lines.append(_("diagPython", sys.version.split()[0], sys.executable))
     lines.append("")
 
-    lines.append("Konfiguration")
-    lines.append("  Datei:                %s%s"
-                 % (args.config, "" if os.path.exists(args.config) else "  (fehlt)"))
+    lines.append(_("diagConfig"))
+    lines.append(_("diagFile", args.config, "" if os.path.exists(args.config) else _("diagMissingSuffix")))
     if config_warning:
-        lines.append("  PROBLEM:              %s" % config_warning)
-    lines.append("  Backend:              %s%s"
-                 % (backend, "  (per --backend)" if args.backend else ""))
-    lines.append("  Vorschau / Nachlauf:  %d min / %d s"
-                 % (config["lookahead_minutes"], config["grace_seconds"]))
-    lines.append("  Alarm-Vorlauf:        %d s" % config["alert_lead_seconds"])
-    lines.append("  Netz-Refresh:         alle %d s" % config["refresh_seconds"])
-    lines.append("  ICS-Quellen:          %d konfiguriert" % len(config["ics_urls"]))
+        lines.append(_("diagProblem", config_warning))
+    lines.append(_("diagBackend", backend, _("diagViaFlag") if args.backend else ""))
+    lines.append(_("diagWindow", config["lookahead_minutes"], config["grace_seconds"]))
+    lines.append(_("diagLead", config["alert_lead_seconds"]))
+    lines.append(_("diagRefresh", config["refresh_seconds"]))
+    lines.append(_("diagIcsSources", len(config["ics_urls"])))
     lines.append("")
 
-    lines.append("Pakete  (linke Spalte = pacman-Paketname)")
+    lines.append(_("diagPackages"))
     ok, detail = module_state("gi")
-    lines.append("  %-30s %-6s gi %s" % ("python-gobject", "ok" if ok else "FEHLT", detail))
+    lines.append("  %-30s %-8s gi %s" % ("python-gobject", _("diagOk") if ok else _("diagMissing"), detail))
     for namespace, versions in EDS_NAMESPACES:
         ok, detail = typelib_state(namespace, versions)
-        lines.append("  %-30s %-6s %s"
-                     % (typelib_package(namespace), "ok" if ok else "FEHLT", detail))
+        lines.append("  %-30s %-8s %s"
+                     % (typelib_package(namespace), _("diagOk") if ok else _("diagMissing"), detail))
     for module, package in (("icalendar", "python-icalendar"),
                             ("recurring_ical_events", "python-recurring-ical-events")):
         ok, detail = module_state(module)
-        lines.append("  %-30s %-6s %s (nur Backend ics)"
-                     % (package, "ok" if ok else "FEHLT", detail))
-    lines.append("  Typelib-Suchpfad: %s" % (", ".join(typelib_search_paths()) or "-"))
+        lines.append("  %-30s %-8s %s"
+                     % (package, _("diagOk") if ok else _("diagMissing"), _("diagIcsOnly", detail)))
+    lines.append(_("diagTypelibPath", ", ".join(typelib_search_paths()) or "-"))
     lines.append("")
 
-    lines.append("Google-Konto (GNOME Online Accounts)")
+    lines.append(_("diagGoogle"))
     google, detail = goa_google_accounts()
-    lines.append("  Google-Konten:        %d  (%s)" % (google, detail))
+    lines.append(_("diagGoogleAccounts", google, detail))
     lines.append("")
 
-    lines.append("Kalender")
+    lines.append(_("diagCalendars"))
     lines.extend(diagnose_calendars(config))
     lines.append("")
 
-    lines.append("Cache")
+    lines.append(_("diagCache"))
     lines.extend(diagnose_cache(out_path, cache, now))
     lines.append("")
 
-    lines.append("Beitritts-URL: welcher Pfad greift (ohne URL-Inhalt)")
+    lines.append(_("diagJoin"))
     lines.extend(diagnose_join_paths(config, backend, args, now, cache))
 
     sys.stdout.write("\n".join(lines) + "\n")
@@ -1568,9 +1796,11 @@ def parse_args(argv):
 
 
 def main(argv=None):
+    global LANGUAGE
     args = parse_args(argv)
     now = int(time.time())
     config, config_warning = load_config(args.config)
+    LANGUAGE = pick_language(config.get("language"), os.environ)
     backend = args.backend or config["backend"]
     out_path = args.out or os.path.join(runtime_dir(), CACHE_BASENAME)
     inject_path = inject_path_for(out_path)
@@ -1591,8 +1821,7 @@ def main(argv=None):
     if args.in_seconds is not None and injected is None:
         # write_inject armed it and load_inject spent it in the same run: the
         # start was already more than grace_seconds in the past.
-        warnings.append("Der Testtermin aus --in-seconds liegt bereits außerhalb von "
-                        "grace_seconds und wurde verworfen.")
+        warnings.append(_("injectExpired"))
 
     window_start, window_end = window_for(config, now)
     status, error, failure, stale = "ok", "", "", False
@@ -1612,14 +1841,13 @@ def main(argv=None):
         # A backend bug must still leave a readable cache behind, never a
         # traceback on the service's stderr and an unchanged stale file.
         status = "error"
-        error = ("Unerwarteter Fehler im Backend '%s' (%s: %s)."
-                 % (backend, type(exc).__name__, _scrub(_short(exc, 100))))
+        error = _("unexpectedBackendError", backend, type(exc).__name__, _scrub(_short(exc, 100)))
         events = stale_events(cache, config, now, window_start, window_end)
         stale = bool(events)
         refreshed_at = _int(cache.get("refreshed_at"))
 
     if len(events) > MAX_EVENTS:
-        warnings.append("Nur die ersten %d Termine werden ausgeliefert." % MAX_EVENTS)
+        warnings.append(_("maxEvents", MAX_EVENTS))
         events = events[:MAX_EVENTS]
 
     if failure:

@@ -5,6 +5,7 @@ import QtQuick
 import qs.Commons
 import qs.Ui
 import "Providers.js" as Providers
+import "Strings.js" as Strings
 
 // Fullscreen blanking alert for an imminent meeting. Deliberately not a toast:
 // every monitor is covered by an opaque themed surface, because the user does
@@ -41,6 +42,10 @@ Item {
   // Queue id of the alert on screen, echoed back to the service as the witness
   // that it rendered (Service.overlayShown). Empty for previews and tests.
   property string alertId: ""
+  // UI language, resolved by the service from omeetingbar.json and the session
+  // locale and carried in the payload; a summon without it (test, preview from
+  // the shell) resolves it here the same way.
+  property string lang: Strings.pick("", Qt.locale().name)
   // The overlay takes exclusive keyboard focus the moment it appears, mid-
   // sentence if need be. Keys inside this window after open() are swallowed,
   // so a keystroke already on its way down cannot join a meeting unread.
@@ -176,10 +181,8 @@ Item {
     return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate()
   }
 
-  // Day names are hardcoded German rather than locale-derived: the UI is
-  // German regardless of what LANG the session happens to carry.
-  readonly property var weekdayNames: ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"]
-
+  // Day names come from Strings.js, keyed by the UI language rather than by
+  // the session locale, and the date order with them ("Sa, 04.10." / "Sat, 10/04").
   function dayLabel(epoch, nowMs) {
     if (!(epoch > 0)) return ""
     var d = new Date(epoch * 1000)
@@ -187,23 +190,24 @@ Item {
     if (root.dayKey(d) === root.dayKey(today)) return ""
     var tomorrow = new Date(nowMs)
     tomorrow.setDate(tomorrow.getDate() + 1)
-    if (root.dayKey(d) === root.dayKey(tomorrow)) return "morgen"
-    return root.weekdayNames[d.getDay()] + ", " + root.pad2(d.getDate()) + "." + root.pad2(d.getMonth() + 1) + "."
+    if (root.dayKey(d) === root.dayKey(tomorrow)) return Strings.t(root.lang, "tomorrow")
+    return Strings.t(root.lang, "alertDate", Strings.weekday(root.lang, d.getDay()),
+      root.pad2(d.getDate()), root.pad2(d.getMonth() + 1))
   }
 
   readonly property string countdownText: {
     if (!root.hasStart) return "—"
     var nowSec = root.nowMs / 1000
-    if (root.endEpoch > root.startEpoch && nowSec >= root.endEpoch) return "vorbei"
+    if (root.endEpoch > root.startEpoch && nowSec >= root.endEpoch) return Strings.t(root.lang, "over")
     var delta = Math.round(root.startEpoch - nowSec)
-    if (delta >= 90) return "in " + Math.ceil(delta / 60) + " min"
-    if (delta >= 1) return "in " + delta + " s"
+    if (delta >= 90) return Strings.t(root.lang, "inMin", Math.ceil(delta / 60))
+    if (delta >= 1) return Strings.t(root.lang, "inSec", delta)
     var since = -delta
-    if (since < 60) return "jetzt"
-    return "läuft seit " + Math.floor(since / 60) + " min"
+    if (since < 60) return Strings.t(root.lang, "now")
+    return Strings.t(root.lang, "runningForMin", Math.floor(since / 60))
   }
 
-  readonly property string titleText: root.title || "Termin"
+  readonly property string titleText: root.title || Strings.t(root.lang, "meeting")
 
   readonly property string rangeText: {
     if (!root.hasStart) return ""
@@ -223,14 +227,14 @@ Item {
   // Naming the provider tells the user what Enter is about to open before
   // they press it — a browser tab for Meet, the Zoom client for Zoom.
   readonly property string providerName: root.hasUrl ? Providers.name(root.joinUrl) : ""
-  readonly property string hintText: !root.hasUrl ? "Esc schließen"
-    : (root.providerName !== "" ? "Enter: in " + root.providerName + " beitreten · Esc schließen"
-      : "Enter beitreten · Esc schließen")
+  readonly property string hintText: !root.hasUrl ? Strings.t(root.lang, "hintEsc")
+    : (root.providerName !== "" ? Strings.t(root.lang, "hintEnterVia", root.providerName)
+      : Strings.t(root.lang, "hintEnter"))
 
   readonly property string queuedText: {
     if (root.queuedCount <= 0) return ""
-    if (root.queuedCount === 1) return "Danach folgt noch ein Termin"
-    return "Danach folgen noch " + root.queuedCount + " Termine"
+    if (root.queuedCount === 1) return Strings.t(root.lang, "queuedOne")
+    return Strings.t(root.lang, "queuedN", root.queuedCount)
   }
 
   // ---------------------------------------------------------- host contract
@@ -247,6 +251,7 @@ Item {
     root.calendar = root.cleanText(payload.calendar)
     root.location = root.cleanText(payload.location)
     root.alertId = root.cleanText(payload.id)
+    root.lang = Strings.pick(payload.lang, Qt.locale().name)
     // Missing auto_dismiss means "use the documented config default" rather
     // than "stay forever"; only an explicit 0 pins the alert open. Anything
     // longer than hardDismissSeconds is capped, so the progress bar cannot
