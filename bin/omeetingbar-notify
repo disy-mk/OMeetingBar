@@ -9,9 +9,9 @@ omarchy-notification-send uses, so Omarchy's daemon renders it the same way:
 a string). Prints the notification id (uint32) on stdout.
 
   {"summary": "...", "body": "...", "glyph": "...", "urgency": "critical",
-   "exec": ["<plugin>/bin/omeetingbar-join", "<event id>"],   # optional
-   "replaces_id": 0, "expire_ms": -1,                            # optional
-   "safe": {"summary": "Meeting", "body": "14:00-14:30"}}        # fallback text
+   "exec": ["<plugin>/bin/omeetingbar-join", "<event id>", "<grace seconds>"],  # optional
+   "replaces_id": 0, "expire_ms": -1,                                         # optional
+   "safe": {"summary": "Meeting", "body": "14:00-14:30"}}                     # fallback text
 
 Why stdin: omarchy-notification-send and busctl take the summary, the body and
 the click command as process arguments, and any local user can read those from
@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 # Omarchy's own CLI identity: bypasses Do Not Disturb (the daemon's rule for
-# critical toasts) and is not kept as history noise.
+# critical toasts). Like any toast, it lands in Omarchy's history once shown.
 APP_NAME = "omarchy-action"
 URGENCY = {"low": 0, "normal": 1, "critical": 2}
 POPUP_STATE_DIR = os.path.expanduser("~/.local/state/omarchy/notifications")

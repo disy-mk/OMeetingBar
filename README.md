@@ -21,12 +21,15 @@ around it.
   ("Demnächst"), and footer actions (join, create, refresh, open calendar).
 - **Fullscreen alert** — configurable lead time (default 60 s), auto-dismiss, `Enter` joins the
   meeting in its provider (the hint names it: "in Teams beitreten"), `Esc` dismisses it and
-  silences the sound. It also sends a critical notification, plays a sound and wakes the
-  display, so the alert reaches you even when the overlay cannot (see limits).
-- **Notifications that clean up after themselves** — a meeting's notification closes itself
-  when the meeting ends, so you do not come back from a call taken on your phone to a stack of
-  stale ones. Clicking one joins only while the meeting is on; afterwards a click just closes
-  it. A right click always closes without joining.
+  silences the sound. It also sends a critical notification and plays a sound, so the alert
+  reaches you even when the overlay cannot (see limits). The display is woken once, right
+  before the alert is shown — never under the lock screen.
+- **Notifications that clean up after themselves** — when a meeting ends, its notification is
+  replaced by a short "Meeting ended" (Omarchy shows it for at least 5 s), so you do not come
+  back from a call taken on your phone to a stack of stale ones. A click joins until the
+  meeting ends, also before it starts; afterwards it just closes the toast. A right click
+  always just closes. Toasts sent before a shell restart or reboot (or through the fallback
+  without `python-gobject`) are not taken down; they close on click.
 - **Video providers** — join links from Google Meet, Microsoft Teams, Zoom, Webex, Jitsi
   (meet.jit.si, 8x8.vc), Whereby, GoTo Meeting, Slack Huddles and Discord are recognised in the
   invite's conference data, location or description. Meet, Teams, Slack and Discord show their
@@ -101,14 +104,29 @@ at `~/.local/bin/omeetingbar-fetch`. It ends with a numbered list of the steps o
 4. Test: `omarchy-shell omeetingbar test`, `omarchy-shell omeetingbar status`,
    `omeetingbar-fetch --diagnose`.
 
-No shell restart is needed: the fetcher is a separate process started fresh on every refresh,
-so `omarchy-shell omeetingbar refresh` (or the next interval) picks up the packages and the
-account.
+Installing the packages and connecting the account need no shell restart: the fetcher is a
+separate process started fresh on every refresh, so `omarchy-shell omeetingbar refresh` (or the
+next interval) picks them up. Updating the plugin itself does need one (see Update).
 
 Until the packages are installed (and unless you switched to `demo`) the bar shows a dim
 `󰃭 —` with the reason in its tooltip;
 `omarchy-shell omeetingbar test` shows the fullscreen alert regardless, so you can see it
 before connecting anything.
+
+## Update
+
+```bash
+omarchy plugin update io.github.disy-mk.omeetingbar && omarchy restart shell
+```
+
+Run it while the screen is unlocked: Omarchy refuses to restart a locked shell. The update
+replaces the files, but the running service keeps its old code until the shell restarts.
+`omarchy-shell omeetingbar status | jq -r .version` prints the version that is running. A
+service from before 1.1.0 reports neither `version` nor `restartNeeded`, so `null` there means
+the restart is still due; from 1.1.0 on, `restartNeeded` in the same JSON is `true` while the
+installed version differs from the running one. As long as an old service is still running,
+the bar shows a warning: the fetcher detects it on its next run and asks for the restart in
+the tooltip.
 
 ## Remove
 
@@ -142,8 +160,9 @@ save.
 | `grace_seconds` | `300` | A meeting whose start is at most this long ago still alerts (suspend, lock). Older ones never do. |
 | `sound` | `…/alarm-clock-elapsed.oga` | Played with `pw-play`. Empty string = silent. |
 | `language` | `"auto"` | `"de"`, `"en"` or `"auto"` (session locale: `de*` → German, else English). Bar, popup, alert, notifications and the fetcher's messages follow it; dates and weekday names too. Times stay 24 h. |
-| `notify` | `true` | Also send `omarchy-notification-send -u critical` (bypasses DND). |
-| `wake_display` | `true` | `omarchy-brightness-display on` before the alert. |
+| `notify` | `true` | Also send a critical notification (bypasses DND) through `bin/omeetingbar-notify`, which gets the text on stdin rather than as an argument (Omarchy's daemon still passes it to a bash job when it saves the toast; see privacy). Once the meeting is over it is replaced by a short "Meeting ended". `false` = no notification at all. |
+| `notify_details` | `true` | The notification shows the title plus the location (or the calendar name). `false` = a toast without title, location or calendar name: only "Meeting"/"Termin", the countdown and the time range. See privacy. |
+| `wake_display` | `true` | `omarchy-brightness-display on` once, right before the alert is shown — never under the lock screen. |
 | `skip_all_day` | `true` | Keep all-day entries out of the cache. All-day entries never alert either way. |
 | `skip_declined` | `true` | Declined invitations never alert but are listed, struck through, in the agenda. `false` treats them like any other meeting. |
 | `min_duration_minutes` | `0` | Ignore meetings shorter than this. |
@@ -159,10 +178,11 @@ save.
 - In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
   `Tab` switches to the neighbouring panel.
 - In the alert: `Enter` or `Space` joins, `Esc` (or any other key, or a click) dismisses.
-  Either way the sound stops. Keys in the first second after it appears are ignored, so a
-  keystroke already on its way down cannot join a meeting you have not read yet.
-- On a meeting notification: click joins while the meeting is on (afterwards it only closes),
-  right click closes without joining.
+  Either way the sound stops. Keys and clicks in the first second after it appears are
+  ignored, so input already on its way can neither join a meeting you have not read yet nor
+  clear the alert unread.
+- On a meeting notification: click joins until the meeting ends, also before it starts
+  (afterwards it only closes); right click always just closes.
 - From a keybinding or script:
 
 ```bash
@@ -175,10 +195,11 @@ omeetingbar-fetch --diagnose              # packages, typelibs, GOA accounts, ca
 omeetingbar-fetch --in-seconds 90         # inject a test meeting 90 s out → real alert at T-60
 ```
 
-Hyprland example — `~/.config/hypr/bindings.lua`:
+Hyprland example — `~/.config/hypr/bindings.lua` (`SUPER + SHIFT + M` is Omarchy's Music key,
+`SUPER + CTRL + M` is free):
 
 ```lua
-o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
+o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda toggle")
 ```
 
 ## Troubleshooting
@@ -198,18 +219,27 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
   check your setup before connecting a work account.
 - The event cache lives in `$XDG_RUNTIME_DIR/omeetingbar/` (tmpfs, mode 0600, gone on
   reboot) and holds only title, times, join URL, calendar name and location — no attendees,
-  no descriptions. Nothing from the calendar is ever written to the journal, and
-  `omarchy-shell omeetingbar status` prints ids and times, never titles.
-- The critical notification does carry the meeting's title and location, and Omarchy keeps
-  dismissed notifications in its history (`~/.local/state/omarchy/notifications/`) — that much
-  outlives a reboot. Set `notify` to `false` if you do not want that.
-- Nothing from your calendar appears on a command line, where any local user could read it from
-  `/proc`: notifications go to a small helper over stdin, the click action carries only the
-  event id, and the join link leaves the 0600 cache only when the browser is launched with it.
-  Without `python-gobject` the helper falls back to a content-free toast (time only).
+  no descriptions. `omarchy-shell omeetingbar status` prints ids and times, never titles.
+- The plugin writes nothing from the calendar to the journal. One exception: joining hands the
+  link to Omarchy's launcher, which logs the browser command line — link and passcode
+  included — to the persistent user journal.
+- A meeting's toast shows its title plus the location — or, without one, the calendar name,
+  which is often an account address. Omarchy's notification daemon briefly passes that text to
+  a bash job as an argument when it saves the toast, and keeps open toasts under
+  `~/.local/state/omarchy/notifications/`, where they survive a reboot. A toast replaced by
+  "Meeting ended" reaches Omarchy's history without content; one you closed or clicked earlier
+  keeps its text there — on disk under `~/.local/state/omarchy/notifications/history/`, the
+  newest 10, across reboots (`omarchy-shell notifications clear` empties it). Set `notify_details` to
+  `false` to send toasts without meeting content (only "Meeting"/"Termin", the countdown and
+  the time range), or `notify` to `false` to send none. The join URL never reaches the daemon.
+- The plugin's own processes never carry calendar content in their arguments, where any local
+  user could read it from `/proc`: notifications go to a small helper over stdin, the click
+  action carries only the event id and the grace window, and the join link leaves the 0600
+  cache only when the browser is launched with it. Without `python-gobject` the helper falls
+  back to a content-free toast (time only).
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
-- The fullscreen alert ignores keys for its first second, so a keystroke in flight cannot join a
-  meeting from an invite you have not seen. Alerts are bounded: at most 8 wait in the queue, at
+- The fullscreen alert ignores keys and clicks for its first second, so input in flight can
+  neither join a meeting from an invite you have not seen nor clear the alert unread. Alerts are bounded: at most 8 wait in the queue, at
   most 3 meetings per minute get their own notification (the rest share one), at most 512
   occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
@@ -234,15 +264,25 @@ OMeetingBar ist ein MeetingBar-Ersatz für Omarchy: der nächste Google-Kalender
 Bar (türkis = steht an, orange = läuft), per Linksklick eine Agenda für heute und morgen mit
 Timeline, und **eine Minute vor dem Meeting ein Vollbild-Alarm**, der den Bildschirm belegt —
 weil man normale Benachrichtigungen im Tunnel nicht wahrnimmt. `Enter` tritt bei, `Esc`
-schließt und stoppt den Ton. Die Meeting-Notification schließt sich zum Meeting-Ende selbst;
-ein Klick danach öffnet den Link nicht mehr, ein Rechtsklick schließt immer ohne Aktion.
+schließt und stoppt den Ton. Zum Meeting-Ende wird die Meeting-Notification durch ein kurzes
+"Meeting beendet" ersetzt (Omarchy zeigt es mindestens 5 s); Notifications von vor einem
+Shell-Neustart oder Reboot (oder aus dem Fallback ohne `python-gobject`) bleiben stehen. Ein
+Klick tritt bei, bis das Meeting endet (auch schon vor Beginn), danach schließt er nur; ein
+Rechtsklick schließt immer nur. Die Notification zeigt Titel und Ort (sonst den Kalendernamen);
+mit `notify_details: false` nur "Termin", Countdown und Uhrzeit.
 
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
 `./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die noch
 fehlenden der benötigten Pakete (`evolution-data-server`, `gnome-online-accounts`,
 `gnome-online-accounts-gtk`, `python-gobject`), die Anleitung, das Google-Konto in `gnome-online-accounts-gtk`
-zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es das `demo`-Backend vor. Ein
-Shell-Neustart ist nicht nötig, der nächste Abruf übernimmt Pakete und Konto.
+zu verbinden, und Testbefehle; solange Pakete fehlen, schlägt es das `demo`-Backend vor. Für
+Pakete und Konto ist kein Shell-Neustart nötig, der nächste Abruf übernimmt beide.
+
+Update: `omarchy plugin update io.github.disy-mk.omeetingbar && omarchy restart shell`, bei
+entsperrtem Bildschirm (eine gesperrte Shell startet Omarchy nicht neu). Erst der
+Shell-Neustart ersetzt den laufenden Dienst; bis dahin zeigt die Bar eine Warnung, und
+`omarchy-shell omeetingbar status | jq -r .version` nennt die laufende Version (`null` = älter
+als 1.1.0, der Neustart steht also noch aus).
 
 Grenzen: über einen **gesperrten** Bildschirm kann kein Plugin zeichnen — der Alarm wird dann
 nach dem Entsperren nachgezogen, Notification und Ton kommen trotzdem; ein Laptop im Suspend
