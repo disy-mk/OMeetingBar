@@ -203,6 +203,10 @@ o.bind("SUPER SHIFT", "M", "exec", "omarchy-shell omeetingbar-agenda toggle")
 - The critical notification does carry the meeting's title and location, and Omarchy keeps
   dismissed notifications in its history (`~/.local/state/omarchy/notifications/`) — that much
   outlives a reboot. Set `notify` to `false` if you do not want that.
+- Nothing from your calendar appears on a command line, where any local user could read it from
+  `/proc`: notifications go to a small helper over stdin, the click action carries only the
+  event id, and the join link leaves the 0600 cache only when the browser is launched with it.
+  Without `python-gobject` the helper falls back to a content-free toast (time only).
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
 - The fullscreen alert ignores keys for its first second, so a keystroke in flight cannot join a
   meeting from an invite you have not seen. Alerts are bounded: at most 8 wait in the queue, at

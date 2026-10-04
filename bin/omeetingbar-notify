@@ -1,0 +1,147 @@
+#!/usr/bin/python3
+"""Send or replace an OMeetingBar notification without putting calendar
+content on a command line.
+
+Reads ONE JSON object (one line) from stdin and calls
+org.freedesktop.Notifications.Notify on the session bus with the hints
+omarchy-notification-send uses, so Omarchy's daemon renders it the same way:
+`urgency` (byte), `omarchy-glyph` (string), `omarchy-exec-argv` (JSON array as
+a string). Prints the notification id (uint32) on stdout.
+
+  {"summary": "...", "body": "...", "glyph": "...", "urgency": "critical",
+   "exec": ["<plugin>/bin/omeetingbar-join", "<event id>"],   # optional
+   "replaces_id": 0, "expire_ms": -1,                            # optional
+   "safe": {"summary": "Meeting", "body": "14:00-14:30"}}        # fallback text
+
+Why stdin: omarchy-notification-send and busctl take the summary, the body and
+the click command as process arguments, and any local user can read those from
+/proc/<pid>/cmdline while they run. This helper's own argv is just its path.
+
+Replace mode (`replaces_id` > 0) is how the service takes a toast down once the
+meeting is over: the critical toast becomes a low-urgency one with a short
+expiry, which Omarchy's daemon lets expire. A toast the user already closed is
+left alone -- re-using its id would create a new one -- which is checked
+against Omarchy's popup state directory when that directory exists.
+
+Without python-gobject (Gio) the helper falls back to omarchy-notification-send
+with the content-free `safe` text only and prints no id.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+
+# Omarchy's own CLI identity: bypasses Do Not Disturb (the daemon's rule for
+# critical toasts) and is not kept as history noise.
+APP_NAME = "omarchy-action"
+URGENCY = {"low": 0, "normal": 1, "critical": 2}
+POPUP_STATE_DIR = os.path.expanduser("~/.local/state/omarchy/notifications")
+
+
+def read_payload():
+    line = sys.stdin.readline()
+    try:
+        payload = json.loads(line)
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def text(payload, key, default=""):
+    value = payload.get(key, default)
+    return value if isinstance(value, str) else default
+
+
+def exec_argv(payload):
+    argv = payload.get("exec")
+    if isinstance(argv, list) and argv and all(isinstance(a, str) and a for a in argv):
+        return argv
+    return None
+
+
+def replaces_id(payload):
+    value = payload.get("replaces_id", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def expire_ms(payload):
+    value = payload.get("expire_ms", -1)
+    return value if isinstance(value, int) and not isinstance(value, bool) else -1
+
+
+def hints_for(payload, variant):
+    """The a{sv} hints as {name: Variant}; `variant` is GLib.Variant (passed in
+    so this stays testable without gi)."""
+    hints = {"urgency": variant("y", URGENCY.get(text(payload, "urgency", "critical"), 2))}
+    glyph = text(payload, "glyph")
+    if glyph:
+        hints["omarchy-glyph"] = variant("s", glyph)
+    argv = exec_argv(payload)
+    if argv:
+        hints["omarchy-exec-argv"] = variant("s", json.dumps(argv))
+    return hints
+
+
+def toast_still_open(notification_id):
+    """False only when Omarchy's popup directory exists and holds no file for
+    this id (its files are named <timestamp>-<id>.json while a toast is on
+    screen). An unknown layout reads as "open", so a replace is still sent."""
+    if not os.path.isdir(POPUP_STATE_DIR):
+        return True
+    return bool(glob.glob(os.path.join(POPUP_STATE_DIR, "*-%d.json" % notification_id)))
+
+
+def send(payload):
+    from gi.repository import Gio, GLib
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    params = GLib.Variant("(susssasa{sv}i)", (
+        APP_NAME, replaces_id(payload), "", text(payload, "summary"), text(payload, "body"),
+        [], hints_for(payload, GLib.Variant), expire_ms(payload)))
+    reply = bus.call_sync("org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+                          "org.freedesktop.Notifications", "Notify", params,
+                          GLib.VariantType("(u)"), Gio.DBusCallFlags.NONE, 5000, None)
+    return reply.unpack()[0]
+
+
+def fallback(payload):
+    """No Gio: the content-free text only, through Omarchy's own sender. The
+    argv then carries a word like "Meeting" and a time range, nothing private."""
+    safe = payload.get("safe") if isinstance(payload.get("safe"), dict) else {}
+    summary = text(safe, "summary") or "Meeting"
+    body = text(safe, "body")
+    argv = ["omarchy-notification-send", "-u", text(payload, "urgency", "critical")]
+    glyph = text(payload, "glyph")
+    if glyph:
+        argv += ["-g", glyph]
+    rid = replaces_id(payload)
+    if rid:
+        argv += ["-r", str(rid), "-t", str(max(expire_ms(payload), 0))]
+    argv += [summary, body]
+    subprocess.run(argv, check=False, stdout=subprocess.DEVNULL)
+
+
+def main():
+    payload = read_payload()
+    if payload is None:
+        sys.stderr.write("omeetingbar-notify: expected one JSON object on stdin\n")
+        return 1
+    rid = replaces_id(payload)
+    if rid and not toast_still_open(rid):
+        print("gone")
+        return 0
+    try:
+        import gi  # noqa: F401  -- only to decide between D-Bus and the fallback
+    except ImportError:
+        fallback(payload)
+        return 0
+    try:
+        print(send(payload))
+    except Exception as exc:  # GLib.Error, D-Bus timeouts: type name only, never content
+        sys.stderr.write("omeetingbar-notify: %s\n" % type(exc).__name__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
