@@ -30,6 +30,7 @@ Item {
   readonly property string statePath: cacheDir + "/state.json"
   readonly property string fetcherPath: String(Qt.resolvedUrl("bin/omeetingbar-fetch")).replace(/^file:\/\//, "")
   readonly property string joinPath: String(Qt.resolvedUrl("bin/omeetingbar-join")).replace(/^file:\/\//, "")
+  readonly property string notifyPath: String(Qt.resolvedUrl("bin/omeetingbar-notify")).replace(/^file:\/\//, "")
 
   readonly property int stateRetentionSeconds: 43200
   readonly property int pruneIntervalSeconds: 3600
@@ -61,9 +62,9 @@ Item {
   // Meetings due in the same tick beyond this share one summary toast instead
   // of each sending a critical, never-expiring one.
   readonly property int maxToastsPerTick: 3
-  // Omarchy closes toasts by summary substring; a needle shorter than this
-  // would also take down other apps' toasts, so such a toast is not tracked.
-  readonly property int minToastNeedleChars: 4
+  // How long the "meeting ended" replacement toast stays before Omarchy lets it
+  // expire (low urgency honours the request; critical never expires).
+  readonly property int toastReplaceExpireMs: 1500
   // The host reports an overlay "open" from the moment a summon is accepted,
   // before Alert.qml has loaded. Its witness only counts once a failed load
   // would have had time to clear that state again; the overlay's own callback
@@ -160,6 +161,12 @@ Item {
   // down once its meeting is over. Persisted, because the toasts outlive a
   // shell restart and so must the list.
   property var openToasts: []
+  // Notifications go out one at a time through bin/omeetingbar-notify, which
+  // reads the content from stdin and answers with the notification id. The
+  // queue holds { payload, toastId }; toastId names the openToasts entry that
+  // receives the id (null for a replacement).
+  property var notifyQueue: []
+  property var notifyCurrent: null
   property int startedAtSec: 0
   property int fireHoldUntilSec: 0
 
@@ -622,6 +629,12 @@ Item {
 
     var toasts = root.openToasts.slice()
     if (parsed && Array.isArray(parsed.toasts)) {
+      // Notification ids belong to one daemon generation: Omarchy's
+      // notifications plugin restarts with the shell and hands out ids from 1
+      // again, so an id recorded under another shell process would now name a
+      // stranger's toast. Those entries keep their end (the join script still
+      // checks it) but lose the id, and are forgotten instead of replaced.
+      var sameShell = tsOf(parsed.toastsShellPid) === Quickshell.processId
       for (var t = 0; t < parsed.toasts.length; t++) {
         var toast = parsed.toasts[t]
         if (!toast || typeof toast !== "object") continue
@@ -630,7 +643,9 @@ Item {
         if (toast.id === undefined || headline === "" || toastEndSec === 0) continue
         var seen = false
         for (var k = 0; k < toasts.length; k++) if (toasts[k].id === String(toast.id)) seen = true
-        if (!seen) toasts.push({ id: String(toast.id), headline: headline, end: toastEndSec })
+        if (seen) continue
+        toasts.push({ id: String(toast.id), headline: headline, end: toastEndSec,
+                      nid: sameShell ? tsOf(toast.nid) : 0 })
       }
     }
     root.openToasts = toasts
@@ -670,6 +685,7 @@ Item {
       events: root.alertState,
       queue: queue,
       toasts: root.openToasts,
+      toastsShellPid: Quickshell.processId,
       fired: legacy
     }, null, 2) + "\n")
   }
@@ -836,12 +852,10 @@ Item {
     return from + "–" + Qt.formatDateTime(new Date(entry.end * 1000), "HH:mm")
   }
 
-  // The headline lands in omarchy-notification-send's option position, where a
-  // title the script recognises as one of its flags is consumed as that flag
-  // (`-g`, `--urgency=x`, `-p`, …). Matching that option table here would mean
-  // keeping a copy of it in sync forever, so neutralise the only way in
-  // instead: a leading dash. A leading space cannot start an option, and the
-  // script passes the headline through to D-Bus as a plain string.
+  // The headline reaches D-Bus as a plain string through bin/omeetingbar-notify
+  // (stdin JSON, never argv), so no option parser ever sees it. The leading
+  // space in front of a dash stays for the Gio-less fallback inside that helper,
+  // which does go through omarchy-notification-send's option position.
   function notificationHeadline(title) {
     var text = String(title || "").trim()
     if (text === "") return Strings.t(root.lang, "meeting")
@@ -868,18 +882,23 @@ Item {
     return Math.max(entry.end, entry.start + root.graceSeconds)
   }
 
+  // Nothing from the calendar goes on a command line: the helper reads this
+  // payload from stdin, and the click action carries the event id only --
+  // bin/omeetingbar-join looks the URL up in the 0600 cache when clicked, and
+  // only while the meeting is on. `safe` is the content-free text the helper
+  // falls back to without Gio.
   function sendNotification(entry, atSec) {
     var headline = notificationHeadline(entry.title)
-    var argv = ["omarchy-notification-send", "-u", "critical", "-g", "󰃭",
-      headline, notificationBody(entry, atSec)]
-    // --exec must come last and as separate words; the script hands them to the
-    // click action as argv, so a URL can never become a command. The join
-    // script opens it only while the meeting is on: a toast clicked after the
-    // meeting is over just closes.
-    if (entry.url !== "")
-      argv = argv.concat(["--exec", root.joinPath, entry.url, String(toastEnd(entry))])
-    Quickshell.execDetached(argv)
+    var payload = {
+      summary: headline,
+      body: notificationBody(entry, atSec),
+      glyph: "󰃭",
+      urgency: "critical",
+      safe: { summary: Strings.t(root.lang, "meeting"), body: timeRangeText(entry) }
+    }
+    if (entry.url !== "") payload.exec = [root.joinPath, String(entry.id)]
     trackToast(entry, headline)
+    enqueueNotify(payload, String(entry.id))
   }
 
   // Meetings due in the same tick beyond maxToastsPerTick get one toast for
@@ -889,66 +908,99 @@ Item {
     var latestEnd = atSec
     for (var i = 0; i < extra.length; i++) latestEnd = Math.max(latestEnd, toastEnd(extra[i]))
     var headline = Strings.t(root.lang, "moreMeetings", extra.length)
-    Quickshell.execDetached(["omarchy-notification-send", "-u", "critical", "-g", "󰃭",
-      headline, Strings.t(root.lang, "moreMeetingsBody")])
-    trackToast({ id: "summary-" + atSec, title: headline, start: atSec, end: latestEnd }, headline)
+    var id = "summary-" + atSec
+    trackToast({ id: id, title: headline, start: atSec, end: latestEnd }, headline)
+    enqueueNotify({
+      summary: headline,
+      body: Strings.t(root.lang, "moreMeetingsBody"),
+      glyph: "󰃭",
+      urgency: "critical",
+      safe: { summary: headline, body: "" }
+    }, id)
   }
 
-  // Omarchy's notifications plugin can only be asked to close a toast by
-  // summary substring: a CloseNotification by id leaves its toast on screen
-  // (measured on Omarchy 4.x). So the needle is the full headline, and a
-  // meeting with no title, or one shorter than minToastNeedleChars, is not
-  // tracked at all, since "Termin" or "1:1" would also hit other apps' toasts.
-  // Those still close by click (bin/omeetingbar-join) or right click.
+  // Every toast this service sends is recorded with the notification id the
+  // helper reports (0 until it does), so it can be replaced by id once the
+  // meeting is over. Omarchy ignores CloseNotification for its popups
+  // (measured on 4.x) and dismisses by summary substring only, which would put
+  // the title on a command line again -- hence the replacement.
   function trackToast(entry, headline) {
-    if (String(entry.title || "").trim() === "") return
-    if (headline.trim().length < root.minToastNeedleChars) return
     var id = String(entry.id)
     for (var i = 0; i < root.openToasts.length; i++) if (root.openToasts[i].id === id) return
-    root.openToasts = root.openToasts.concat([{ id: id, headline: headline, end: toastEnd(entry) }])
+    root.openToasts = root.openToasts.concat([{ id: id, headline: headline, end: toastEnd(entry), nid: 0 }])
     saveState()
   }
 
-  // A substring needle also matches every toast whose headline contains it.
-  // While such a meeting is still on, the ended one waits for it, so "Standup"
-  // ending cannot take down "Standup Team" that is still running.
-  function toastNeedleBusy(toast, atSec) {
+  function setToastNid(id, nid) {
+    var next = []
+    var hit = false
     for (var i = 0; i < root.openToasts.length; i++) {
-      var other = root.openToasts[i]
-      if (other.id !== toast.id && atSec < other.end && other.headline.indexOf(toast.headline) !== -1)
-        return true
+      var toast = root.openToasts[i]
+      if (toast.id === id) {
+        next.push({ id: toast.id, headline: toast.headline, end: toast.end, nid: nid })
+        hit = true
+      } else next.push(toast)
     }
-    return false
+    if (!hit) return
+    root.openToasts = next
+    saveState()
   }
 
+  function enqueueNotify(payload, toastId) {
+    root.notifyQueue = root.notifyQueue.concat([{ payload: payload, toastId: toastId }])
+    pumpNotify()
+  }
+
+  function pumpNotify() {
+    if (notifySender.running || root.notifyCurrent !== null || root.notifyQueue.length === 0) return
+    root.notifyCurrent = root.notifyQueue[0]
+    root.notifyQueue = root.notifyQueue.slice(1)
+    notifySender.command = ["/usr/bin/python3", root.notifyPath]
+    notifySender.running = true
+  }
+
+  // Once a meeting is over its toast is replaced, by notification id, with a
+  // low-urgency "meeting ended" that Omarchy lets expire after
+  // toastReplaceExpireMs -- no title, no IPC argument. A toast without an id
+  // (the helper failed, or the shell restarted since) is forgotten; it still
+  // closes by click or right click, and the join script checks the end anyway.
   function clearEndedToasts(atSec) {
     if (root.openToasts.length === 0) return
     // startedAtSec is 0 until Component.onCompleted; a tick before that must
     // not slip past the settle window.
     if (root.startedAtSec === 0 || atSec - root.startedAtSec < root.toastSettleSeconds) return
     var kept = []
-    var cleared = 0
+    var replaced = 0
+    var forgotten = 0
     for (var i = 0; i < root.openToasts.length; i++) {
       var toast = root.openToasts[i]
-      if (atSec < toast.end || toastNeedleBusy(toast, atSec)) {
+      if (atSec < toast.end) {
         kept.push(toast)
         continue
       }
-      // Fire and forget: a toast the user already closed answers "none", and
-      // one this misses still closes by click or right click.
-      Quickshell.execDetached(["omarchy-shell", "notifications", "dismiss", toast.headline])
-      cleared += 1
+      if (toast.nid > 0) {
+        enqueueNotify({
+          summary: Strings.t(root.lang, "meetingEnded"),
+          body: "",
+          glyph: "󰃭",
+          urgency: "low",
+          replaces_id: toast.nid,
+          expire_ms: root.toastReplaceExpireMs,
+          safe: { summary: Strings.t(root.lang, "meetingEnded"), body: "" }
+        }, null)
+        replaced += 1
+      } else forgotten += 1
     }
-    if (cleared === 0) return
+    if (replaced === 0 && forgotten === 0) return
     root.openToasts = kept
     saveState()
-    logState("toasts-cleared", "count=" + cleared)
+    logState("toasts-cleared", "replaced=" + replaced + " forgotten=" + forgotten)
   }
 
   // An alert withdrawn before it was shown (cancelled or declined while the
   // queue waited) would leave a toast with a live join link behind. Its end is
-  // pulled to now, and clearEndedToasts takes it down on the next tick with
-  // the same needle rules as any other ended toast. The caller saves state.
+  // pulled to now, and clearEndedToasts replaces it on the next tick like any
+  // other ended toast. The caller saves state.
   function withdrawToast(id, atSec) {
     var key = String(id)
     var next = []
@@ -956,7 +1008,7 @@ Item {
     for (var i = 0; i < root.openToasts.length; i++) {
       var toast = root.openToasts[i]
       if (toast.id === key && atSec < toast.end) {
-        next.push({ id: toast.id, headline: toast.headline, end: atSec })
+        next.push({ id: toast.id, headline: toast.headline, end: atSec, nid: toast.nid })
         hit = true
       } else next.push(toast)
     }
@@ -1411,6 +1463,7 @@ Item {
       soundAvailable: root.soundAvailable,
       soundPlaying: soundPlayer.running,
       toastsOpen: root.openToasts.length,
+      notifyQueued: root.notifyQueue.length + (root.notifyCurrent !== null ? 1 : 0),
       fetch: {
         running: fetchProcess.running,
         outcome: root.lastFetchOutcome,
@@ -1445,7 +1498,8 @@ Item {
         cache: root.cachePath,
         state: root.statePath,
         fetcher: root.fetcherPath,
-        join: root.joinPath
+        join: root.joinPath,
+        notify: root.notifyPath
       },
       lastEvent: root.logLine,
       lastEventAt: root.logAt
@@ -1600,6 +1654,29 @@ Item {
 
   Process {
     id: soundPlayer
+  }
+
+  // One notification at a time through bin/omeetingbar-notify. The content is
+  // written to its stdin once it runs, so no toast text or join link is ever
+  // visible in /proc/<pid>/cmdline; its stdout is the notification id.
+  Process {
+    id: notifySender
+    stdinEnabled: true
+    stdout: StdioCollector { id: notifyOut; waitForEnd: true }
+    stderr: StdioCollector { id: notifyErr; waitForEnd: true }
+    onStarted: {
+      var job = root.notifyCurrent
+      if (job) notifySender.write(JSON.stringify(job.payload) + "\n")
+    }
+    onExited: function(exitCode) {
+      var job = root.notifyCurrent
+      root.notifyCurrent = null
+      var answer = String(notifyOut.text || "").trim()
+      if (job && job.toastId !== null && exitCode === 0 && /^\d+$/.test(answer))
+        root.setToastNid(job.toastId, Number(answer))
+      if (exitCode !== 0) root.logState("notify-failed", "exit=" + exitCode + " " + root.lastLine(notifyErr.text))
+      root.pumpNotify()
+    }
   }
 
   Process {

@@ -19,7 +19,8 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
 | `Strings.js` | — | every QML-side UI string in German and English, plus the language rule (`pick`); imported by all four QML files |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
-| `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: opens the link only while the meeting is on |
+| `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: looks the event up by id in the 0600 cache and opens its link only while the meeting is on |
+| `bin/omeetingbar-notify` | — | python3 (Gio D-Bus), sends or replaces a notification from a JSON payload on **stdin**, so no toast text or link is ever a process argument; prints the notification id |
 | `config.example.json` | — | copied to `~/.config/omarchy/omeetingbar.json` on install |
 | `install.sh` | — | idempotent installer; never calls sudo itself |
 | `README.md` | — | user-facing docs incl. the Google Workspace setup |
@@ -221,7 +222,8 @@ restart during a lock.
       "allDay": false, "url": "https://meet.google.com/abc-defg-hij", "calendar": "Work",
       "location": "", "untilSec": 1757503500, "notifiedAt": 1757503140 }
   ],
-  "toasts": [ { "id": "<event id>", "headline": "Standup", "end": 1757505000 } ],
+  "toasts": [ { "id": "<event id>", "headline": "Standup", "end": 1757505000, "nid": 12 } ],
+  "toastsShellPid": 3364032,
   "fired": { "<event id>": 1757503140 }
 }
 ```
@@ -246,9 +248,12 @@ restart during a lock.
   can be shown. It is a queue, not one slot, because two meetings can come due while the session
   is locked; the head owns the overlay and the rest wait for it to close.
 - `toasts` — the meeting notifications this service sent and has not taken down yet: event id,
-  the exact headline it was sent with, and `end` (`max(end, start + grace_seconds)`, so a meeting
-  without a real end keeps its toast as long as its alert stays relevant). See "Toast cleanup"
-  under the firing rules. Merged by id on load, like the rest of the file.
+  the headline it was sent with, `end` (`max(end, start + grace_seconds)`, so a meeting without a
+  real end keeps its toast as long as its alert stays relevant) and `nid`, the notification id
+  the helper reported (0 until it has). `toastsShellPid` is the shell process the ids belong to:
+  Omarchy's notification daemon restarts with the shell and numbers from 1 again, so entries
+  loaded under another `Quickshell.processId` keep their `end` but lose their `nid`. See "Toast
+  cleanup" under the firing rules. Merged by id on load, like the rest of the file.
 - `fired` — a schema-1 mirror (`id → notified`) written for readers of the old format and never
   read back. A file that *only* has `fired` is read as legacy: those ids count as notified **and**
   shown, because the old format cannot say whether the overlay was ever seen, and a surprise
@@ -466,17 +471,28 @@ file talks to the outside world.
   1. persist the id to `notified` in the state file first (so a crash cannot cause a re-fire loop),
   2. if `wake_display`: `omarchy-brightness-display on` (NOT `hyprctl dispatch dpms on` — that
      dispatcher no longer exists in Hyprland 0.56),
-  3. if `notify`: `omarchy-notification-send -u critical -g 󰃭 "<title>" "<body>"` and, only when a
-     URL exists, `--exec <plugin>/bin/omeetingbar-join <url> <end>` **last** and as separate argv
-     words. `omeetingbar-join` opens the URL with `omarchy-launch-browser` only while `now < end`;
-     after that a click just closes the toast (Omarchy closes it on click either way). A
-     non-numeric `end` opens the URL — a missed join is worse than an unneeded one. The toast is
-     recorded in the state file's `toasts` (not for an empty or very short title, see "Toast
-     cleanup"). Location and calendar name are markup-escaped (`& < >`) because Omarchy renders the
-     body as `StyledText`; the headline is plain text there and needs none. Only the first
-     `maxToastsPerTick` (3) meetings due in one tick get their own toast; the rest share one
-     summary toast ("N weitere Termine", no join link, tracked under its own id until the last of
-     them ends) — N same-minute invites must not mean N critical, never-expiring toasts,
+  3. if `notify`: a critical toast through `bin/omeetingbar-notify`, run as a child `Process`
+     one at a time (`notifyQueue`) with the payload written to its **stdin** — title, body,
+     glyph `󰃭`, urgency, and, only when a URL exists, the click action
+     `["<plugin>/bin/omeetingbar-join", "<event id>"]`. **Nothing from the calendar may ever be a
+     process argument**: `omarchy-notification-send` and `busctl` put summary, body and `--exec`
+     into argv, which any local user can read from `/proc/<pid>/cmdline` while they run (the
+     marketplace review of 2026-10-04 flagged exactly that). The helper calls
+     `org.freedesktop.Notifications.Notify` over Gio with the hints Omarchy's daemon reads
+     (`urgency` byte, `omarchy-glyph`, `omarchy-exec-argv` as a JSON string) and `app_name`
+     `omarchy-action` (the daemon's DND bypass), and prints the notification id, which lands in
+     the toast's `nid`. Without Gio it falls back to `omarchy-notification-send` with the
+     content-free `safe` text (the word "Meeting" and the time range). `omeetingbar-join <id>`
+     reads URL, start and end from the 0600 cache when clicked and opens the URL with
+     `omarchy-launch-browser` only while the meeting is on (`end`, or `start + 300 s` for a
+     zero-length occurrence); after that, or when the event is gone from the cache, a click just
+     closes the toast. So the URL never appears on a command line, nor in Omarchy's persisted
+     notification files, before the browser launch itself. Location and calendar name are
+     markup-escaped (`& < >`) because Omarchy renders the body as `StyledText`; the headline is
+     plain text there and needs none. Only the first `maxToastsPerTick` (3) meetings due in one
+     tick get their own toast; the rest share one summary toast ("N weitere Termine", no join
+     link, tracked under its own id until the last of them ends) — N same-minute invites must not
+     mean N critical, never-expiring toasts,
   4. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
      detached, so closing the overlay can stop it; a sound still playing is not restarted by a
      second meeting in the same minute,
@@ -501,24 +517,28 @@ file talks to the outside world.
   `--exec` argv fail with E2BIG. The fetcher caps on its side too; this is the second line.
 - **Toast cleanup**: critical toasts never expire in Omarchy, so a meeting notification would
   stay on screen until clicked — and a stale one, clicked after a meeting taken on the phone,
-  used to reopen the call. Once `now >= end` of a recorded toast, the service runs
-  `omarchy-shell notifications dismiss "<headline>"` and forgets the entry (fire and forget; a
-  toast the user already closed answers `none`). The dismissed toast moves to Omarchy's
-  notification history.
-  - Omarchy's notifications plugin closes toasts by **summary substring** only. A freedesktop
-    `CloseNotification(id)` leaves its toast on screen (measured on Omarchy 4.x: the server object
-    closes, the popup row stays), so the id is not usable and the needle is the full headline.
-  - A substring needle also hits every toast whose headline contains it. An ended toast therefore
-    waits while another recorded meeting that is still on has a headline containing its own
-    ("Standup" ending must not take down "Standup Team").
-  - An empty title is sent with the fallback headline "Termin" and is not recorded, and neither
-    is a headline shorter than `minToastNeedleChars` (4): "Termin", "e" or "1:1" as a needle
-    would hit other apps' toasts. Such a toast still closes by click (`omeetingbar-join`) or by
-    right click, which Omarchy maps to "close without action".
-  - Nothing is dismissed during the first 30 s after the service starts: after a shell restart
-    Omarchy restores its toasts from disk asynchronously, and a dismiss sent before that finds
-    nothing. The state file is tmpfs, so after a reboot restored toasts are no longer recorded;
-    `omeetingbar-join` is the fallback for those.
+  used to reopen the call. Once `now >= end` of a recorded toast, the service **replaces** it by
+  notification id (`replaces_id = nid`) through the same helper with a low-urgency "Meeting
+  beendet" / "Meeting ended", empty body and `toastReplaceExpireMs` (1500 ms); Omarchy's daemon
+  lets a low-urgency toast expire, and it moves to the notification history. The entry is then
+  forgotten.
+  - Why replace: a freedesktop `CloseNotification(id)` leaves an Omarchy popup on screen
+    (measured on 4.x: the server object closes, the popup row stays), and the only IPC that
+    closes one — `omarchy-shell notifications dismiss "<summary substring>"` — would put the
+    title on a command line again. Replacing works by id and carries no calendar content.
+  - A toast the user already closed must not be replaced: the daemon would treat the stale id as
+    a new notification and show a stray "Meeting ended". The helper therefore checks Omarchy's
+    popup state directory (`~/.local/state/omarchy/notifications/<timestamp>-<id>.json` exists
+    while a toast is on screen) and answers `gone` without sending; an unknown layout reads as
+    "open", so the replace is still sent.
+  - A toast without an id — the helper failed, or the entry was recorded under another shell
+    process (`toastsShellPid`) — is forgotten without a dismiss. It still closes by click
+    (`omeetingbar-join`, which checks the end itself) or by right click, which Omarchy maps to
+    "close without action". Every title is tracked, including empty ones: without a substring
+    needle there is nothing to collide.
+  - Nothing is replaced during the first 30 s after the service starts, so a hot reload (same
+    shell process, same ids) does not race Omarchy's asynchronous restore of its toasts. The
+    state file is tmpfs, so after a reboot nothing is recorded; `omeetingbar-join` is the fallback.
 - **Idle inhibitor**: hold one from `start - inhibit_lead_seconds` (default 600 s, see the config
   semantics) until `start + grace_seconds` for the next event, so the session cannot lock/blank
   into the alert. Implement as a 1x1 click-through `PanelWindow` (input mask empty /
@@ -540,8 +560,11 @@ file talks to the outside world.
 - Idle defaults: screensaver 150 s, lock 300 s — the reason `inhibit_lead_seconds` defaults to
   600. `omarchy-shell idle status` reports live state; stay-awake is currently on, so idle is
   disabled on this machine right now.
-- `omarchy-notification-send -u critical` bypasses DND. Omarchy ships no sound files; `pw-play`,
-  `paplay`, `canberra-gtk-play` and `sound-theme-freedesktop` are installed.
+- Omarchy's notification daemon bypasses DND for `app_name` `omarchy-action` (what
+  `omarchy-notification-send` sends and `bin/omeetingbar-notify` reuses) and for critical
+  `notify-send` toasts; it reads `omarchy-glyph` and `omarchy-exec-argv` from the hints
+  (`NotificationLogic.js`). Omarchy ships no sound files; `pw-play`, `paplay`,
+  `canberra-gtk-play` and `sound-theme-freedesktop` are installed.
 - QML errors from plugins land in `journalctl --user -t omarchy-shell` and
   `/run/user/1000/quickshell/by-id/<id>/log.qslog` (`quickshell log -f`).
 - Saving any file under `~/.config/omarchy/plugins/` triggers a plugin reload, but — measured on

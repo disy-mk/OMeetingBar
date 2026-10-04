@@ -95,6 +95,7 @@ var table = {
     starts: "Beginnt %1",
     moreMeetings: "%1 weitere Termine",
     moreMeetingsBody: "Beginnen in Kürze · nicht einzeln gemeldet",
+    meetingEnded: "Meeting beendet",
     testMeeting: "Testtermin",
     testCalendar: "Test"
   },
@@ -183,6 +184,7 @@ var table = {
     starts: "Starts %1",
     moreMeetings: "%1 more meetings",
     moreMeetingsBody: "Starting shortly · not listed individually",
+    meetingEnded: "Meeting ended",
     testMeeting: "Test meeting",
     testCalendar: "Test"
   }

@@ -1,17 +1,27 @@
 #!/bin/sh
-# Click action of an OMeetingBar notification: omeetingbar-join URL END
+# Click action of an OMeetingBar notification: omeetingbar-join EVENT_ID
 #
-# Opens the meeting link in the browser while the meeting is still on, and does
-# nothing once END (unix seconds) has passed. The notification closes on click
-# either way, so clicking a stale toast after a meeting just clears it instead
-# of reopening a call that is over. An END that is not a number opens the link,
-# because a missed join is worse than an unneeded one.
-url=$1
-end=$2
+# Looks the meeting up in the plugin's 0600 event cache and opens its join link
+# while the meeting is still on. Once it is over -- or the event is gone from
+# the cache -- it does nothing; the notification closes on click either way, so
+# a stale toast just clears instead of reopening a call that is over.
+#
+# Only the event id travels in the notification: the URL never appears on a
+# command line (or in Omarchy's notification history on disk) before the
+# browser itself is launched with it.
+id=$1
+[ -n "$id" ] || exit 0
+cache="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omeetingbar/events.json"
+[ -r "$cache" ] || exit 0
+command -v jq >/dev/null 2>&1 || exit 0
 
-# Defence in depth: Service.qml only hands over validated https URLs, but this
-# is the last hop before a browser launcher that takes options, so the same
-# rule is applied again (https, no whitespace, no backslash).
+url=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .url // ""][0] // ""' "$cache" 2>/dev/null)
+start=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .start // 0][0] // 0' "$cache" 2>/dev/null)
+end=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .end // 0][0] // 0' "$cache" 2>/dev/null)
+
+# Defence in depth: the fetcher only writes validated https URLs, but this is
+# the last hop before a browser launcher that takes options, so the same rule
+# is applied again (https, no whitespace, no backslash).
 case $url in
   https://*) ;;
   *) exit 0 ;;
@@ -19,8 +29,12 @@ esac
 case $url in
   *[[:space:]\\]*) exit 0 ;;
 esac
-case $end in
-  '' | *[!0-9]*) ;;
-  *) [ "$(date +%s)" -ge "$end" ] && exit 0 ;;
+
+# A meeting without a real end (end <= start) is treated as still joinable for
+# five minutes after its start, the service's default grace window.
+case $start$end in
+  *[!0-9]*) exit 0 ;;
 esac
+[ "$end" -gt "$start" ] || end=$((start + 300))
+[ "$(date +%s)" -lt "$end" ] || exit 0
 exec omarchy-launch-browser "$url"
