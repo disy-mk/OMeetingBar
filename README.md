@@ -42,13 +42,14 @@ around it.
 
 ## Screenshots
 
-The bar entry while a meeting is running, and the agenda popup (all meetings shown are made up):
+The bar entry while a meeting is running, and the agenda popup at the same moment (English UI;
+all meetings shown are made up):
 
 ![Bar entry](docs/screenshots/bar.png)
 
 ![Agenda popup](docs/screenshots/agenda.png)
 
-The fullscreen alert, a minute before the next meeting:
+The fullscreen alert for the next meeting in that agenda, a minute before it starts:
 
 ![Fullscreen alert](docs/screenshots/alert.png)
 
