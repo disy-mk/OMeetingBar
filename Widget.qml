@@ -467,11 +467,12 @@ BarWidget {
   function parseEvents(list) {
     if (!Array.isArray(list)) return []
     var out = []
-    // 256, not 64: since the cache became the two-day agenda it also carries
-    // the finished and the declined occurrences, and a busy calendar does not
-    // fit in 64 of them. The cap only exists so a corrupt file cannot make
+    // 512, the fetcher's own cap: since the cache became the two-day agenda it
+    // also carries the finished and the declined occurrences, and anything
+    // lower would cut a list the fetcher already chose by relevance (it keeps
+    // what lies ahead first). The cap only exists so a corrupt file cannot make
     // the bar chew through a million entries.
-    for (var i = 0; i < list.length && out.length < 256; i++) {
+    for (var i = 0; i < list.length && out.length < 512; i++) {
       var raw = list[i]
       if (!Util.isPlainObject(raw)) continue
       var start = Number(raw.start)

@@ -177,7 +177,7 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   "events": [
     { "id": "9f2c…", "title": "Standup", "start": 1757503200, "end": 1757505000,
       "all_day": false, "declined": false, "url": "https://meet.google.com/abc-defg-hij",
-      "calendar": "Work", "location": "" }
+      "calendar": "Work", "location": "", "calendar_uid": "1d5f0c9e…" }
   ]
 }
 ```
@@ -194,12 +194,29 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   `refresh_ok_at`: the last one that **succeeded** (the freshness). Both unix seconds, 0 for never.
   They differ on purpose: a refresh that keeps failing — revoked token, VPN down — must throttle
   like any other (or every run blocks on it again) and still be visible as "the data is old".
+- `calendar_uid`: the EDS source uid, lower-cased; for an ICS feed `ics-` plus the first 16 hex
+  digits of the SHA-256 of its URL — a key, never the URL, which is a bearer token; `""` for demo
+  and the test event. `date` and `end_date` (`YYYY-MM-DD`, `end_date` exclusive, both the local
+  dates nearest to `start`/`end`): on all-day entries only. `signin_needed_at` (unix seconds,
+  present only when set): the eds backend's sign-in stamp, see *Network freshness*. All three are
+  for the fetcher's next run and every other consumer ignores them: carry-forward matches the
+  uid (display names are not unique), `calendars_exclude` matches it as well as the name, and an
+  all-day entry is rebuilt from its dates in the current zone, because its epochs are the
+  midnights of the zone that wrote it.
 - `status: "error"` + human-readable `error` when the backend fails; `events` then keeps the last
-  known good list if one is available (write `stale: true` in that case), re-filtered with the
-  current config and without occurrences that ended before the agenda window. Never put tokens,
+  known good list if one is available (write `stale: true` in that case), re-validated with the
+  rules a fresh entry is written by (the URL passes the provider allow-list again, text fields are
+  capped), re-filtered with the current config and without occurrences that ended before the
+  agenda window. A deliberate state is not a failure — no Google account, no enabled calendar, no
+  `ics_urls` — and drops the list, so a removed account's meetings stop alerting, and the sign-in
+  stamp; a broken `omeetingbar.json` (unreadable, not an object, invalid values — a capped option
+  is not broken) keeps the list, as it may be what made the state look deliberate. Never put tokens,
   URLs with secrets, attendee emails or full ICS text into `error`; calendars are named by
   position ("Kalender 2") because display names are often an address, and backend error text is
-  scrubbed of URLs and addresses before it is quoted.
+  scrubbed before it is quoted: URLs, then the names the run knows (the calendar's display name,
+  the account's addresses), then quoted spans holding an `@` or a space, then any address
+  (`<url>`, `<name>`, `<email>`) — and only then shortened, so a cut cannot leave half an address
+  behind.
 - `status` is `"error"` **whenever the backend reported a failure and no event survived
   filtering** — an empty list from a failed run is never dressed up as `"ok"`. "Nothing on your
   calendar" and "your calendar could not be read" must not look alike to the user.
@@ -207,7 +224,9 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds invalid values
   and the documented defaults were used, one of several calendars failed while the others
   delivered (its previous events were carried forward), the pushed network refresh failed or
-  has not succeeded for over 30 min, a calendar hit the instance cap, or an option was ignored
+  has not succeeded for longer than 30 min or `refresh_seconds`, whichever is longer, a Google
+  sign-in is due, a calendar, feed or series hit an instance cap, a feed's broken or runaway
+  series was skipped, or an option was ignored
   because it does not apply to the active backend. `status` stays `"ok"`, and the text is in
   the UI language (see `language`), short and content-free (same privacy rules as `error`).
   One warning is not about the run at all: the restart notice (see *Restart notice* under the
@@ -384,7 +403,9 @@ Requirements:
 - The widget keeps reading the cache and the config; the popup renders what it is handed. `events`
   is the full agenda, while the bar label, its colour, the tooltip and "next meeting" all come from
   an alertable-filtered view of it (no declined, no all-day, not over), so their meaning is
-  unchanged. The parser's event cap rises to 256 — a two-day agenda no longer fits in 64.
+  unchanged. The parser's event cap is 512, the fetcher's own: a two-day agenda with its finished and
+  declined entries does not fit in 64, and a lower cap would cut a list the fetcher already chose
+  by relevance.
 - Shows a clear degraded state when the cache is missing or `status != "ok"` (e.g. a dim `󰃭 —`),
   never an empty crash, never a QML binding loop.
 - A non-empty cache `warning` (or an `error` on an otherwise `"ok"` cache) adds a calm `󰀦` marker
@@ -567,7 +588,10 @@ file talks to the outside world.
      notification id, see *Toast cleanup*), so no live join link is left behind for a meeting
      that is off.
 - **Bounds on calendar input**: `normalizeEvents` keeps at most `maxEvents` (512) occurrences,
-  earliest first, and drops a URL longer than `maxUrlChars` (2048). Both bound hostile input: a
+  chosen by the fetcher's relevance rule (`capByRelevance`, see *Bounds* under the fetcher; ties
+  broken by start, then id, since Qt's JS sort is not stable; the service's `grace_seconds` is
+  capped at an hour, the fetcher's at six), and
+  drops a URL longer than `maxUrlChars` (2048). Both bound hostile input: a
   `FREQ=SECONDLY` rule expands to hundreds of thousands of instances, and an invite can carry a
   URL of any length. No argv limit is at stake: no notification carries a URL (the click action
   carries the event id), and the browser launch takes it as one argument far below any limit. The fetcher caps on its side too; this is the second line.
@@ -654,9 +678,15 @@ CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [-
 - `--diagnose`: print a human-readable readiness report (packages, typelibs, GOA accounts,
   calendars found, last sync attempt and last success, the installed plugin version beside
   `OMEETINGBAR_SERVICE`) — no event content. It reads the calendar like a normal run, a due
-  network refresh included, but writes no cache.
-- `--print`: write the JSON to stdout instead of the cache file (full event content — an explicit
-  opt-in, the one exception to the privacy rule above).
+  network refresh included, but writes no cache. A module that fails on import is reported as
+  installed but broken (status `DEFEKT`/`BROKEN`), not as a traceback that loses the report — a
+  broken `gi` included; only a module that is not found at all reads as missing, an ImportError
+  from inside one (a native library, a dependency) is broken. GOA's `accounts.conf` is looked for where goa-daemon keeps it
+  (`$XDG_CONFIG_HOME` when set), then in `~/.config`, and an unreadable one is reported as such
+  rather than as "0 accounts".
+- `--print`: write the JSON to stdout instead of the cache file and leave that file alone, the
+  refresh stamp a due refresh would persist included (full event content — an explicit opt-in,
+  the one exception to the privacy rule above).
 - Exit 0 on success; on failure still write a cache with `status: "error"` and exit non-zero.
 - **Restart notice**: the environment variable `OMEETINGBAR_SERVICE` names the version of the
   service that started the run (see *Version and updates*). When it differs from `version` in
@@ -681,12 +711,26 @@ CLI: `omeetingbar-fetch [--config PATH] [--out PATH] [--backend eds|ics|demo] [-
   changes nothing, and a missing or malformed pid keeps the notice. A run from a terminal that
   sets `OMEETINGBAR_SERVICE` by hand names the terminal, so the readers cut its notice. Readers
   from before 1.1.0 ignore both fields and show `warning` as it is, which is what they need.
-- **Bounds** (calendar data is third-party input): at most 2000 instances per calendar or feed
-  (the expansion is stopped, `warning` says so), at most 512 events in the cache (earliest
-  first), URLs over 2048 characters are dropped. Service.qml caps again on its side.
+- **Bounds** (calendar data is third-party input): one series contributes at most 512
+  occurrences — the rest is skipped, never the expansion stopped: EDS walks the series in hash
+  order, and stopping hid every later series of the calendar. A calendar or feed keeps at most its
+  2000 earliest occurrences, and an ICS series that repeats every second or minute and would
+  flood the window is dropped before the expansion (see *backend `ics`*). `warning` names each
+  cut. The cache keeps at most 512 events, chosen by
+  relevance, not by start (`cap_events`): what has not started more than `grace_seconds` ago,
+  earliest first, up to three quarters of the limit; then what is running; then what finished
+  most recently; then the rest ahead. The agenda starts at local midnight, and an earliest-first
+  cut let a dense morning push every meeting still ahead out of an "ok" cache. URLs over 2048
+  characters are dropped. Service.qml caps again by the same rule, Widget.qml at 512.
 - **Deadlines**: the service kills the fetcher at 45 s and a killed run writes no cache, so every
-  blocking call has one — 15 s for all pushed refreshes together (a `Gio.Cancellable` fired from a
-  timer), 30 s for all ICS downloads together, 1 s per `connect_sync` (see below).
+  blocking call has one — 15 s for all pushed refreshes together, charged only for the time
+  inside `refresh_sync` (a `Gio.Cancellable` fired from a timer), and no refresh started or left
+  running past 25 s into the calendar loop (connects and expansion count towards that) — the
+  cutoff bounds the refreshes, not the loop: the calendars after it are still connected and read,
+  from the local copy; 30 s for all ICS
+  downloads together, each held to what is left of it (a download thread abandoned at the
+  deadline: the socket timeout applies per operation and name resolution has none); 1 s per
+  `connect_sync` (see below).
 
 ### Test injection — `--in-seconds`
 
@@ -723,6 +767,8 @@ of the injected occurrence:
   is reported through `warning`, not silently swallowed.
 - `--print` also arms the marker — the arming is the point; only the payload goes to stdout
   instead of into the cache.
+- The marker is read after the backend has run, not before: a run that started before the test
+  was armed — the service's, during a slow refresh — must not write its cache without it.
 
 ### backend `eds` (default, Google Workspace via GOA)
 
@@ -754,23 +800,61 @@ Verified API recipe — follow it exactly:
   by the local offset. All-day events are `is_date() == True`.
 - Network freshness: EDS's own refresh interval defaults to **60 minutes**. When the last refresh is
   older than `refresh_seconds`, call `client.refresh_sync(cancellable)` (guarded by
-  `client.check_refresh_supported()`) for every calendar inside one 15 s budget. The attempt is
-  stamped into `refreshed_at` and **persisted before** the refresh starts (the previous cache is
-  rewritten with the new stamp), so a refresh killed by the watchdog cannot make the next run hang
-  on the same refresh again. Outcomes go to `refresh_ok_at` and `warning`: all failed → "Kalender-
-  Sync fehlgeschlagen" and `refresh_ok_at` unchanged; some failed → "teilweise fehlgeschlagen
-  (n von m)"; and whenever `refresh_ok_at` is older than 30 min → "Letzter erfolgreicher
-  Kalender-Sync vor …". A refresh failure never discards the local copy: EDS still has it, and a
-  stale list that says so beats an empty one.
+  `client.check_refresh_supported()`) for every calendar, within the budget and cutoff above,
+  starting at another calendar every refresh cycle (`now // refresh_seconds`) so that a spent
+  budget never starves the same calendars; one left out is read from the local copy and counts
+  as skipped, not failed. Only the order of the refreshes rotates: results are merged in registry
+  order, so which copy of a meeting listed in two calendars wins does not change from cycle to
+  cycle. The attempt is stamped into `refreshed_at` and **persisted before** the
+  refresh starts (the previous cache is rewritten with the new stamp), so a refresh killed by the
+  watchdog cannot make the next run hang on the same refresh again; the in-memory cache gets the
+  stamp too, so an error branch writes it back instead of the old one.
+  `refresh_sync` returns success whatever the server answered — measured on EDS 3.60.2 with
+  synthetic webcal sources: 200, 401 and 500 all return without an error and without
+  `backend-error`, at once when the server answers at once and only after its answer when it is
+  slow. The source's connection status is no reliable witness: it turns `awaiting-credentials`
+  after a 401, but EDS sets it back to `disconnected` when the refresh returns, and when a
+  client is released. What does tell is the source's `credentials-required` signal, connected
+  before the calendar is opened: a backend that the server turned down asks for credentials,
+  with reason `required` or `rejected` after a 401 and `error` after a 500, for every refresh
+  that fails (a fast or a slow answer, one calendar or several, a fresh process per run) and
+  never for a 200. Signals are queued until the main context runs, so after the loop the run
+  lets them in for 0.3 s and only then releases the clients. A calendar counts as failed when it
+  asked for credentials, when its status still reads `awaiting-credentials` or `ssl-failed`,
+  when the client reported `backend-error` or `backend-died` (heard if a backend sends them; the
+  webcal backend sent neither), when `is_online()` is false (EDS's network monitor sees no
+  network), or when connecting failed. An unreachable server that the network monitor does not
+  notice may still pass unreported, so `refresh_ok_at` means "accepted by EDS without a reported
+  error". Outcomes go to `refresh_ok_at` and `warning`: all failed → `refresh_ok_at`
+  unchanged; some failed → "teilweise fehlgeschlagen (n von m)"; on every run, refreshing or not,
+  "Kalender-Sync fehlgeschlagen" while `refreshed_at` is newer than `refresh_ok_at` (after login
+  too, when the tmpfs cache knows no success at all), and "Letzter erfolgreicher Kalender-Sync
+  vor …" once `refresh_ok_at` is older than 30 min or `refresh_seconds`, whichever is longer.
+  A run in which a calendar asks for a sign-in (`required`, `rejected`, or the status
+  `awaiting-credentials`) stamps `signin_needed_at`, and "Google-Anmeldung nötig – in
+  gnome-online-accounts-gtk neu anmelden" is shown while the stamp is set: by the next run the
+  backend that asked is gone. A run whose refreshes were read without such a request clears
+  it — failures of other kinds say nothing about the sign-in — and so does a deliberate state
+  (no account any more). A refresh failure never discards the local copy: EDS still has it, and
+  a stale list that says so beats an empty one.
 - One failing calendar: any exception from `connect_sync` or the expansion is that calendar's
-  problem, not the run's. It is reported as "Kalender N (…)" in `warning` (or in `error` when
-  nothing at all was read), and its events from the previous cache are carried forward (with
-  `_join_path: "cache"`), so a one-minute hiccup neither empties the agenda nor makes Service.qml
-  withdraw a queued alert as "gone from the cache".
+  problem, not the run's. So is a calendar that hands over no occurrence at all when a direct
+  query of the window (`get_object_list_as_comps_sync`) then fails: a calendar factory that died
+  hands over nothing and no error, which read as an empty calendar. Occurrences that fail to
+  convert fail the calendar only when they are at least as many as the converted ones; fewer are
+  a warning ("n Termine nicht auswertbar") and the rest is used. A failing calendar is reported as
+  "Kalender N (…)" in `warning` (or in `error` when nothing at all was read), and its events from
+  the previous cache are carried forward (with `_join_path: "cache"`) — matched by
+  `calendar_uid`, since a healthy namesake's deleted meeting must not come back (entries from
+  before 1.2.0 have only the name), and only those that end inside the window — so a one-minute
+  hiccup neither empties the agenda nor makes Service.qml withdraw a queued alert as "gone from
+  the cache".
 - `STATUS:CANCELLED` occurrences are dropped (`get_status()` on eds, the `STATUS` property on
   ics) — a backend that still hands them over must not blank the screen for them.
 - Join URL, in this order: RFC 7986 `CONFERENCE` property → `X-GOOGLE-CONFERENCE` X-property →
-  the first `JOIN_URL_RE` match in `LOCATION`, then in `DESCRIPTION`. `JOIN_URL_RE` accepts these
+  the first `JOIN_URL_RE` match in `LOCATION`, then in `DESCRIPTION`, that still passes the
+  whole-value test after trailing punctuation is trimmed (a bare `https://discord.gg/` names no
+  room and must not hide a real link after it). `JOIN_URL_RE` accepts these
   hosts (and their subdomains): `meet.google.com`, `zoom.us`, `zoomgov.com`,
   `teams.microsoft.com`, `teams.live.com`, `webex.com`, `meet.jit.si`, `8x8.vc`, `whereby.com`,
   `gotomeeting.com`, `meet.goto.com`, `gotomeet.me`; for Slack and Discord, which also carry
@@ -808,6 +892,25 @@ can miss a meeting that was moved this morning. Fetch each `ics_urls` entry with
 (timeout, no redirects to non-https), parse with `icalendar` + `recurring_ical_events`
 (both in `extra`, currently not installed → import failure must degrade to `status: "error"`,
 not a traceback). Treat the URLs as secrets: never log them, never put them in `error`.
+
+One feed's trouble stays that feed's. Before the expansion — which expands the whole window first
+and walks a series from its DTSTART (one `FREQ=SECONDLY` invite costs a minute and gigabytes) —
+a series whose rule repeats every second or minute is dropped when it can put more than 512
+occurrences into the window, or when the walk from its DTSTART would take more than 200 000
+steps; `COUNT`, `UNTIL` and `INTERVAL` all count (`MINUTELY;INTERVAL=1440` is a daily meeting,
+and ten minutely occurrences up to an `UNTIL` are ten). A series that can put no occurrence into
+the window is dropped silently, a rule without a readable `FREQ` as malformed. Any other
+malformed series (RRULE, EXDATE, DTSTART) makes the expansion run again with `skip_bad_series`
+instead of making the feed unreadable. These notes about a feed that was read — dropped, skipped
+or cut series, a few unparseable entries — go to `warning` and do not make the run fail. A feed
+counts as lost, though, when it cannot be read (https only, network, budget, unparseable), when
+at least as many of its entries fail to convert as convert, or when broken series were skipped,
+nothing came out and the last cache held meetings of that feed in the window. A lost feed keeps
+its events from the previous cache as long as another feed was read, matched by its
+`calendar_uid` key, so same-named feeds stay apart, a feed removed from `ics_urls` is not kept
+alive, and a URL listed twice and read once counts as read; entries written before 1.2.0 have no
+key and count by name, and only out of a cache the ics backend wrote. With every feed lost the
+run ends in `status: "error"` with the stale list, as before.
 
 ### backend `demo`
 

@@ -25,7 +25,9 @@ Always run with /usr/bin/python3, never a bare `python3`: mise/pyenv shims do no
 carry the `gi` bindings the eds backend needs.
 
 Privacy: the cache carries id/title/start/end/all_day/declined/url/calendar/
-location and nothing else -- no attendees, no description, no organizer. Nothing
+location, the calendar's EDS source uid (or a key derived from an ICS feed's
+URL, never the URL) and, on all-day entries, their dates -- and nothing else:
+no attendees, no description, no organizer. Nothing
 but counts and error text reaches stdout or the journal, and ICS feed URLs are
 treated as secrets (they are bearer tokens: never logged, never quoted in an
 error).
@@ -104,11 +106,24 @@ MAX_URL_CHARS = 2048
 # Total budget for the pushed network refresh across all calendars, and for
 # all ICS downloads: the service kills the fetcher at 45 s, and a killed run
 # writes no cache at all, so every blocking call needs a deadline well inside.
+# The refresh budget is charged only for the time spent inside refresh_sync.
+# The cutoff bounds the refreshes, not the loop: no refresh starts later than
+# this into the calendar loop (connects and expansion count towards it), one
+# still running then is cancelled, and the calendars after it are still read,
+# from the local copy.
 REFRESH_BUDGET_SECONDS = 15
+REFRESH_CUTOFF_SECONDS = 25
 ICS_BUDGET_SECONDS = 30
 # A pushed refresh that has not succeeded for this long means EDS is serving
 # its old local copy (revoked token, VPN down) and the user has to be told.
+# A refresh_seconds above it raises the threshold to match.
 REFRESH_STALE_SECONDS = 1800
+# refresh_sync reports success whatever the server answered; EDS tells the
+# outcome as D-Bus signals instead -- the source asking for credentials, its
+# connection status. The refresh call returns once the backend has its answer,
+# so the signals are queued by then, but the fetcher runs no main loop: after
+# the calendar loop it lets them in for this long (measured on EDS 3.60).
+SYNC_SETTLE_SECONDS = 0.3
 
 # Exactly the packages README.md and install.sh name, in the same order, so
 # the sentence the user reads here is the command they can paste.
@@ -158,6 +173,9 @@ MESSAGES = {
         "srcUnparseable": "Quelle %d: nicht auswertbar (%s)",
         "srcCapped": "Quelle %d: mehr als %d Termine im Fenster, gekürzt",
         "srcBroken": "Quelle %d: %d Einträge nicht auswertbar",
+        "srcSeriesSkipped": "Quelle %d: fehlerhafte Terminserien übersprungen",
+        "srcSeriesCapped": "Quelle %d: Terminserien mit mehr als %d Terminen im Fenster gekürzt",
+        "srcRunaway": "Quelle %d: Serien im Minuten- oder Sekundentakt übersprungen (%d)",
         "icsNoneReadable": "Kein ICS-Feed lesbar – %s",
         "icsProblems": "ICS-Probleme: %s",
         "giMissing": "Python-Modul 'gi' fehlt – installieren: sudo pacman -S python-gobject",
@@ -170,14 +188,17 @@ MESSAGES = {
         "skipDeclinedNoIdentity": "skip_declined ist aktiv, aber im Konto ist keine eigene Adresse hinterlegt – abgelehnte Termine lösen weiterhin einen Alarm aus.",
         "calendarLabel": "Kalender %d",
         "calCapped": "%s: mehr als %d Termine im Fenster, Liste gekürzt.",
+        "calSeriesCapped": "%s: Terminserien mit mehr als %d Terminen im Fenster gekürzt.",
+        "calBroken": "%s: Termine nicht auswertbar (%d).",
         "syncFailed": "Kalender-Sync fehlgeschlagen – es gilt die lokale Kopie.",
         "syncPartial": "Kalender-Sync teilweise fehlgeschlagen (%d von %d).",
         "syncStale": "Letzter erfolgreicher Kalender-Sync vor %s – Termine können veraltet sein.",
+        "syncSignIn": "Google-Anmeldung nötig – in %s neu anmelden.",
         "carried": "%d Termine aus dem letzten Lauf übernommen",
         "calendarsUnreadable": "Kalender nicht lesbar – %s",
         "partialFailure": "Teilweise fehlgeschlagen: %s",
         "unexpectedBackendError": "Unerwarteter Fehler im Backend '%s' (%s: %s).",
-        "maxEvents": "Nur die ersten %d Termine werden ausgeliefert.",
+        "maxEvents": "Mehr als %d Termine im Fenster – Liste gekürzt, anstehende zuerst.",
         "restartNeeded": "OMeetingBar wurde aktualisiert – Shell neu starten (omarchy restart shell), damit die neue Version läuft.",
         # --diagnose
         "diagTitle": "OMeetingBar – Bereitschaftsprüfung",
@@ -198,6 +219,7 @@ MESSAGES = {
         "diagPackages": "Pakete  (linke Spalte = pacman-Paketname)",
         "diagOk": "ok",
         "diagMissing": "FEHLT",
+        "diagBroken": "DEFEKT",
         "diagIcsOnly": "%s (nur Backend ics)",
         "diagTypelibPath": "  Typelib-Suchpfad: %s",
         "gobjectMissing": "python-gobject fehlt",
@@ -205,6 +227,7 @@ MESSAGES = {
         "presentNotLoadable": "%s vorhanden, aber nicht ladbar%s",
         "fileMissing": "%s fehlt%s",
         "notInstalled": "nicht installiert",
+        "moduleBroken": "installiert, aber defekt (%s: %s)",
         "present": "vorhanden",
         "goaFileMissing": "%s fehlt",
         "goaUnreadable": "nicht lesbar (%s)",
@@ -271,6 +294,9 @@ MESSAGES = {
         "srcUnparseable": "Source %d: unparseable (%s)",
         "srcCapped": "Source %d: more than %d events in the window, truncated",
         "srcBroken": "Source %d: %d entries unparseable",
+        "srcSeriesSkipped": "Source %d: malformed series skipped",
+        "srcSeriesCapped": "Source %d: series with more than %d occurrences in the window truncated",
+        "srcRunaway": "Source %d: series repeating every minute or second skipped (%d)",
         "icsNoneReadable": "No ICS feed readable – %s",
         "icsProblems": "ICS problems: %s",
         "giMissing": "Python module 'gi' is missing – install: sudo pacman -S python-gobject",
@@ -283,14 +309,17 @@ MESSAGES = {
         "skipDeclinedNoIdentity": "skip_declined is on, but the account carries no own address – declined meetings still trigger an alert.",
         "calendarLabel": "Calendar %d",
         "calCapped": "%s: more than %d events in the window, list truncated.",
+        "calSeriesCapped": "%s: series with more than %d occurrences in the window truncated.",
+        "calBroken": "%s: events unparseable (%d).",
         "syncFailed": "Calendar sync failed – using the local copy.",
         "syncPartial": "Calendar sync partly failed (%d of %d).",
         "syncStale": "Last successful calendar sync %s ago – meetings may be outdated.",
+        "syncSignIn": "Google sign-in needed – sign in again in %s.",
         "carried": "%d events carried over from the previous run",
         "calendarsUnreadable": "Calendars unreadable – %s",
         "partialFailure": "Partly failed: %s",
         "unexpectedBackendError": "Unexpected error in backend '%s' (%s: %s).",
-        "maxEvents": "Only the first %d events are delivered.",
+        "maxEvents": "More than %d events in the window – list truncated, upcoming ones first.",
         "restartNeeded": "OMeetingBar was updated – restart the shell (omarchy restart shell) to run the new version.",
         # --diagnose
         "diagTitle": "OMeetingBar – readiness check",
@@ -311,6 +340,7 @@ MESSAGES = {
         "diagPackages": "Packages  (left column = pacman package name)",
         "diagOk": "ok",
         "diagMissing": "MISSING",
+        "diagBroken": "BROKEN",
         "diagIcsOnly": "%s (ics backend only)",
         "diagTypelibPath": "  Typelib search path: %s",
         "gobjectMissing": "python-gobject missing",
@@ -318,6 +348,7 @@ MESSAGES = {
         "presentNotLoadable": "%s present but not loadable%s",
         "fileMissing": "%s missing%s",
         "notInstalled": "not installed",
+        "moduleBroken": "installed but broken (%s: %s)",
         "present": "present",
         "goaFileMissing": "%s missing",
         "goaUnreadable": "unreadable (%s)",
@@ -457,11 +488,17 @@ def unescape_html(text):
 
 class BackendError(Exception):
     """A backend could not produce a trustworthy event list. Carries a message
-    meant for the user's screen, so it must stay free of URLs and tokens."""
+    meant for the user's screen, so it must stay free of URLs and tokens.
 
-    def __init__(self, message):
+    `keep_stale` False marks a deliberate state rather than a failure -- no
+    account, every calendar switched off, no feed configured. The last known
+    list must not live on then: the meetings of a removed account would keep
+    ringing for days."""
+
+    def __init__(self, message, keep_stale=True):
         super().__init__(message)
         self.message = message
+        self.keep_stale = keep_stale
 
 
 # --- small shared helpers ---------------------------------------------------
@@ -476,11 +513,45 @@ def _short(value, limit=140):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def _scrub(value):
-    """Error text meant for the user's screen (widget tooltip, `status`): URLs
-    -- CalDAV errors quote the request -- and addresses are blanked first."""
-    text = re.sub(r"https?://\S+", "<url>", str(value))
-    return re.sub(r"\S+@\S+", "<adresse>", text)
+# A quoted span: opening and closing mark of one pair, nothing quoted inside.
+# The ASCII apostrophe is left out on purpose -- "can't ... server's" is not a
+# quotation.
+_QUOTED_SPAN = re.compile(r'"[^"\n]{1,200}"|“[^”\n]{1,200}”|„[^“”\n]{1,200}[“”]'
+                          r'|»[^«\n]{1,200}«|«[^»\n]{1,200}»|›[^‹\n]{1,200}‹|‹[^›\n]{1,200}›'
+                          r'|‘[^’\n]{1,200}’|‚[^‘’\n]{1,200}[‘’]')
+
+
+def _blank_quoted(match):
+    span = match.group(0)
+    inner = span[1:-1]
+    if "@" in inner or re.search(r"\s", inner):
+        return span[0] + "<name>" + span[-1]
+    return span
+
+
+def _scrub(value, limit=None, known=()):
+    """Error text meant for the user's screen (widget tooltip, `status`,
+    --diagnose): CalDAV and GOA errors quote requests, accounts and calendar
+    names. In this order: URLs, then the names this run knows (a calendar's
+    display name, the account's addresses), then quoted spans holding an "@"
+    or a space -- display names -- then addresses. Shortening comes last, so a
+    cut can never leave the local part of an address behind.
+
+    A known name only counts as a whole word ("Work" must not turn "Network"
+    into "Net<name>", nor "family.example.org" into a name), with any run of
+    whitespace between its words; a sentence's closing period still ends it. The input
+    is bounded first: the address pattern is quadratic on long runs without
+    whitespace, and nothing past a few kilobytes reaches the screen anyway."""
+    text = re.sub(r"https?://\S+", "<url>", str(value)[:4096])
+    for name in sorted({" ".join(str(n).split()) for n in known if n and len(str(n).strip()) >= 3},
+                       key=len, reverse=True):
+        pattern = (r"(?<![\w@])(?<!\w\.)" + r"\s+".join(map(re.escape, name.split()))
+                   + r"(?![\w@]|\.\w)")
+        text = re.sub(pattern, "<name>", text, flags=re.IGNORECASE)
+    text = _QUOTED_SPAN.sub(_blank_quoted, text)
+    # %40 is "@" in a URL path, which is how CalDAV paths carry the account.
+    text = re.sub(r"\S+(?:@|%40)\S+", "<email>", text)
+    return _short(text, limit) if limit else " ".join(text.split())
 
 
 def _call(obj, name, default=None):
@@ -522,19 +593,21 @@ def runtime_dir():
 
 
 def load_config(path):
-    """-> (config, warning). Never raises. A missing file is normal; a broken
-    one falls back to the documented defaults and returns a warning that ends
-    up in the cache's `warning` field, so the user can actually see it."""
+    """-> (config, warning, broken). Never raises. A missing file is normal; a
+    broken one falls back to the documented defaults and returns a warning that
+    ends up in the cache's `warning` field, so the user can actually see it.
+    `broken` says the file could not be used as written -- unreadable, not an
+    object, invalid values -- and not merely that an option was capped."""
     config = dict(DEFAULTS)
     try:
         with open(path, "r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except FileNotFoundError:
-        return config, ""
+        return config, "", False
     except (OSError, ValueError) as exc:
-        return config, _("cfgUnreadable", path, _short(exc, 80))
+        return config, _("cfgUnreadable", path, _short(exc, 80)), True
     if not isinstance(raw, dict):
-        return config, _("cfgNotObject", path)
+        return config, _("cfgNotObject", path), True
 
     rejected = []
     for key, default in DEFAULTS.items():
@@ -567,7 +640,7 @@ def load_config(path):
     if config["grace_seconds"] > MAX_GRACE_SECONDS:
         warnings.append(_("cfgGraceCap", MAX_GRACE_SECONDS))
         config["grace_seconds"] = MAX_GRACE_SECONDS
-    return config, " ".join(warnings)
+    return config, " ".join(warnings), bool(rejected)
 
 
 # --- event construction (pure) ----------------------------------------------
@@ -583,7 +656,7 @@ def event_id(uid, start_epoch, title=""):
 
 
 def make_event(uid, title, start, end, all_day, url, calendar, location, join_path,
-               declined=False):
+               declined=False, calendar_uid=""):
     """One cache entry. `_join_path` records which URL rule matched; every
     underscore key is stripped again before the cache is written -- it exists
     only so --diagnose can name the path without printing the URL.
@@ -591,12 +664,18 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
     `declined` defaults to False because only the eds backend can know it: it
     needs the account's own ATTENDEE line, which neither the ics feed nor the
     demo schedule has, so those two always write False (that is correct, not a
-    missing feature)."""
+    missing feature).
+
+    `calendar_uid` (the EDS source uid, lower-cased like calendars_exclude, or
+    an ICS feed's key) and, for an all-day entry, `date`/`end_date` (end
+    exclusive) are for the fetcher's own next run:
+    display names are not unique, and an all-day entry's epochs are the local
+    midnights of the zone that wrote them. previous_events reads both back."""
     start = int(start)
     end = int(end) if end is not None else start
     if end < start:
         end = start
-    return {
+    event = {
         "id": event_id(uid, start, title),
         "title": _short(title or _("untitled"), 200),
         "start": start,
@@ -608,8 +687,25 @@ def make_event(uid, title, start, end, all_day, url, calendar, location, join_pa
         "url": url if url and len(url) <= MAX_URL_CHARS else "",
         "calendar": _short(calendar or "", 120),
         "location": _short(location or "", 200),
+        # "" for demo and the test event, which belong to no source.
+        "calendar_uid": _short((calendar_uid or "").strip().lower(), 120),
         "_join_path": join_path,
     }
+    if all_day:
+        event["date"] = _nearest_local_date(start).isoformat()
+        event["end_date"] = _nearest_local_date(end).isoformat()
+    return event
+
+
+def _nearest_local_date(epoch):
+    """The local date whose midnight is nearest to `epoch`. An end computed as
+    start plus a day of seconds lands an hour short of midnight on a 25-hour
+    day; the plain date would make that all-day entry end where it starts."""
+    moment = datetime.datetime.fromtimestamp(epoch)
+    try:
+        return (moment + datetime.timedelta(hours=12)).date()
+    except OverflowError:  # the last day datetime can hold
+        return moment.date()
 
 
 def clean_url(value):
@@ -655,9 +751,11 @@ def pick_join_url(conference, x_google_conference, location, description):
     # Descriptions arrive HTML-escaped, so &amp; has to be undone before matching
     # or a Zoom link loses its ?pwd= parameter.
     for text, path in ((location, "location-regex"), (description, "description-regex")):
-        match = JOIN_URL_RE.search(unescape_html(text or ""))
-        if match:
-            url = clean_url(match.group(0))
+        for match in JOIN_URL_RE.finditer(unescape_html(text or "")):
+            # The whole-value test again, after trimming: "https://discord.gg/."
+            # in prose trims to a bare prefix that names no room at all, and
+            # must not hide a real link later in the same text.
+            url = provider_url(match.group(0))
             if url:
                 return url, path
     return "", "none"
@@ -687,7 +785,11 @@ def apply_filters(events, config, now, window_end):
     for event in events:
         if config["skip_all_day"] and event["all_day"]:
             continue
-        if event["calendar"].strip().lower() in excluded:
+        # By display name or by uid, like calendar_excluded() on the live
+        # sources -- the uid also reaches stale and carried-forward entries,
+        # whose source may be unreachable right now.
+        if (event["calendar"].strip().lower() in excluded
+                or event.get("calendar_uid", "") in excluded):
             continue
         if any(term in event["title"].lower() for term in blocked):
             continue
@@ -730,9 +832,27 @@ def load_cache(path):
     return data if isinstance(data, dict) else {}
 
 
+def _all_day_dates(item):
+    """-> (first, last) as dates, or None for an entry written without them
+    (before 1.2.0) or with anything that is not an ISO date."""
+    try:
+        first = datetime.date.fromisoformat(str(item.get("date")))
+        last = datetime.date.fromisoformat(str(item.get("end_date")))
+    except ValueError:
+        return None
+    return first, max(first, last)
+
+
 def previous_events(cache):
-    """Last known good list, re-validated field by field: a corrupt cache must
-    not be laundered into a fresh cache carrying our name."""
+    """Last known good list, re-validated field by field with the rules a fresh
+    entry is written by: a corrupt or older cache must not be laundered into a
+    fresh cache carrying our name. The URL passes the provider allow-list
+    again, so a link an older fetcher accepted (before the ASCII host match)
+    does not live on in stale and carried-forward entries.
+
+    An all-day entry is rebuilt from its dates in the current zone: its epochs
+    are the writer's midnights, and after a timezone change they would put a
+    vacation on two days. Entries without dates keep their epochs."""
     raw = cache.get("events")
     if not isinstance(raw, list):
         return []
@@ -743,20 +863,36 @@ def previous_events(cache):
         start = _int(item.get("start"), None)
         if start is None or not isinstance(item.get("id"), str):
             continue
-        kept.append({
+        end = max(_int(item.get("end"), start), start)
+        all_day = bool(item.get("all_day"))
+        dates = _all_day_dates(item) if all_day else None
+        if dates:
+            try:
+                start, end = (_local_epoch(dates[0], 0, 0),
+                              max(_local_epoch(dates[1], 0, 0), _local_epoch(dates[0], 0, 0)))
+            except (ValueError, OverflowError, OSError):
+                # A date no epoch can express (year 1 east of UTC): keep the
+                # stored epochs rather than lose the whole run to it.
+                dates = None
+        event = {
             "id": item["id"],
-            "title": str(item.get("title") or ""),
+            "title": _short(str(item.get("title") or ""), 200),
             "start": start,
-            "end": _int(item.get("end"), start),
-            "all_day": bool(item.get("all_day")),
+            "end": end,
+            "all_day": all_day,
             # Load-bearing: without this key a backend failure would rebuild a
             # declined meeting as a normal one and blank the screen for a
             # meeting the user has already said no to.
             "declined": item.get("declined") is True,
-            "url": str(item.get("url") or ""),
-            "calendar": str(item.get("calendar") or ""),
-            "location": str(item.get("location") or ""),
-        })
+            "url": provider_url(str(item.get("url") or "")),
+            "calendar": _short(str(item.get("calendar") or ""), 120),
+            "location": _short(str(item.get("location") or ""), 200),
+            "calendar_uid": _short(str(item.get("calendar_uid") or "").strip().lower(), 120),
+        }
+        if dates:
+            event["date"] = dates[0].isoformat()
+            event["end_date"] = dates[1].isoformat()
+        kept.append(event)
     kept.sort(key=lambda event: (event["start"], event["id"]))
     return kept
 
@@ -770,8 +906,33 @@ def stale_events(cache, config, now, window_start, window_end):
     return [event for event in events if max(event["end"], event["start"]) >= window_start]
 
 
+def cap_events(events, now, grace, limit=MAX_EVENTS):
+    """-> (events, capped): at most `limit` entries, chosen by relevance rather
+    than by start. The agenda begins at local midnight and keeps finished
+    meetings, so an earliest-first cut let a dense morning push every meeting
+    still ahead out of a cache that said "ok".
+
+    Kept first: what has not started more than `grace` ago, earliest first, up
+    to three quarters of the limit; then what is still running; then what
+    finished most recently; then the rest of what lies ahead. The result is in
+    (start, id) order again."""
+    if len(events) <= limit:
+        return events, False
+    ordered = sorted(events, key=lambda event: (event["start"], event["id"]))
+    ahead = [event for event in ordered if event["start"] >= now - grace]
+    behind = [event for event in ordered if event["start"] < now - grace]
+    behind.sort(key=lambda event: (max(event["end"], event["start"]) <= now,
+                                   -max(event["end"], event["start"])))
+    first = limit - limit // 4
+    kept = ahead[:first]
+    kept += behind[:limit - len(kept)]
+    kept += ahead[first:first + limit - len(kept)]
+    kept.sort(key=lambda event: (event["start"], event["id"]))
+    return kept, True
+
+
 def build_payload(backend, status, error, warning, events, refreshed_at, refresh_ok_at,
-                  stale, now, restart_notice="", restart_shell_pid=0):
+                  stale, now, restart_notice="", restart_shell_pid=0, signin_needed_at=0):
     """`error` belongs to status "error" alone. `warning` is the separate channel
     for "usable but degraded" -- a partial calendar failure, a rejected config
     value, a test event outside the window -- and stays "" when there is none, so
@@ -782,7 +943,8 @@ def build_payload(backend, status, error, warning, events, refreshed_at, refresh
     that ran this fetch is outdated, and `restart_shell_pid` names the process
     that started the run -- the desktop shell for every run of the service --
     so that a reader in another shell process, i.e. after a restart, can cut
-    exactly that text again (see restart_needed)."""
+    exactly that text again (see restart_needed). `signin_needed_at` is the
+    eds backend's sign-in stamp, for its own next run (see read_eds)."""
     payload = {
         "schema": SCHEMA_VERSION,
         "backend": backend,
@@ -800,6 +962,8 @@ def build_payload(backend, status, error, warning, events, refreshed_at, refresh
     if restart_notice:
         payload["restart_notice"] = restart_notice
         payload["restart_shell_pid"] = int(restart_shell_pid)
+    if signin_needed_at:
+        payload["signin_needed_at"] = int(signin_needed_at)
     return payload
 
 
@@ -1026,8 +1190,9 @@ def _dt_to_epoch(value):
     return None
 
 
-def ics_component_to_event(component, calendar_name):
-    """Pure: takes an already-parsed component, returns a cache entry or None."""
+def ics_component_to_event(component, calendar_name, calendar_uid=""):
+    """Pure: takes an already-parsed component, returns a cache entry or None.
+    `calendar_uid` is the feed's key (ics_feed_key), never its URL."""
     # A cancelled occurrence the feed still lists must not blank the screen.
     if _ics_text(component, "STATUS").strip().upper() == "CANCELLED":
         return None
@@ -1050,17 +1215,165 @@ def ics_component_to_event(component, calendar_name):
                               _ics_text(component, "X-GOOGLE-CONFERENCE"),
                               location, _ics_text(component, "DESCRIPTION"))
     return make_event(_ics_text(component, "UID"), _ics_text(component, "SUMMARY"),
-                      start, end, all_day, url, calendar_name, location, path)
+                      start, end, all_day, url, calendar_name, location, path,
+                      calendar_uid=calendar_uid)
 
 
-def read_ics(config, window_start, window_end):
-    """-> (events, failure). Raises BackendError when nothing could be read; a
-    non-empty `failure` means some feeds were unreadable (D2: with nothing left
-    after filtering the caller turns that into status "error").
-    Feed URLs are secrets: failures are reported by list position only."""
+class _BudgetSpent(Exception):
+    """A feed download outlived what was left of ICS_BUDGET_SECONDS."""
+
+
+def _http_get_ics_bounded(url, budget):
+    """_http_get_ics with a wall-clock bound. ICS_TIMEOUT_SECONDS applies per
+    socket operation and name resolution has none, so a slow or dripping feed
+    could run past the service's 45 s watchdog, and a killed run writes no
+    cache at all. The download runs in a daemon thread that is abandoned at
+    the deadline."""
+    result = {}
+
+    def download():
+        try:
+            result["text"] = _http_get_ics(url, max(min(ICS_TIMEOUT_SECONDS, budget), 1))
+        except Exception as exc:
+            result["error"] = exc
+
+    worker = threading.Thread(target=download, daemon=True)
+    worker.start()
+    worker.join(budget)
+    if worker.is_alive():
+        raise _BudgetSpent()
+    if "error" in result:
+        raise result["error"]
+    return result["text"]
+
+
+# Seconds per step of the RRULE frequencies that can run away. recurring_ical_events
+# expands the whole window before anything can be cut, and walks a series from its
+# DTSTART: one FREQ=SECONDLY invite costs a minute and gigabytes.
+ICS_RUNAWAY_FREQUENCIES = {"SECONDLY": 1, "MINUTELY": 60}
+# The most steps the expansion may walk for one such series, from its DTSTART
+# to the end of the window -- a minutely rule that started years ago costs
+# seconds even when only a few of its occurrences fall into the window.
+ICS_MAX_WALK = 200000
+
+
+def _rule_values(rule, key):
+    """The values of one RRULE part; [] for a part that is missing or a rule
+    icalendar could not read (version 7 hands that over as vBroken, which
+    raises on access)."""
+    try:
+        values = rule.get(key)
+    except Exception:
+        return []
+    if values is None:
+        return []
+    return values if isinstance(values, list) else [values]
+
+
+def _ics_epoch(value):
+    """A DTSTART or UNTIL value as unix seconds; None when it cannot be read
+    (a vBroken value may raise on any attribute access)."""
+    try:
+        return _dt_to_epoch(getattr(value, "dt", value))
+    except Exception:
+        return None
+
+
+def _series_verdict(component, rule, window_start, window_end):
+    """None keeps the series. "malformed": the rule has no FREQ it can be read
+    by, which would make the expansion fail. "gone": the rule can put no
+    occurrence into the window. "runaway": it repeats every second or minute
+    and can put more than MAX_EVENTS occurrences into the window, or the
+    expansion would have to walk more than ICS_MAX_WALK steps to reach it. A
+    COUNT, an UNTIL or a long INTERVAL (MINUTELY;INTERVAL=1440 is a daily
+    meeting) all count."""
+    frequencies = [str(value).upper() for value in _rule_values(rule, "FREQ")]
+    if not frequencies:
+        return "malformed"
+    unit = ICS_RUNAWAY_FREQUENCIES.get(frequencies[0])
+    if not unit:
+        return None
+    try:
+        count = int((_rule_values(rule, "COUNT") or [0])[0])
+        interval = max(int((_rule_values(rule, "INTERVAL") or [1])[0]), 1)
+    except (TypeError, ValueError):
+        return None
+    step = interval * unit
+    try:
+        start = _ics_epoch(component.get("DTSTART"))
+    except Exception:
+        start = None
+    end = int(window_end)
+    untils = _rule_values(rule, "UNTIL")
+    until = _ics_epoch(untils[0]) if untils else None
+    if until is not None:
+        end = min(end, until)
+    if start is not None and count > 0:
+        end = min(end, start + (count - 1) * step)
+    if end < window_start:
+        return "gone"
+    first = max(int(window_start), start if start is not None else int(window_start))
+    if (end - first) // step + 1 > MAX_EVENTS:
+        return "runaway"
+    if start is not None and (end - start) // step + 1 > ICS_MAX_WALK:
+        return "runaway"
+    return None
+
+
+def _drop_runaway_series(calendar, window_start, window_end):
+    """Remove, before the expansion, the VEVENTs whose rule would hurt it:
+    malformed rules, runaway ones, and ones with no occurrence in the window --
+    those silently, nothing in the window is lost. -> (runaway, malformed)."""
+    kept = []
+    runaway = malformed = 0
+    for component in calendar.subcomponents:
+        rules = component.get("RRULE") if getattr(component, "name", "") == "VEVENT" else None
+        rules = rules if isinstance(rules, list) else [rules] if rules is not None else []
+        verdicts = [_series_verdict(component, rule, window_start, window_end) for rule in rules]
+        if "malformed" in verdicts:
+            malformed += 1
+            continue
+        if "runaway" in verdicts:
+            runaway += 1
+            continue
+        if verdicts and all(verdict == "gone" for verdict in verdicts):
+            continue
+        kept.append(component)
+    calendar.subcomponents[:] = kept
+    return runaway, malformed
+
+
+def _expand_ics(recurring_ical_events, calendar, from_time, to_time):
+    """-> (occurrences, skipped). The expansion raises on the first malformed
+    rule, EXDATE or DTSTART -- even of a series outside the window -- which
+    used to make the whole feed unreadable for good. On an error it runs again
+    without the broken series."""
+    try:
+        return list(recurring_ical_events.of(calendar).between(from_time, to_time)), False
+    except Exception:
+        query = recurring_ical_events.of(calendar, skip_bad_series=True)
+        return list(query.between(from_time, to_time)), True
+
+
+def ics_feed_key(url):
+    """The calendar_uid of an ICS feed's entries: a key derived from the URL,
+    never the URL itself, which is a bearer token. Feed names (X-WR-CALNAME)
+    are not unique, and a feed that could not be read this run has none."""
+    return "ics-" + hashlib.sha256(url.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+
+
+def read_ics(config, window_start, window_end, cache=None):
+    """-> (events, failure, warnings). Raises BackendError when no feed could be
+    read at all. `failure` names the feeds that could not be used (D2: with
+    nothing left after filtering the caller turns that into status "error");
+    `warnings` are notes about feeds that were read -- a series dropped,
+    skipped or cut, a few entries unparseable -- which never make a run fail.
+    A feed that could not be used keeps its events from `cache`, the previous
+    cache, as long as another feed was read. Feed URLs are secrets: problems
+    are named by list position only."""
     urls = [url.strip() for url in config["ics_urls"] if isinstance(url, str) and url.strip()]
     if not urls:
-        raise BackendError(_("icsNoUrls"))
+        raise BackendError(_("icsNoUrls"), keep_stale=False)
     try:
         import icalendar
         import recurring_ical_events
@@ -1071,52 +1384,128 @@ def read_ics(config, window_start, window_end):
     utc = datetime.timezone.utc
     from_time = datetime.datetime.fromtimestamp(window_start, tz=utc)
     to_time = datetime.datetime.fromtimestamp(window_end, tz=utc)
+    previous = previous_events(cache or {})
 
     events = []
     failures = []
-    # ICS_TIMEOUT_SECONDS is per socket operation, so a slow-drip server or
-    # three feeds could outlast the service's 45 s watchdog; one monotonic
-    # deadline across all sources keeps the whole run inside it.
+    notes = []
+    read_keys = set()
+    read_names = set()
+    lost_keys = set()
+    # One monotonic deadline across all sources keeps the whole run inside the
+    # service's 45 s watchdog; _http_get_ics_bounded holds each download to
+    # what is left of it.
     deadline = time.monotonic() + ICS_BUDGET_SECONDS
     for index, url in enumerate(urls, start=1):
+        key = ics_feed_key(url)
         if url[:8].lower() != "https://":
             failures.append(_("srcHttpsOnly", index))
+            lost_keys.add(key)
             continue
         remaining = deadline - time.monotonic()
         if remaining < 1:
             failures.append(_("srcBudget", index))
+            lost_keys.add(key)
             continue
         try:
-            text = _http_get_ics(url, min(ICS_TIMEOUT_SECONDS, remaining))
+            text = _http_get_ics_bounded(url, remaining)
+        except _BudgetSpent:
+            failures.append(_("srcBudget", index))
+            lost_keys.add(key)
+            continue
         except Exception as exc:
             failures.append(_("srcDetail", index, _network_detail(exc)))
+            lost_keys.add(key)
             continue
         try:
             calendar = icalendar.Calendar.from_ical(text)
             name = _ics_text(calendar, "X-WR-CALNAME") or "ICS %d" % index
-            occurrences = recurring_ical_events.of(calendar).between(from_time, to_time)
+            runaway, malformed = _drop_runaway_series(calendar, window_start, window_end)
+            occurrences, skipped = _expand_ics(recurring_ical_events, calendar, from_time, to_time)
         except Exception as exc:
             failures.append(_("srcUnparseable", index, type(exc).__name__))
+            lost_keys.add(key)
             continue
+        skipped = skipped or malformed > 0
+        per_series = {}
+        series_capped = False
+        feed_events = []
         broken = 0
-        for count, component in enumerate(occurrences, start=1):
-            if count > MAX_INSTANCES_PER_CALENDAR:
-                failures.append(_("srcCapped", index, MAX_INSTANCES_PER_CALENDAR))
-                break
+        for component in occurrences:
+            series = _ics_text(component, "UID")
+            per_series[series] = per_series.get(series, 0) + 1
+            if per_series[series] > MAX_EVENTS:
+                # Cut the runaway series, never the feed: the other series
+                # after it in the feed still arrive.
+                series_capped = True
+                continue
             # One malformed component must not take the rest of its feed down.
             try:
-                event = ics_component_to_event(component, name)
+                event = ics_component_to_event(component, name, key)
             except Exception:
                 broken += 1
                 continue
             if event is not None:
-                events.append(event)
-        if broken:
-            failures.append(_("srcBroken", index, broken))
+                feed_events.append(event)
+        if len(feed_events) > MAX_INSTANCES_PER_CALENDAR:
+            # The expansion hands occurrences over in feed order; the earliest
+            # are the ones worth keeping.
+            _keep_earliest(feed_events, MAX_INSTANCES_PER_CALENDAR)
+            notes.append(_("srcCapped", index, MAX_INSTANCES_PER_CALENDAR))
+        if runaway:
+            notes.append(_("srcRunaway", index, runaway))
+        if series_capped:
+            notes.append(_("srcSeriesCapped", index, MAX_EVENTS))
+        # Read without an error, the feed can still be of no use: at least as
+        # many entries failed to convert as converted, or broken series were
+        # skipped and nothing came out although the last cache held meetings
+        # of this feed in the window. Like an EDS calendar in that state it
+        # counts as lost, so its meetings are carried rather than withdrawn.
+        lost_feed = broken > 0 and broken >= len(feed_events)
+        if not lost_feed and skipped and not feed_events:
+            lost_feed = any(event["calendar_uid"] == key
+                            and max(event["end"], event["start"]) >= window_start
+                            for event in previous)
+        trouble = (([_("srcSeriesSkipped", index)] if skipped else [])
+                   + ([_("srcBroken", index, broken)] if broken else []))
+        events.extend(feed_events)
+        if lost_feed:
+            failures.extend(trouble)
+            lost_keys.add(key)
+        else:
+            notes.extend(trouble)
+            read_keys.add(key)
+            read_names.add(_short(name, 120))
 
-    if failures and not events:
+    # A key listed twice, read once and lost once, is a feed that was read.
+    lost_only = lost_keys - read_keys
+    if lost_only and read_keys:
+        # A feed that failed this run keeps its last known events, like a
+        # failing EDS calendar: Service.qml withdraws a queued alert whose
+        # event is gone from a cache that says "ok". Matched by feed key;
+        # entries written before 1.2.0 have none and count by name -- whatever
+        # belongs to no feed read this run, the test event aside -- and only
+        # out of a cache the ics backend wrote.
+        from_ics = (cache or {}).get("backend") == "ics"
+        known = {event["id"] for event in events}
+        carried = 0
+        for event in previous:
+            if event["calendar_uid"]:
+                owned = event["calendar_uid"] in lost_only
+            else:
+                owned = (from_ics and event["calendar"] not in read_names
+                         and event["calendar"] != INJECT_CALENDAR)
+            if (owned and event["id"] not in known
+                    and max(event["end"], event["start"]) >= window_start):
+                event["_join_path"] = "cache"
+                events.append(event)
+                carried += 1
+        if carried:
+            failures.append(_("carried", carried))
+
+    if failures and not read_keys:
         raise BackendError(_("icsNoneReadable", "; ".join(failures)))
-    return events, _("icsProblems", "; ".join(failures)) if failures else ""
+    return events, (_("icsProblems", "; ".join(failures)) if failures else ""), notes
 
 
 # --- backend: eds (default) -------------------------------------------------
@@ -1151,7 +1540,7 @@ def import_eds():
     try:
         from gi.repository import ECal, EDataServer, Gio, GLib, ICalGLib
     except (ImportError, ValueError) as exc:
-        raise BackendError(_("edsUnusable", _short(exc, 80), EDS_PACKAGES)) from None
+        raise BackendError(_("edsUnusable", _scrub(exc, 80), EDS_PACKAGES)) from None
     return EDataServer, ECal, ICalGLib, GLib, Gio
 
 
@@ -1184,10 +1573,12 @@ def ical_time_to_epoch(value, ical):
         if _call(value, "get_timezone") is not None:
             value = value.convert_to_zone(ical.Timezone.get_utc_timezone())
         else:
+            # Second 60 is valid iCalendar (a leap second) but not a valid
+            # datetime; one such DTSTART must not make the calendar fail.
             return int(datetime.datetime(year, month, day,
                                          _call(value, "get_hour", 0),
                                          _call(value, "get_minute", 0),
-                                         _call(value, "get_second", 0)).timestamp())
+                                         min(_call(value, "get_second", 0), 59)).timestamp())
     return int(value.as_timet())
 
 
@@ -1266,7 +1657,8 @@ def attendee_partstat(icomp, ical, identities):
     return ""
 
 
-def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, identities):
+def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, identities,
+                      calendar_uid=""):
     """`icomp` is the series' component for THIS occurrence: its own
     get_dtstart() still reads the recurrence master's original date (a
     birthday's 1988, not this year's), which is why only the instance times the
@@ -1292,33 +1684,70 @@ def instance_to_event(icomp, instance_start, instance_end, ical, calendar_name, 
     return make_event(texts["uid"], texts["title"], start,
                       ical_time_to_epoch(instance_end, ical),
                       bool(_call(instance_start, "is_date", False)),
-                      url, calendar_name, texts["location"], path, declined=declined)
+                      url, calendar_name, texts["location"], path, declined=declined,
+                      calendar_uid=calendar_uid)
 
 
-def generate_instances(client, ical, glib, window_start, window_end, calendar_name, identities):
-    """-> (events, problem, capped). generate_instances_sync is what actually
-    expands recurrences; get_object_list_as_comps_sync hands back the masters
-    instead. `capped` means the calendar hit MAX_INSTANCES_PER_CALENDAR and the
-    expansion was stopped -- a runaway rule, not a failure."""
+def _keep_earliest(events, limit):
+    events.sort(key=lambda event: (event["start"], event["id"]))
+    del events[limit:]
+
+
+def _query_time(epoch):
+    return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(epoch))
+
+
+def generate_instances(client, ical, glib, window_start, window_end, calendar_name, identities,
+                       calendar_uid="", display_name=None):
+    """-> (events, problem, capped, broken). generate_instances_sync is what
+    actually expands recurrences; get_object_list_as_comps_sync hands back the
+    masters instead.
+
+    `capped` names what was cut short, in a tuple: "series" when a series
+    passed MAX_EVENTS occurrences, "calendar" when the calendar passed
+    MAX_INSTANCES_PER_CALENDAR (the earliest are kept). A runaway rule is not a
+    failure, and it never hides the other series. `display_name`, the
+    unshortened name, is what error text is scrubbed of.
+
+    `problem` is a failure of the calendar: the expansion raised, at least as
+    many occurrences failed to convert as converted, or no occurrence arrived
+    at all and a direct query of the window then failed -- a backend whose
+    calendar factory died hands over nothing without an error, which would
+    otherwise read as an empty calendar. `broken` counts occurrences that
+    failed to convert while most of the calendar did not: a warning, not a
+    reason to treat the whole calendar as unreadable."""
     collected = []
     trouble = []
-    capped = []
+    per_series = {}
+    state = {"seen": 0, "series": False, "calendar": False}
+    known = ((display_name or calendar_name),) + tuple(identities)
 
     def on_instance(icomp, instance_start, instance_end, *_rest):
         # ECalRecurInstanceCb also passes user_data and a GCancellable; *_rest
         # absorbs whichever arity the installed binding uses. An exception here
-        # would unwind through C, so nothing may escape. Returning False stops
-        # the expansion.
-        if len(collected) >= MAX_INSTANCES_PER_CALENDAR:
-            capped.append(True)
-            return False
+        # would unwind through C, so nothing may escape. Returning False would
+        # stop the expansion of every later series in hash order as well, so
+        # a runaway series is cut by skipping its occurrences, never by
+        # stopping.
+        state["seen"] += 1
         try:
+            series = _call(icomp, "get_uid", "") or ""
+            count = per_series.get(series, 0) + 1
+            per_series[series] = count
+            if count > MAX_EVENTS:
+                state["series"] = True
+                return True
             event = instance_to_event(icomp, instance_start, instance_end, ical,
-                                      calendar_name, identities)
+                                      calendar_name, identities, calendar_uid)
             if event is not None:
                 collected.append(event)
+                # Bounded memory for many capped series at once; the final cut
+                # below keeps the same earliest occurrences.
+                if len(collected) >= 2 * MAX_INSTANCES_PER_CALENDAR:
+                    _keep_earliest(collected, MAX_INSTANCES_PER_CALENDAR)
+                    state["calendar"] = True
         except Exception as exc:
-            trouble.append("%s: %s" % (type(exc).__name__, _scrub(_short(exc, 60))))
+            trouble.append("%s: %s" % (type(exc).__name__, _scrub(exc, 60, known)))
         return True
 
     start, end = int(window_start), int(window_end)
@@ -1328,10 +1757,27 @@ def generate_instances(client, ical, glib, window_start, window_end, calendar_na
         except TypeError:
             client.generate_instances_sync(start, end, None, on_instance, None)
     except glib.Error as exc:
-        return collected, _scrub(_short(getattr(exc, "message", exc), 80)), bool(capped)
+        return collected, _scrub(getattr(exc, "message", exc), 80, known), (), 0
     except Exception as exc:
-        return collected, type(exc).__name__, bool(capped)
-    return collected, (trouble[0] if trouble else ""), bool(capped)
+        return collected, type(exc).__name__, (), 0
+
+    if state["seen"] == 0:
+        query = '(occur-in-time-range? (make-time "%s") (make-time "%s"))' % (
+            _query_time(start), _query_time(end))
+        try:
+            client.get_object_list_as_comps_sync(query, None)
+        except glib.Error as exc:
+            return [], _scrub(getattr(exc, "message", exc), 80, known), (), 0
+        except Exception as exc:
+            return [], type(exc).__name__, (), 0
+
+    if len(collected) > MAX_INSTANCES_PER_CALENDAR:
+        _keep_earliest(collected, MAX_INSTANCES_PER_CALENDAR)
+        state["calendar"] = True
+    capped = tuple(kind for kind in ("series", "calendar") if state[kind])
+    if trouble and len(trouble) >= len(collected):
+        return collected, trouble[0], capped, 0
+    return collected, "", capped, len(trouble)
 
 
 def google_collection_roots(registry):
@@ -1398,29 +1844,86 @@ def open_registry(eds, glib):
     try:
         return eds.SourceRegistry.new_sync(None)
     except glib.Error as exc:
-        raise BackendError(_("registryDown", _short(getattr(exc, "message", exc), 80))) from None
+        raise BackendError(_("registryDown", _scrub(getattr(exc, "message", exc), 80))) from None
+
+
+def _pump(glib, seconds):
+    """Deliver queued D-Bus signals for `seconds` -- the fetcher runs no main
+    loop of its own (see SYNC_SETTLE_SECONDS)."""
+    context = glib.MainContext.default()
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        while context.iteration(False):
+            pass
+        time.sleep(0.02)
+
+
+def _collect_backend_errors(client):
+    """-> a list that fills with the client's backend-error and backend-died
+    signals. EDS 3.60's webcal backend sent neither for a 401, a 500 or a dead
+    server in the measurements -- credentials-required is what reports those --
+    but a backend that does report this way is heard. ECal.Client's own
+    connect() is its constructor, hence GObject's; without GObject the list
+    simply stays empty."""
+    messages = []
+    try:
+        from gi.repository import GObject
+        GObject.Object.connect(client, "backend-error",
+                               lambda _client, text: messages.append(str(text)))
+        GObject.Object.connect(client, "backend-died",
+                               lambda _client: messages.append("backend died"))
+    except Exception:
+        pass
+    return messages
+
+
+def _watch_credentials(source):
+    """-> a list that fills with the reasons of the source's credentials-required
+    signal, connected before the calendar is opened. A backend whose server
+    turned it down asks for credentials this way -- REQUIRED or REJECTED after
+    a 401, SSL_FAILED, ERROR after a 500 -- and, measured on EDS 3.60, it does
+    so for every refresh that fails, even when the source's connection status
+    has already fallen back to "disconnected" by the time anyone looks."""
+    reasons = []
+    try:
+        from gi.repository import GObject
+        GObject.Object.connect(source, "credentials-required",
+                               lambda _source, reason, *_rest: reasons.append(reason))
+    except Exception:
+        pass
+    return reasons
+
+
+def _enum_values(eds, enum_name, *names):
+    """The values of these names in an EDataServer enum, as far as the
+    installed typelib knows them."""
+    enum = getattr(eds, enum_name, None)
+    return {getattr(enum, name) for name in names if enum is not None and hasattr(enum, name)}
 
 
 def read_eds(config, now, window_start, window_end, cache, cache_path, force_refresh):
-    """-> (events, refreshed_at, failure, warnings, refresh_ok_at). Raises
-    BackendError when there is no usable calendar at all. A single failing
-    calendar only fills `failure`, which the caller reports as a warning -- or,
-    when nothing survives filtering, as status "error" (D2) -- and keeps its
-    events from the previous cache. `cache_path` is where the refresh stamp is
-    persisted ahead of the refresh; None (diagnose) writes nothing."""
+    """-> (events, refreshed_at, failure, warnings, refresh_ok_at,
+    signin_needed_at). Raises BackendError when there is no usable calendar at
+    all. A single failing calendar only fills `failure`, which the caller
+    reports as a warning -- or, when nothing survives filtering, as status
+    "error" (D2) -- and keeps its events from the previous cache. `cache_path`
+    is where the refresh stamp is persisted ahead of the refresh; None
+    (diagnose, --print) writes nothing. `signin_needed_at` stamps the last run
+    that found a calendar asking for credentials, 0 once a refresh is seen
+    without that: the backend that knew is gone by the next run."""
     eds, ecal, ical, glib, gio = import_eds()
     registry = open_registry(eds, glib)
 
     # These two strings are what the widget and `omeetingbar status` put in front of
     # the user in exactly the situation where the next step matters, so they name
     # the GOA dialog that is actually installable here (GOA_DIALOG) and nothing
-    # else.
+    # else. Both are deliberate states, not failures: the last known list goes.
     roots = google_collection_roots(registry)
     if not roots:
-        raise BackendError(_("noGoogleAccount", GOA_DIALOG))
+        raise BackendError(_("noGoogleAccount", GOA_DIALOG), keep_stale=False)
     sources = calendar_sources(registry, roots)
     if not sources:
-        raise BackendError(_("noEnabledCalendar", GOA_DIALOG))
+        raise BackendError(_("noEnabledCalendar", GOA_DIALOG), keep_stale=False)
 
     warnings = []
     # Resolved regardless of skip_declined: the identities feed the `declined`
@@ -1440,101 +1943,202 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
     # every refresh_seconds, since the fetcher itself runs every minute.
     refreshed_at = _int(cache.get("refreshed_at"))
     refresh_ok_at = _int(cache.get("refresh_ok_at"))
+    signin_needed_at = _int(cache.get("signin_needed_at"))
     refresh_due = force_refresh or (now - refreshed_at) >= max(config["refresh_seconds"], 0)
     if refresh_due:
         # Stamp the ATTEMPT, not the success, and persist it BEFORE refreshing:
         # a refresh that hangs into the service's watchdog is killed before this
         # run writes its cache, and without the stamp the next run would hang
-        # again, for ever, while the local copy stayed perfectly readable.
+        # again, for ever, while the local copy stayed perfectly readable. The
+        # in-memory cache gets the stamp too: main()'s error branches read
+        # refreshed_at back from it, and the old value would undo the throttle.
         refreshed_at = now
-        if cache and cache_path:
+        persist = bool(cache) and cache_path
+        cache["refreshed_at"] = now
+        if persist:
             try:
-                write_cache(cache_path, dict(cache, refreshed_at=now))
+                write_cache(cache_path, cache)
             except (OSError, ValueError):
                 pass
 
-    events = []
-    failures = []
+    results = {}  # index -> (events, failures, warnings), merged in registry order
     failed_names = set()
-    refresh_tried = 0
-    refresh_failed = 0
-    deadline = time.monotonic() + REFRESH_BUDGET_SECONDS
-    for index, source in enumerate(sources, start=1):
-        name = _short(source.get_display_name() or "", 120)
+    failed_uids = set()
+    refresh_tried = refresh_failed = refresh_skipped = 0
+    watched = []     # (source, credential reasons) of every calendar opened
+    # (source, client, backend errors, credential reasons) of every refresh
+    # queued this run. The client is held until the outcome has been read:
+    # a released client closes its backend.
+    refreshing = []
+    budget = REFRESH_BUDGET_SECONDS
+    cutoff = time.monotonic() + REFRESH_CUTOFF_SECONDS
+    numbered = list(enumerate(sources, start=1))
+    if refresh_due and numbered:
+        # Refresh from another calendar every refresh cycle: when the budget
+        # runs out, it must not always be the same calendars that miss it. Only
+        # the order of the refreshes rotates; the results are merged in registry
+        # order, so which copy of a meeting listed twice wins does not change.
+        shift = (now // max(config["refresh_seconds"], 1)) % len(numbered)
+        numbered = numbered[shift:] + numbered[:shift]
+
+    for index, source in numbered:
+        display_name = source.get_display_name() or ""
+        name = _short(display_name, 120)
+        uid = (source.get_uid() or "").strip().lower()
         if calendar_excluded(source, excluded):
             continue
         # Calendars are named by position in anything user-facing: display
         # names are often an address or a colleague's name, and these strings
         # reach the widget tooltip and `omeetingbar status`.
         label = _("calendarLabel", index)
+        known = (display_name,) + tuple(identities)
+        cal_events, cal_failures, cal_warnings = results.setdefault(index, ([], [], []))
+        # Before opening: the backend's own connect may already ask.
+        reasons = _watch_credentials(source)
+        watched.append((source, reasons))
+        detail = ""
         try:
             client = ecal.Client.connect_sync(source, ecal.ClientSourceType.EVENTS,
                                               CONNECT_TIMEOUT_SECONDS, None)
         except glib.Error as exc:
-            failures.append("%s (%s)" % (label, _scrub(_short(getattr(exc, "message", exc), 60))))
-            failed_names.add(name)
-            continue
+            detail = _scrub(getattr(exc, "message", exc), 60, known) or "GLib.Error"
         except Exception as exc:
             # Anything else from one calendar is that calendar's problem, not
             # the run's: it used to abort everything via main()'s last resort.
-            failures.append("%s (%s)" % (label, type(exc).__name__))
+            detail = type(exc).__name__
+        if detail:
+            cal_failures.append("%s (%s)" % (label, detail))
             failed_names.add(name)
+            failed_uids.add(uid)
+            if refresh_due:
+                # Unreachable counts as a failed refresh: with every connect
+                # failing, the last success must not move to now.
+                refresh_tried += 1
+                refresh_failed += 1
             continue
 
-        if refresh_due:
-            try:
-                if client.check_refresh_supported():
-                    refresh_tried += 1
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError("refresh budget spent")
+        if refresh_due and _call(client, "check_refresh_supported", False):
+            if budget <= 0 or time.monotonic() >= cutoff:
+                # Out of time: this calendar is read from the local copy only.
+                # Not a failure -- the rotation reaches it early next time.
+                refresh_skipped += 1
+            else:
+                refresh_tried += 1
+                started = time.monotonic()
+                try:
+                    if not _call(client, "is_online", True):
+                        # EDS's network monitor says there is no network.
+                        raise ConnectionError("offline")
+                    errors = _collect_backend_errors(client)
                     # A cancellable fired from a timer is the only deadline
                     # refresh_sync offers; an unreachable backend (VPN down,
                     # captive portal) otherwise blocks until the watchdog.
                     cancellable = gio.Cancellable()
-                    timer = threading.Timer(remaining, cancellable.cancel)
+                    timer = threading.Timer(max(min(budget, cutoff - started), 0.1),
+                                            cancellable.cancel)
                     timer.daemon = True
                     timer.start()
                     try:
                         client.refresh_sync(cancellable)
                     finally:
                         timer.cancel()
-            except Exception:
-                # The locally cached copy stays readable; the failure is counted
-                # and surfaced below instead of being swallowed.
-                refresh_failed += 1
+                    refreshing.append((source, client, errors, reasons))
+                except Exception:
+                    # The locally cached copy stays readable; the failure is
+                    # counted and surfaced below instead of being swallowed.
+                    refresh_failed += 1
+                finally:
+                    budget -= time.monotonic() - started
 
-        collected, problem, capped = generate_instances(client, ical, glib, window_start,
-                                                        window_end, name, identities)
-        events.extend(collected)
+        collected, problem, capped, broken = generate_instances(
+            client, ical, glib, window_start, window_end, name, identities, uid, display_name)
+        cal_events.extend(collected)
         if problem:
-            failures.append("%s (%s)" % (label, problem))
+            cal_failures.append("%s (%s)" % (label, problem))
             failed_names.add(name)
-        if capped:
-            warnings.append(_("calCapped", label, MAX_INSTANCES_PER_CALENDAR))
+            failed_uids.add(uid)
+        if "series" in capped:
+            cal_warnings.append(_("calSeriesCapped", label, MAX_EVENTS))
+        if "calendar" in capped:
+            cal_warnings.append(_("calCapped", label, MAX_INSTANCES_PER_CALENDAR))
+        if broken:
+            cal_warnings.append(_("calBroken", label, broken))
+
+    events = []
+    failures = []
+    for index in sorted(results):
+        cal_events, cal_failures, cal_warnings = results[index]
+        events.extend(cal_events)
+        failures.extend(cal_failures)
+        warnings.extend(cal_warnings)
+
+    # refresh_sync reports success whatever the server answered. What tells a
+    # failed refresh is the source asking for credentials (a 401 as REQUIRED or
+    # REJECTED, a 500 as ERROR) and, while it lasts, its connection status --
+    # both D-Bus signals, queued until the main context runs. The refresh call
+    # itself returns only once the backend has its answer, so one short pump
+    # delivers them.
+    rejected = _enum_values(eds, "SourceCredentialsReason", "REQUIRED", "REJECTED")
+    refused = rejected | _enum_values(eds, "SourceCredentialsReason", "SSL_FAILED", "ERROR")
+    awaiting = _enum_values(eds, "SourceConnectionStatus", "AWAITING_CREDENTIALS")
+    broken_states = awaiting | _enum_values(eds, "SourceConnectionStatus", "SSL_FAILED")
+    if watched:
+        _pump(glib, SYNC_SETTLE_SECONDS)
+    settled = len(refreshing)
+    for source, _client, errors, reasons in refreshing:
+        if (errors or _call(source, "get_connection_status") in broken_states
+                or any(reason in refused for reason in reasons)):
+            refresh_failed += 1
+    signin_due = any(any(reason in rejected for reason in reasons)
+                     or _call(source, "get_connection_status") in awaiting
+                     for source, reasons in watched)
+    # Only now may the clients go (see `refreshing`).
+    del refreshing[:]
 
     # A refresh that keeps failing (revoked token, VPN down) used to be
     # invisible: EDS served its old local copy as `status: "ok"` with a fresh
     # refreshed_at, and meetings added or moved since never reached the cache.
     if refresh_due:
-        if refresh_tried == 0 or refresh_failed == 0:
-            refresh_ok_at = now  # nothing to refresh, or all of it worked
-        elif refresh_failed == refresh_tried:
-            warnings.append(_("syncFailed"))
-        else:
+        succeeded = refresh_tried - refresh_failed
+        if refresh_failed == 0 and (succeeded or not refresh_skipped):
+            refresh_ok_at = now  # all of it worked, or there was nothing to refresh
+        elif succeeded:
             refresh_ok_at = now
             warnings.append(_("syncPartial", refresh_failed, refresh_tried))
-    if refresh_ok_at and now - refresh_ok_at > REFRESH_STALE_SECONDS:
+    # On every run, not only on refreshing ones: the last attempt failed for as
+    # long as it is newer than the last success -- after login too, when the
+    # tmpfs cache knows no success at all.
+    if refreshed_at > refresh_ok_at:
+        warnings.append(_("syncFailed"))
+    if refresh_ok_at and now - refresh_ok_at > max(REFRESH_STALE_SECONDS, config["refresh_seconds"]):
         warnings.append(_("syncStale", human_delta(now - refresh_ok_at)))
+    # The way out is named until a refresh is seen without a request for
+    # credentials: by the next run the backend that asked is gone, so the
+    # finding is carried in the cache as a stamp. Failures of other kinds say
+    # nothing about the sign-in and do not keep it.
+    if signin_due:
+        signin_needed_at = now
+    elif settled:
+        signin_needed_at = 0
+    if signin_needed_at:
+        warnings.append(_("syncSignIn", GOA_DIALOG))
 
-    if failed_names:
+    if failed_names or failed_uids:
         # A calendar that failed this run keeps its last known events instead of
         # vanishing for a minute: Service.qml withdraws a queued alert whose
         # event is gone from a healthy cache, and the agenda would lose its rows.
-        known = {event["id"] for event in events}
+        # Matched by source uid -- display names are not unique, and a healthy
+        # namesake's deleted meeting must not come back. Entries written before
+        # calendar_uid existed have only the name.
+        known_ids = {event["id"] for event in events}
         carried = 0
         for event in previous_events(cache):
-            if event["calendar"] in failed_names and event["id"] not in known:
+            if event["calendar_uid"]:
+                owned = event["calendar_uid"] in failed_uids
+            else:
+                owned = event["calendar"] in failed_names
+            if (owned and event["id"] not in known_ids
+                    and max(event["end"], event["start"]) >= window_start):
                 event["_join_path"] = "cache"
                 events.append(event)
                 carried += 1
@@ -1544,22 +2148,24 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
     if failures and not events:
         raise BackendError(_("calendarsUnreadable", "; ".join(failures)))
     failure = _("partialFailure", "; ".join(failures)) if failures else ""
-    return events, refreshed_at, failure, warnings, refresh_ok_at
+    return events, refreshed_at, failure, warnings, refresh_ok_at, signin_needed_at
 
 
 # --- fetch dispatch ---------------------------------------------------------
 
 
 def fetch(config, backend, args, now, window_start, window_end, cache, cache_path=None):
-    """-> (events, refreshed_at, failure, warnings, refresh_ok_at). Raises
-    BackendError when the backend produced nothing trustworthy at all. `failure`
-    non-empty means the backend delivered only part of its data; `warnings` are
-    non-fatal notes. `cache_path` None means "write nothing" (diagnose)."""
+    """-> (events, refreshed_at, failure, warnings, refresh_ok_at,
+    signin_needed_at). Raises BackendError when the backend produced nothing
+    trustworthy at all. `failure` non-empty means the backend delivered only
+    part of its data; `warnings` are non-fatal notes; `signin_needed_at` is
+    the eds backend's sign-in stamp (see read_eds), 0 for the others.
+    `cache_path` None means "write nothing" (diagnose, --print)."""
     if backend == "demo":
-        return demo_events(now), now, "", [], now
+        return demo_events(now), now, "", [], now, 0
     if backend == "ics":
-        events, failure = read_ics(config, window_start, window_end)
-        return events, now, failure, [], now
+        events, failure, notes = read_ics(config, window_start, window_end, cache)
+        return events, now, failure, notes, now, 0
     return read_eds(config, now, window_start, window_end, cache, cache_path, args.refresh)
 
 
@@ -1644,19 +2250,27 @@ def typelib_search_paths():
 
 
 def typelib_state(namespace, versions):
-    """-> (ok, detail). Importability is authoritative; the file check is what
-    tells the two failures apart -- not installed at all, versus installed but
-    unloadable, which needs a completely different fix."""
+    """-> (state, detail), state "ok", "missing" or "broken". Importability is
+    authoritative; the file check is what tells the two failures apart -- not
+    installed at all, versus installed but unloadable, which needs a completely
+    different fix. A gi that fails in any other way is "broken": one line in
+    the report, not a traceback that loses all of it."""
     try:
         import gi
-    except ImportError:
-        return False, _("gobjectMissing")
+    except ImportError as exc:
+        if isinstance(exc, ModuleNotFoundError) and exc.name == "gi":
+            return "missing", _("gobjectMissing")
+        return "broken", _("moduleBroken", type(exc).__name__, _scrub(exc, 60))
+    except Exception as exc:
+        return "broken", _("moduleBroken", type(exc).__name__, _scrub(exc, 60))
     for version in versions:
         try:
             gi.require_version(namespace, version)
-            return True, "%s-%s" % (namespace, version)
+            return "ok", "%s-%s" % (namespace, version)
         except (ValueError, AttributeError):
             continue
+        except Exception as exc:
+            return "broken", _("moduleBroken", type(exc).__name__, _scrub(exc, 60))
     # versions[0] is the version this machine is expected to have (ICalGLib 4.0
     # from libical); the rest are only fallbacks and are named as such.
     wanted = "%s-%s.typelib" % (namespace, versions[0])
@@ -1664,26 +2278,60 @@ def typelib_state(namespace, versions):
     on_disk = any(os.path.exists(os.path.join(path, "%s-%s.typelib" % (namespace, version)))
                   for path in typelib_search_paths() for version in versions)
     if on_disk:
-        return False, _("presentNotLoadable", wanted, also)
-    return False, _("fileMissing", wanted, also)
+        return "missing", _("presentNotLoadable", wanted, also)
+    return "missing", _("fileMissing", wanted, also)
 
 
 def module_state(name):
+    """-> (state, detail), state "ok", "missing" or "broken" (installed but
+    failing on import: one line in the report, not a traceback that swallows
+    the whole report)."""
     try:
         module = __import__(name)
-    except ImportError:
-        return False, _("notInstalled")
-    return True, str(getattr(module, "__version__", "") or _("present"))
+    except ImportError as exc:
+        # Missing is the module itself not found; an ImportError from inside
+        # it (a native library, a dependency) is an installed, broken one.
+        if isinstance(exc, ModuleNotFoundError) and exc.name == name:
+            return "missing", _("notInstalled")
+        return "broken", _("moduleBroken", type(exc).__name__, _scrub(exc, 60))
+    except Exception as exc:
+        return "broken", _("moduleBroken", type(exc).__name__, _scrub(exc, 60))
+    return "ok", str(getattr(module, "__version__", "") or _("present"))
+
+
+def _state_label(state):
+    return _({"ok": "diagOk", "broken": "diagBroken"}.get(state, "diagMissing"))
+
+
+def goa_accounts_paths():
+    """Where goa-daemon keeps its accounts: g_get_user_config_dir(), which is
+    $XDG_CONFIG_HOME when that is set and ~/.config otherwise. The XDG one is
+    looked at first; when it is the default directory anyway, GOA_ACCOUNTS_PATH
+    alone stands for it."""
+    paths = []
+    xdg = os.environ.get("XDG_CONFIG_HOME") or ""
+    if xdg:
+        candidate = os.path.join(xdg, "goa-1.0", "accounts.conf")
+        default = os.path.expanduser("~/.config/goa-1.0/accounts.conf")
+        if os.path.realpath(candidate) != os.path.realpath(default):
+            paths.append(candidate)
+    paths.append(GOA_ACCOUNTS_PATH)
+    return paths
 
 
 def goa_google_accounts():
     """-> (google count, detail). Reads GOA's own config file, so this works
     without the Goa typelib. Only counts are reported, never addresses."""
-    if not os.path.exists(GOA_ACCOUNTS_PATH):
-        return 0, _("goaFileMissing", GOA_ACCOUNTS_PATH)
+    paths = goa_accounts_paths()
+    path = next((candidate for candidate in paths if os.path.exists(candidate)), None)
+    if path is None:
+        return 0, _("goaFileMissing", " / ".join(paths))
     parser = configparser.ConfigParser(interpolation=None)
     try:
-        parser.read(GOA_ACCOUNTS_PATH, encoding="utf-8")
+        # read_file, not read(): read() silently skips a file it cannot open,
+        # which made a root-owned accounts.conf look like "0 accounts".
+        with open(path, encoding="utf-8") as handle:
+            parser.read_file(handle)
     except (configparser.Error, OSError, UnicodeDecodeError) as exc:
         return 0, _("goaUnreadable", type(exc).__name__)
     total = google = 0
@@ -1702,11 +2350,13 @@ def diagnose_calendars(config):
         registry = open_registry(eds, glib)
     except BackendError as exc:
         return [_("calNotCheckable", exc.message)]
+    except Exception as exc:
+        return [_("calNotCheckable", "%s: %s" % (type(exc).__name__, _scrub(exc, 80)))]
     try:
         roots = google_collection_roots(registry)
         sources = calendar_sources(registry, roots)
     except Exception as exc:
-        return [_("calQueryFailed", _short(exc, 80))]
+        return [_("calQueryFailed", _scrub(exc, 80))]
     excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
     skipped = sum(1 for source in sources if calendar_excluded(source, excluded))
     return [
@@ -1753,12 +2403,12 @@ def diagnose_join_paths(config, backend, args, now, cache):
     titles, no times, and above all never the URL itself."""
     window_start, window_end = window_for(config, now)
     try:
-        events, _refreshed, failure, warnings, _ok = fetch(config, backend, args, now,
+        events, _refreshed, failure, warnings, _ok, _signin = fetch(config, backend, args, now,
                                                            window_start, window_end, cache)
     except BackendError as exc:
         return [_("joinBackendError", exc.message)]
     except Exception as exc:
-        return [_("joinUnexpected", type(exc).__name__, _short(exc, 80))]
+        return [_("joinUnexpected", type(exc).__name__, _scrub(exc, 80))]
     # Since schema 2 the agenda starts at local midnight, so without this the
     # report would describe the morning's finished meetings and never reach
     # the one being diagnosed.
@@ -1799,17 +2449,15 @@ def diagnose(args, config, config_warning, out_path, cache, now):
     lines.append("")
 
     lines.append(_("diagPackages"))
-    ok, detail = module_state("gi")
-    lines.append("  %-30s %-8s gi %s" % ("python-gobject", _("diagOk") if ok else _("diagMissing"), detail))
+    state, detail = module_state("gi")
+    lines.append("  %-30s %-8s gi %s" % ("python-gobject", _state_label(state), detail))
     for namespace, versions in EDS_NAMESPACES:
-        ok, detail = typelib_state(namespace, versions)
-        lines.append("  %-30s %-8s %s"
-                     % (typelib_package(namespace), _("diagOk") if ok else _("diagMissing"), detail))
+        state, detail = typelib_state(namespace, versions)
+        lines.append("  %-30s %-8s %s" % (typelib_package(namespace), _state_label(state), detail))
     for module, package in (("icalendar", "python-icalendar"),
                             ("recurring_ical_events", "python-recurring-ical-events")):
-        ok, detail = module_state(module)
-        lines.append("  %-30s %-8s %s"
-                     % (package, _("diagOk") if ok else _("diagMissing"), _("diagIcsOnly", detail)))
+        state, detail = module_state(module)
+        lines.append("  %-30s %-8s %s" % (package, _state_label(state), _("diagIcsOnly", detail)))
     lines.append(_("diagTypelibPath", ", ".join(typelib_search_paths()) or "-"))
     lines.append("")
 
@@ -1867,7 +2515,7 @@ def main(argv=None):
     global LANGUAGE
     args = parse_args(argv)
     now = int(time.time())
-    config, config_warning = load_config(args.config)
+    config, config_warning, config_broken = load_config(args.config)
     LANGUAGE = pick_language(config.get("language"), os.environ)
     backend = args.backend or config["backend"]
     out_path = args.out or os.path.join(runtime_dir(), CACHE_BASENAME)
@@ -1891,61 +2539,74 @@ def main(argv=None):
             sys.stderr.write("omeetingbar-fetch: cannot write %s: %s\n"
                              % (inject_path, _short(exc, 100)))
             return 1
-    injected = load_inject(inject_path, now, max(config["grace_seconds"], 0))
-    if args.in_seconds is not None and injected is None:
-        # write_inject armed it and load_inject spent it in the same run: the
-        # start was already more than grace_seconds in the past.
-        warnings.append(_("injectExpired"))
 
     window_start, window_end = window_for(config, now)
     status, error, failure, stale = "ok", "", "", False
     refreshed_at = now
     refresh_ok_at = _int(cache.get("refresh_ok_at"))
+    # The eds sign-in stamp outlives a run that ends in an error branch.
+    signin_needed_at = _int(cache.get("signin_needed_at")) if backend == "eds" else 0
     try:
-        events, refreshed_at, failure, backend_warnings, refresh_ok_at = fetch(
-            config, backend, args, now, window_start, window_end, cache, out_path)
+        events, refreshed_at, failure, backend_warnings, refresh_ok_at, signin_needed_at = fetch(
+            config, backend, args, now, window_start, window_end, cache,
+            # --print leaves the cache file alone, the refresh stamp included.
+            None if args.print_json else out_path)
         warnings.extend(backend_warnings)
         events = apply_filters(events, config, now, window_end)
     except BackendError as exc:
         status, error = "error", exc.message
-        events = stale_events(cache, config, now, window_start, window_end)
+        # A deliberate state (no account, no enabled calendar, no feed) drops
+        # the last known list -- unless the config is broken, which may be all
+        # that made the state look deliberate. A capped option is not broken.
+        events = (stale_events(cache, config, now, window_start, window_end)
+                  if exc.keep_stale or config_broken else [])
+        if not exc.keep_stale:
+            signin_needed_at = 0  # no account to sign in to any more
         stale = bool(events)
         refreshed_at = _int(cache.get("refreshed_at"))
     except Exception as exc:
         # A backend bug must still leave a readable cache behind, never a
         # traceback on the service's stderr and an unchanged stale file.
         status = "error"
-        error = _("unexpectedBackendError", backend, type(exc).__name__, _scrub(_short(exc, 100)))
+        error = _("unexpectedBackendError", backend, type(exc).__name__, _scrub(exc, 100))
         events = stale_events(cache, config, now, window_start, window_end)
         stale = bool(events)
         refreshed_at = _int(cache.get("refreshed_at"))
-
-    if len(events) > MAX_EVENTS:
-        warnings.append(_("maxEvents", MAX_EVENTS))
-        events = events[:MAX_EVENTS]
 
     if failure:
         # D2, decided AFTER filtering: a partial failure that leaves nothing
         # behind is not a usable result and must not reach the user as "no
         # meetings today" on a status-ok cache. With events left it is only a
-        # warning -- the list is usable, just incomplete. The eds backend
-        # carries a failed calendar's previous events forward itself, so a
-        # one-minute hiccup in one calendar neither empties the agenda nor
-        # withdraws a queued alert. The test marker is merged below, so arming
-        # one cannot hide a half-failed calendar read.
+        # warning -- the list is usable, just incomplete. Both backends carry
+        # a failed calendar's or feed's previous events forward themselves, so
+        # a one-minute hiccup neither empties the agenda nor withdraws a queued
+        # alert. The test marker is merged below, so arming one cannot hide a
+        # half-failed calendar read.
         if events:
             warnings.append(failure)
         else:
             status, error = "error", failure
 
+    # Read only now, after the fetch: a run that started before a test event
+    # was armed -- the service's, during a slow refresh -- must not write its
+    # cache without it.
+    injected = load_inject(inject_path, now, max(config["grace_seconds"], 0))
+    if args.in_seconds is not None and injected is None:
+        # write_inject armed it and load_inject spent it in the same run: the
+        # start was already more than grace_seconds in the past.
+        warnings.append(_("injectExpired"))
     if injected is not None:
         events, inject_warning = merge_inject(events, injected, config, now, window_end)
         if inject_warning:
             warnings.append(inject_warning)
 
+    events, capped = cap_events(events, now, max(config["grace_seconds"], 0))
+    if capped:
+        warnings.append(_("maxEvents", MAX_EVENTS))
+
     payload = build_payload(backend, status, error, " ".join(warnings), events,
                             refreshed_at, refresh_ok_at, stale, now, restart_notice,
-                            restart_shell_pid)
+                            restart_shell_pid, signin_needed_at)
 
     if args.print_json:
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
