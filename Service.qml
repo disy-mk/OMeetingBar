@@ -27,7 +27,7 @@ Item {
   // 6.11 offers no way to clear (Qt.clearComponentCache does not exist), so the
   // old code runs on until `omarchy restart shell` while root.manifest already
   // names the installed version. Only this constant says which code is running.
-  readonly property string codeVersion: "1.1.0"
+  readonly property string codeVersion: "1.2.0"
   // Handed to every fetch. The fetcher is read from disk on every run, so after
   // an update it is already the new code while this service may still be the
   // old one; this tells it which service started it (one before 1.1.0 sets
@@ -361,16 +361,53 @@ Item {
         location: String(entry.location === undefined || entry.location === null ? "" : entry.location)
       })
     }
-    out.sort(function(a, b) { return a.start - b.start })
-    // Earliest first, so the cap drops the far end of the window and never the
-    // meeting about to start. A hostile FREQ=SECONDLY rule expands to hundreds
-    // of thousands of instances; the fetcher caps them too, this is the second
-    // line.
+    // Ties broken by id: Qt's JS sort is not stable, and the cap below has to
+    // pick the same entries as the fetcher's.
+    out.sort(function(a, b) {
+      if (a.start !== b.start) return a.start - b.start
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    })
+    // The second line behind the fetcher's own cap, by the same rule
+    // (cap_events) with the service's own grace_seconds: the cache starts at
+    // local midnight and keeps finished meetings, so cutting earliest-first
+    // let a dense morning push every meeting still ahead out -- and with it
+    // the alert about to fire.
     if (out.length > root.maxEvents) {
       logState("events-capped", "count=" + out.length)
-      out = out.slice(0, root.maxEvents)
+      out = capByRelevance(out, Math.floor(Date.now() / 1000), root.graceSeconds, root.maxEvents)
     }
     return out
+  }
+
+  // Kept first: what has not started more than `grace` ago, earliest first,
+  // up to three quarters of `limit`; then what is still running; then what
+  // finished most recently; then the rest of what lies ahead. Returned in
+  // start order.
+  function capByRelevance(list, nowSec, grace, limit) {
+    var ahead = []
+    var behind = []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].start >= nowSec - grace) ahead.push(list[i])
+      else behind.push(list[i])
+    }
+    function lastSec(entry) { return Math.max(entry.end, entry.start) }
+    behind.sort(function(a, b) {
+      var aOver = lastSec(a) <= nowSec
+      var bOver = lastSec(b) <= nowSec
+      if (aOver !== bOver) return aOver ? 1 : -1
+      if (lastSec(a) !== lastSec(b)) return lastSec(b) - lastSec(a)
+      if (a.start !== b.start) return a.start - b.start
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    })
+    var first = limit - Math.floor(limit / 4)
+    var kept = ahead.slice(0, first)
+    kept = kept.concat(behind.slice(0, limit - kept.length))
+    kept = kept.concat(ahead.slice(first, first + limit - kept.length))
+    kept.sort(function(a, b) {
+      if (a.start !== b.start) return a.start - b.start
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+    })
+    return kept
   }
 
   function logCache(message) {

@@ -208,7 +208,8 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
 |---|---|
 | Dim `󰃭 —` in the bar | `omarchy-shell omeetingbar status`, then `omeetingbar-fetch --diagnose`. Usually: packages missing, or no Google account connected yet. |
 | No alert | `status`: is the meeting in the cache (match it by start time — `status` prints no titles), is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
-| Tooltip says "Kalender-Sync fehlgeschlagen" or "Letzter erfolgreicher Kalender-Sync vor …" | EDS cannot reach Google: VPN or network down, or the account's login expired — open `gnome-online-accounts-gtk` and sign in again. Until then the plugin shows EDS's last local copy. `omeetingbar-fetch --diagnose` prints the last attempt and the last success. |
+| Tooltip says "Calendar sync failed" or "Last successful calendar sync … ago" (German UI: "Kalender-Sync fehlgeschlagen", "Letzter erfolgreicher Kalender-Sync vor …") | EDS cannot reach Google: VPN or network down, or the account's login expired — open `gnome-online-accounts-gtk` and sign in again. Until then the plugin shows EDS's last local copy. `omeetingbar-fetch --diagnose` prints the last attempt and the last success. |
+| Tooltip says "Google sign-in needed – sign in again in gnome-online-accounts-gtk" (German UI: "Google-Anmeldung nötig – …") | EDS is waiting for credentials: the Google sign-in expired or was revoked. Open `gnome-online-accounts-gtk` and sign in again; the next refresh clears the hint. |
 | Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply immediately. |
 | Logs | `journalctl --user -t omarchy-shell -f` — the plugin logs one line per state change, never a meeting title. |
 
@@ -218,8 +219,10 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   autologin and an unencrypted keyring that token is readable by any process running as you —
   check your setup before connecting a work account.
 - The event cache lives in `$XDG_RUNTIME_DIR/omeetingbar/` (tmpfs, mode 0600, gone on
-  reboot) and holds only title, times, join URL, calendar name and location — no attendees,
-  no descriptions. `omarchy-shell omeetingbar status` prints ids and times, never titles.
+  reboot) and holds only title, times, join URL, calendar name and location, plus a calendar
+  key (the EDS source id, or a hash of an ICS feed's URL, never the URL) and the dates of all-day
+  entries — no attendees, no descriptions.
+  `omarchy-shell omeetingbar status` prints ids and times, never titles.
 - The plugin writes nothing from the calendar to the journal. One exception: joining hands the
   link to Omarchy's launcher, which logs the browser command line — link and passcode
   included — to the persistent user journal.
@@ -245,7 +248,7 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   notification (the rest share one), at most 512 occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 7,300 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
+  about 7,900 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 
