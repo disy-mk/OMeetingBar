@@ -171,7 +171,7 @@ save.
 | `min_duration_minutes` | `0` | Ignore meetings shorter than this. |
 | `title_blocklist` | `[]` | Title fragments that exclude a meeting everywhere. |
 | `calendars_exclude` | `[]` | Calendar names or UIDs to ignore (case-insensitive; a name as it reads on screen). |
-| `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. |
+| `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. A meeting this close to its start also takes over the bar entry from one still running. `0` turns both off. |
 | `widget.max_title_chars` | `28` | Truncate the title in the bar. |
 | `widget.hide_when_empty` | `true` | Collapse the bar entry when the agenda is empty. |
 

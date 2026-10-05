@@ -39,6 +39,11 @@ consumer that answers one of them on its own silently disagrees with the other t
    agenda** this is `status.next` and the popup's notion of next; the bar label, the popup hero and
    `preview` speak for the **alertable view** of the same list (no all-day, no declined while
    `skip_declined`, not over), so they can legitimately name a different meeting than `status.next`.
+   One exception, for the bar label and the popup hero only (`Widget.nextEvent`, which the popup
+   is handed): while the first meeting of that view is running, an alertable meeting that starts
+   within `widget.warn_minutes` takes over, so a conference running all day — or the last minutes
+   of a call — does not hide the standup about to begin. `warn_minutes: 0` turns it off; the alert
+   path, `status.next` and `preview` keep the plain rule.
    "Over" is `max(end, start) <= now` on every surface, `isAlertable()` included — a zero-length
    occurrence (invariant 2's fallback) is therefore over the second it starts, everywhere.
 2. **`end` is the fetcher's word.** No consumer invents a duration. A missing, non-numeric or
@@ -465,7 +470,8 @@ Requirements:
   it (measured: "14:00 12 · <title>m").
   `widget.warn_minutes` no longer decides *whether* there is colour — it drives
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
-  at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`
+  at a glance without inventing a third colour. It also marks when a meeting about to start takes
+  the label over from one still running (invariant 1's exception). Truncates the title to `widget.max_title_chars`
   (never through a surrogate pair: a cut that would leave half of one drops it);
   collapses to zero width only when the whole agenda is empty (if `hide_when_empty`): while today
   or tomorrow still hold entries it stays as a dimmed `󰃭 —`, because the left click is the popup's

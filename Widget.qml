@@ -108,7 +108,22 @@ BarWidget {
     }
     return out
   }
-  readonly property var nextEvent: alertable.length > 0 ? alertable[0] : null
+  // Invariant 1 with one exception, for this label and the popup hero only:
+  // while a meeting is running, an alertable one that starts within
+  // warn_minutes takes over, so a conference running all day — or the last
+  // minutes of a call — does not hide the standup about to begin. The alert
+  // path, `status.next` and `preview` keep the plain rule.
+  readonly property var nextEvent: {
+    if (alertable.length === 0) return null
+    var first = alertable[0]
+    if (first.start > nowSec) return first
+    for (var i = 1; i < alertable.length; i++) {
+      var ev = alertable[i]
+      if (ev.start <= nowSec) continue
+      return ev.start - nowSec <= warnMinutes * 60 ? ev : first
+    }
+    return first
+  }
   readonly property bool hasEvent: nextEvent !== null
   readonly property real secondsToStart: hasEvent ? nextEvent.start - nowSec : 0
   readonly property bool urgent: hasEvent && secondsToStart <= warnMinutes * 60

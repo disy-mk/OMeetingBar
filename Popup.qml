@@ -36,8 +36,9 @@ Item {
   // (invariant 5). Already parsed, validated and sorted by start.
   property var events: []
   // The alertable view of the same list (invariant 1: first event with
-  // max(end, start) > now, no all-day, no declined). The bar label speaks for
-  // this one, so the hero has to as well or the panel contradicts the bar.
+  // max(end, start) > now, no all-day, no declined; while one is running, one
+  // starting within warn_minutes takes over). The bar label speaks for this
+  // one, so the hero has to as well or the panel contradicts the bar.
   property var nextEvent: null
   property real nowSec: Math.floor(fallbackClock.date.getTime() / 1000)
   property string runningColor: "#FF9500"
