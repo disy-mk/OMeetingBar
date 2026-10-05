@@ -508,6 +508,13 @@ def _int(value, default=0):
     return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 
+def _not_future(stamp, now):
+    """A success stamped in the future (the clock stepped back since) is one
+    from before this run: now - 1, not now, or a refresh that fails right away
+    would not read as newer than it."""
+    return stamp if stamp <= now else now - 1
+
+
 def _short(value, limit=140):
     text = " ".join(str(value).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -1941,10 +1948,15 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
     # EDS's own refresh interval defaults to 60 minutes, which is far too coarse
     # for a meeting alarm, so a network refresh is pushed by hand -- but only
     # every refresh_seconds, since the fetcher itself runs every minute.
+    # Stamps in the future mean the clock stepped back since they were taken
+    # (an RTC kept in local time, say): neither is a recent refresh, and a
+    # success "in the future" would keep syncStale quiet until the clock
+    # caught up.
     refreshed_at = _int(cache.get("refreshed_at"))
-    refresh_ok_at = _int(cache.get("refresh_ok_at"))
+    refresh_ok_at = _not_future(_int(cache.get("refresh_ok_at")), now)
     signin_needed_at = _int(cache.get("signin_needed_at"))
-    refresh_due = force_refresh or (now - refreshed_at) >= max(config["refresh_seconds"], 0)
+    refresh_age = now - refreshed_at
+    refresh_due = force_refresh or not 0 <= refresh_age < max(config["refresh_seconds"], 0)
     if refresh_due:
         # Stamp the ATTEMPT, not the success, and persist it BEFORE refreshing:
         # a refresh that hangs into the service's watchdog is killed before this
@@ -2543,7 +2555,7 @@ def main(argv=None):
     window_start, window_end = window_for(config, now)
     status, error, failure, stale = "ok", "", "", False
     refreshed_at = now
-    refresh_ok_at = _int(cache.get("refresh_ok_at"))
+    refresh_ok_at = _not_future(_int(cache.get("refresh_ok_at")), now)  # see read_eds
     # The eds sign-in stamp outlives a run that ends in an error branch.
     signin_needed_at = _int(cache.get("signin_needed_at")) if backend == "eds" else 0
     try:

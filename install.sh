@@ -8,7 +8,9 @@ set -euo pipefail
 
 PLUGIN_ID="io.github.disy-mk.omeetingbar"
 # python-gobject is in Omarchy's base set, but none of the other three depends
-# on it and the eds backend cannot start without it, so it is checked too.
+# on it. The eds backend cannot start without it, and on every backend the
+# notify helper needs it for toasts that carry the meeting's title (without it
+# they say "Meeting" and the time), so it is checked too.
 REQUIRED_PACKAGES=(gnome-online-accounts gnome-online-accounts-gtk evolution-data-server python-gobject)
 
 # The shell hardcodes ~/.config/omarchy/plugins (PluginRegistry.qml pluginsDir),
@@ -349,4 +351,11 @@ next_step "Test:"
 say "       omarchy-shell omeetingbar test    # fullscreen alert right now, no calendar needed"
 say "       omarchy-shell omeetingbar status  # backend state, cache age, alert state"
 say "       omeetingbar-fetch --diagnose      # packages, typelibs, GOA accounts, calendars"
+
+next_step "Optional, if you share your screen: the alert shows the meeting's title on every"
+say "     monitor, and a share shows it too. To black it out in every share, add this to the"
+say "     end of ~/.config/hypr/hyprland.lua (Hyprland 0.56):"
+say '       hl.layer_rule({ match = { namespace = "^omeetingbar-alert$" }, no_screen_share = true })'
+say '     Toasts: the same rule for "^omarchy-notifications$" (every toast), or'
+say '     "notify_details": false in omeetingbar.json.'
 printf '\n'

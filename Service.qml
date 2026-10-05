@@ -27,7 +27,7 @@ Item {
   // 6.11 offers no way to clear (Qt.clearComponentCache does not exist), so the
   // old code runs on until `omarchy restart shell` while root.manifest already
   // names the installed version. Only this constant says which code is running.
-  readonly property string codeVersion: "1.2.0"
+  readonly property string codeVersion: "1.3.0"
   // Handed to every fetch. The fetcher is read from disk on every run, so after
   // an update it is already the new code while this service may still be the
   // old one; this tells it which service started it (one before 1.1.0 sets
@@ -62,21 +62,34 @@ Item {
   // escalate to SIGKILL if it survives that, and let the next interval retry.
   readonly property int fetchTimeoutSeconds: 45
   readonly property int fetchKillTimeoutSeconds: 60
+  // The same for the notify helper, which ends itself after 30 s (SIGALRM):
+  // a helper that hangs anyway must not hold every later toast back.
+  readonly property int notifyTimeoutSeconds: 40
+  readonly property int notifyKillTimeoutSeconds: 50
   // Spacing and hard cap for re-summoning an alert that was queued but never
   // confirmed on screen. The cap is what keeps a re-summon from looping.
   readonly property int resummonIntervalSeconds: 5
   readonly property int maxSummonAttempts: 6
-  // The notifications plugin restores its toasts from disk asynchronously after
-  // a shell restart; a dismiss sent before that finds nothing and is lost.
-  readonly property int toastSettleSeconds: 30
   // Calendar data is third-party input. These bound what one hostile invite,
   // or a runaway recurrence rule, can make the shell do.
   readonly property int maxEvents: 512
   readonly property int maxUrlChars: 2048
   readonly property int maxQueueLength: 8
-  // Meetings due in the same tick beyond this share one summary toast instead
-  // of each sending a critical, never-expiring one.
-  readonly property int maxToastsPerTick: 3
+  readonly property int maxFiresPerTick: 8
+  // Meetings due together beyond this share one summary toast instead of each
+  // sending a critical, never-expiring one. "Together" is a burst: the ticks
+  // whose fire loop hit maxFiresPerTick, and the tick that ends them.
+  readonly property int maxToastsPerBurst: 3
+  // A zero-length occurrence is over the second it starts (invariant 1), so
+  // with alert_lead_seconds 0 no tick could find it both due and not over: it
+  // is alerted at least this long ahead.
+  readonly property int zeroLengthMinLeadSeconds: 5
+  // Once an alert has been on screen this long, the overlay's own inhibitor
+  // (Alert.qml, at most 180 s) holds the session, and the service's lets go.
+  readonly property int inhibitHandoverSeconds: 5
+  // pw-play runs under `timeout`: a player that stalls (a sink that vanished
+  // under the lock) would otherwise mute every later alert until a restart.
+  readonly property int soundCapSeconds: 60
   // The expiry the "meeting ended" replacement toast asks for. Omarchy takes it
   // as a request and enforces its own minimum for low urgency
   // (lowPopupDuration, 5 s), so the replacement stays at least that long.
@@ -86,9 +99,11 @@ Item {
   // would have had time to clear that state again; the overlay's own callback
   // (overlayShown) is the primary witness and needs no delay.
   readonly property int confirmGraceSeconds: 2
-  // After a clock jump the cache predates the sleep; firing waits this long
-  // for the forced fetch so a meeting cancelled while suspended stays silent.
-  readonly property int fireHoldSeconds: 10
+  // After a clock jump the cache predates the sleep; firing waits at most this
+  // long for the forced fetch so a meeting cancelled while suspended stays
+  // silent. That fetch is refresh-due after any longer sleep and may spend up
+  // to 25 s in refresh_sync (the fetcher's cutoff) before it writes the cache.
+  readonly property int fireHoldSeconds: 30
 
   // Only the keys this service acts on; the rest of omeetingbar.json belongs to
   // bin/omeetingbar-fetch and to Widget.qml, which read the same file themselves.
@@ -135,10 +150,13 @@ Item {
   readonly property int effectiveFetchIntervalSeconds: Math.min(
     root.fetchIntervalSeconds * Math.pow(2, Math.min(root.fetchFailStreak, 4)), 900)
   readonly property int alertLeadSeconds: intConfig("alert_lead_seconds", 0, 3600)
+  // The longest lead any entry gets (see leadFor), where the start-ordered
+  // scans may stop.
+  readonly property int maxLeadSeconds: Math.max(root.alertLeadSeconds, root.zeroLengthMinLeadSeconds)
   readonly property int autoDismissSeconds: intConfig("auto_dismiss_seconds", 0, 3600)
   readonly property int inhibitLeadSeconds: intConfig("inhibit_lead_seconds", 0, 7200)
   readonly property int graceSeconds: intConfig("grace_seconds", 0, 3600)
-  readonly property string soundPath: stringConfig("sound")
+  readonly property string soundPath: soundPathOf(configValue("sound"))
   readonly property string lang: Strings.pick(stringConfig("language"), Qt.locale().name)
   readonly property string runningColor: colorConfig("running", "#FF9500")
   readonly property string upcomingColor: colorConfig("upcoming", "#00BEFF")
@@ -180,20 +198,31 @@ Item {
   // because a re-mount must not lose the tail.
   property var alertQueue: []
 
-  // Meeting notifications this service put on screen, as { id, headline, end,
-  // nid }, nid being the notification id the helper reported (0 until then).
-  // They are critical, so they never expire on their own; each one is taken
-  // down once its meeting is over. Persisted, because the toasts outlive a
-  // shell restart and so must the list.
+  // Meeting notifications this service put on screen, as { id, end, nid,
+  // sent }: nid is the notification id the helper reported (0 until then),
+  // sent the send time in ms. They are critical, so they never expire on their
+  // own; each one is taken down once its meeting is over. Persisted, because
+  // the toasts outlive a shell restart and so must the list.
   property var openToasts: []
   // Notifications go out one at a time through bin/omeetingbar-notify, which
   // reads the content from stdin and answers with the notification id. The
-  // queue holds { payload, toastId }; toastId names the openToasts entry that
-  // receives the id (null for a replacement).
+  // queue holds { payload, toastId, replace }: toastId names the openToasts
+  // entry the job is for, replace says whether it takes that toast down.
   property var notifyQueue: []
   property var notifyCurrent: null
-  property int startedAtSec: 0
+  property int notifyStartedAtSec: 0
+  // How far checkNotifyWatchdog went with the running helper: 0 not at all,
+  // 1 terminated, 2 killed.
+  property int notifyReapStage: 0
+  // The toast budget of the burst in progress (see maxToastsPerBurst) and the
+  // meetings past it, which share one summary toast once the burst ends.
+  property int burstToasts: 0
+  property var burstOverflow: []
   property int fireHoldUntilSec: 0
+  // Set by a clock jump until a fetch has started after it: the fetch that was
+  // running across a suspend is refused as a re-run, reaped by the watchdog,
+  // and must not lift the fire hold on its way out.
+  property bool jumpRefetchPending: false
 
   property int nowSec: 0
   property real lastTickMs: 0
@@ -202,11 +231,28 @@ Item {
   property bool sessionLocked: false
   property bool soundAvailable: false
   property string probedSoundPath: ""
+  // Whose alarm is playing (an event id, "test"), and whether stopSound asked
+  // it to end, which is then no failure to log.
+  property string soundOwner: ""
+  property bool soundStopRequested: false
   // Why the head of the queue is not on screen right now:
-  // "" (nothing pending) | locked | lock-unknown | waiting | summon-failed.
+  // "" (nothing pending) | refreshing (clock-jump hold) | locked | lock-unknown
+  // | waiting | summon-failed.
   property string deferredReason: ""
   property int lastLockProbeSec: 0
+  // When the oldest unanswered lock probe was asked for; 0 when none is. Not
+  // lastLockProbeSec: a probe that fails to start emits no `exited`, and
+  // probeLock asks again every 2 s, which would push a timeout measured from
+  // the last request out for ever.
+  property int lockProbePendingSinceSec: 0
+  // Set by a clock jump while a probe runs: its answer may describe the
+  // session before the sleep and is not taken; the next probe's is.
+  property bool lockProbeStale: false
   property int lockKnownAtSec: 0
+  // Whether the last lock answer came from the probe itself ("true"/"false"
+  // on a clean exit) rather than from giving up on it. Only a sure "unlocked"
+  // may wake the display: under the lock a wake lights the panels for good.
+  property bool lockAnswerSure: false
   property int lastFetchAtSec: 0
   property int lastFetchStartedAtSec: 0
   property int lastFetchExitCode: -1
@@ -283,6 +329,18 @@ Item {
   function stringConfig(key) {
     var value = configValue(key)
     return value === undefined || value === null ? "" : String(value)
+  }
+
+  // `sound` is a path to an audio file: "~/…" is expanded, surrounding spaces
+  // are dropped, and a boolean -- false, "off", "no", "0" -- turns the alarm
+  // off, while true keeps the default. null or a missing key is the default.
+  function soundPathOf(value) {
+    var flag = Style.boolToken(value, null)
+    if (flag === false) return ""
+    if (flag === true) return String(root.configDefaults.sound)
+    var text = String(value === undefined || value === null ? "" : value).trim()
+    if (text === "~" || text.indexOf("~/") === 0) text = root.home + text.slice(1)
+    return text
   }
 
   // Only #rrggbb is accepted: a typo must fall back to the documented default
@@ -491,13 +549,13 @@ Item {
 
   // A meeting the next fetch no longer knows (cancelled, or moved out of the
   // window) — or one it now reports as declined — must not still blank the
-  // screen. Only a healthy, fresh cache is allowed to say that: an error or
-  // stale cache is missing events for its own reasons and would withdraw
-  // alerts that are still due.
+  // screen, nor keep a toast with a live join link. Only a healthy, fresh
+  // cache is allowed to say that: an error or stale cache is missing events
+  // for its own reasons and would withdraw alerts that are still due.
   function dropCancelledAlerts() {
     if (root.cacheStatus !== "ok" || root.cacheStale) return
-    if (root.alertQueue.length === 0) return
     var atSec = Math.floor(Date.now() / 1000)
+    var changed = false
     for (var i = root.alertQueue.length - 1; i >= 0; i--) {
       var pending = root.alertQueue[i]
       if (pending.shownAt > 0) continue
@@ -508,11 +566,26 @@ Item {
       var index = eventIndexOf(pending.id)
       if (index !== -1 && isAlertable(root.events[index], atSec)) continue
       setAlertState(pending.id, { failed: atSec })
+      if (i === 0) cancelPendingSummon(pending)
       dequeueAlert(i)
       withdrawToast(pending.id, atSec)
-      saveState()
+      changed = true
       logState("alert-withdrawn", "id=" + pending.id + (index === -1 ? " gone from cache" : " no longer alertable"))
     }
+    // A toast outlives its alert: the meeting can be cancelled or declined
+    // after the alert was shown and closed, and the toast would keep its join
+    // link until the end. Not isAlertable() here, which would also take down
+    // the toast of a long meeting past its grace window. Summary toasts carry
+    // no link and stay.
+    var toasts = root.openToasts.slice()
+    for (var t = 0; t < toasts.length; t++) {
+      var toast = toasts[t]
+      if (/^summary-/.test(toast.id) || atSec >= toast.end) continue
+      var live = eventIndexOf(toast.id)
+      var off = live === -1 || (root.events[live].declined === true && root.skipDeclined)
+      if (off && withdrawToast(toast.id, atSec)) changed = true
+    }
+    if (changed) saveState()
   }
 
   function tsOf(value) {
@@ -625,7 +698,7 @@ Item {
   //   { "schema": 2,
   //     "events": { "<id>": { "notified": ts, "shown": ts, "failed": ts } },
   //     "queue":  [ { <alert payload>, "untilSec": ts, "notifiedAt": ts } ],
-  //     "toasts": [ { "id": id, "headline": text, "end": ts, "nid": n } ],
+  //     "toasts": [ { "id": id, "end": ts, "nid": n, "sent": ms } ],
   //     "toastsShellPid": pid,       // the shell process the nids belong to
   //     "fired":  { "<id>": ts } }   // schema-1 mirror, written for readers of
   //                                  // the old format, never read back here
@@ -714,18 +787,20 @@ Item {
       // again, so an id recorded under another shell process would now name a
       // stranger's toast. Those entries keep their end (the join script still
       // checks it) but lose the id, and are forgotten instead of replaced.
+      // Files written before 1.3.0 also carry the headline; it is not read.
       var sameShell = tsOf(parsed.toastsShellPid) === Quickshell.processId
       for (var t = 0; t < parsed.toasts.length; t++) {
         var toast = parsed.toasts[t]
         if (!toast || typeof toast !== "object") continue
-        var headline = typeof toast.headline === "string" ? toast.headline : ""
+        var toastId = toast.id === undefined || toast.id === null ? "" : String(toast.id)
         var toastEndSec = tsOf(toast.end)
-        if (toast.id === undefined || headline === "" || toastEndSec === 0) continue
+        if (toastId === "" || toastEndSec === 0) continue
         var seen = false
-        for (var k = 0; k < toasts.length; k++) if (toasts[k].id === String(toast.id)) seen = true
+        for (var k = 0; k < toasts.length; k++) if (toasts[k].id === toastId) seen = true
         if (seen) continue
-        toasts.push({ id: String(toast.id), headline: headline, end: toastEndSec,
-                      nid: sameShell ? tsOf(toast.nid) : 0 })
+        toasts.push({ id: toastId, end: toastEndSec,
+                      nid: sameShell ? tsOf(toast.nid) : 0,
+                      sent: sameShell ? tsOf(toast.sent) : 0 })
       }
     }
     root.openToasts = toasts
@@ -799,10 +874,12 @@ Item {
     cacheDirProcess.running = true
   }
 
+  // probedSoundPath names the file the running (or last) probe looks at; the
+  // silent case leaves it alone, so a probe still running for the old file is
+  // told apart when it answers.
   function probeSound() {
     if (root.soundPath === "") {
       root.soundAvailable = false
-      root.probedSoundPath = ""
       return
     }
     if (soundProbe.running) return
@@ -821,6 +898,8 @@ Item {
     root.fetchKilled = false
     root.fetchKillSent = false
     fetchProcess.running = true
+    // Whatever asked for it, a fetch started now postdates any clock jump.
+    root.jumpRefetchPending = false
     return true
   }
 
@@ -847,6 +926,24 @@ Item {
       root.fetchKillSent = true
       fetchProcess.signal(9)
       logState("fetch-kill", "after=" + ranFor + "s started=" + root.lastFetchStartedAtSec)
+    }
+  }
+
+  // The notify queue runs one helper at a time, so one that never ends would
+  // hold every later toast back for the rest of the session. The helper ends
+  // itself after 30 s (SIGALRM); this is the backstop, in two steps like the
+  // fetch watchdog. The helper's `exited` then drops the job and moves on.
+  function checkNotifyWatchdog(atSec) {
+    if (!notifySender.running || root.notifyStartedAtSec <= 0) return
+    var ranFor = atSec - root.notifyStartedAtSec
+    if (ranFor >= root.notifyTimeoutSeconds && root.notifyReapStage === 0) {
+      root.notifyReapStage = 1
+      notifySender.running = false
+      logState("notify-timeout", "after=" + root.notifyTimeoutSeconds + "s")
+    } else if (ranFor >= root.notifyKillTimeoutSeconds && root.notifyReapStage === 1) {
+      root.notifyReapStage = 2
+      notifySender.signal(9)
+      logState("notify-kill", "after=" + root.notifyKillTimeoutSeconds + "s")
     }
   }
 
@@ -902,13 +999,23 @@ Item {
     return null
   }
 
+  // How far ahead an entry is alerted: alert_lead_seconds, and at least
+  // zeroLengthMinLeadSeconds for a zero-length occurrence, which no later
+  // tick could still catch.
+  function leadFor(entry) {
+    return entry.end > entry.start ? root.alertLeadSeconds
+      : Math.max(root.alertLeadSeconds, root.zeroLengthMinLeadSeconds)
+  }
+
   function dueEvent(atSec) {
     for (var i = 0; i < root.events.length; i++) {
       var entry = root.events[i]
-      // Ascending by start, so once one is beyond the lead nothing after it can
-      // be due either. Sound even though isAlertable() may reject entries
-      // before this one: rejecting them never moves a later start earlier.
-      if (entry.start - atSec > root.alertLeadSeconds) return null
+      // Ascending by start, so once one is beyond the longest lead nothing
+      // after it can be due either. Sound even though isAlertable() may
+      // reject entries before this one: rejecting them never moves a later
+      // start earlier.
+      if (entry.start - atSec > root.maxLeadSeconds) return null
+      if (entry.start - atSec > leadFor(entry)) continue
       // Every other reason not to fire is in the one predicate: all-day,
       // already over, past the grace window, declined.
       if (!isAlertable(entry, atSec)) continue
@@ -916,13 +1023,6 @@ Item {
       return entry
     }
     return null
-  }
-
-  function relativeText(seconds) {
-    if (seconds <= 0) return Strings.t(root.lang, "now")
-    if (seconds < 60) return Strings.t(root.lang, "inSec", seconds)
-    var minutes = Math.round(seconds / 60)
-    return Strings.t(root.lang, "inX", Strings.count(root.lang, minutes, "oneMinute", "nMinutes"))
   }
 
   function timeRangeText(entry) {
@@ -934,13 +1034,10 @@ Item {
 
   // The headline reaches D-Bus as a plain string through bin/omeetingbar-notify
   // (stdin JSON, never argv), so no option parser ever sees it, and the
-  // helper's Gio-less fallback sends the content-free `safe` text instead. The
-  // leading space in front of a dash is left over from when the headline was
-  // an omarchy-notification-send argument; it does no harm.
+  // helper's Gio-less fallback sends the content-free `safe` text instead.
   function notificationHeadline(title) {
     var text = String(title || "").trim()
-    if (text === "") return Strings.t(root.lang, "meeting")
-    return /^-/.test(text) ? " " + text : text
+    return text === "" ? Strings.t(root.lang, "meeting") : text
   }
 
   // Omarchy renders a toast's body as StyledText (the summary is plain text),
@@ -950,10 +1047,13 @@ Item {
     return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
-  // Without details only the start and the time range: location and calendar
-  // name come from the invite.
-  function notificationBody(entry, atSec, details) {
-    var parts = [Strings.t(root.lang, "starts", relativeText(entry.start - atSec)), timeRangeText(entry)]
+  // The toast stays up until the meeting ends, so its body says nothing that
+  // goes stale -- no "starts in 1 minute" at 14:40, no "now" for a meeting
+  // that started four minutes before a resume: the time range, then location
+  // or calendar name. Those two come from the invite, so without details the
+  // time range is all.
+  function notificationBody(entry, details) {
+    var parts = [timeRangeText(entry)]
     if (details && entry.location !== "") parts.push(escapeMarkup(entry.location))
     else if (details && entry.calendar !== "") parts.push(escapeMarkup(entry.calendar))
     return parts.join(" · ")
@@ -972,50 +1072,51 @@ Item {
   // its start too (one without a real end until start + grace). Omarchy's daemon does put summary
   // and body on a bash command line when it saves the toast, and keeps closed
   // toasts in its history; notify_details off sends "Termin"/"Meeting" and the
-  // time there instead of title and location. `safe` is the content-free text
-  // the helper falls back to without Gio.
-  function sendNotification(entry, atSec) {
+  // time range there instead of title and location. `safe` is the
+  // content-free text the helper falls back to without Gio.
+  function sendNotification(entry) {
     var details = root.notifyDetails
     var headline = details ? notificationHeadline(entry.title) : Strings.t(root.lang, "meeting")
     var payload = {
       summary: headline,
-      body: notificationBody(entry, atSec, details),
+      body: notificationBody(entry, details),
       glyph: "󰃭",
       urgency: "critical",
       safe: { summary: Strings.t(root.lang, "meeting"), body: timeRangeText(entry) }
     }
     if (entry.url !== "") payload.exec = [root.joinPath, String(entry.id), String(root.graceSeconds)]
-    trackToast(entry, headline)
-    enqueueNotify(payload, String(entry.id))
+    trackToast(entry)
+    enqueueNotify(payload, String(entry.id), false)
   }
 
-  // Meetings due in the same tick beyond maxToastsPerTick get one toast for
-  // all of them: no join link (the agenda has those), tracked under its own id
-  // so it comes down with the last of them.
+  // The meetings past a burst's maxToastsPerBurst get one toast for all of
+  // them: no join link (the agenda has those), tracked under its own id so it
+  // comes down with the last of them.
   function sendSummaryNotification(extra, atSec) {
     var latestEnd = atSec
     for (var i = 0; i < extra.length; i++) latestEnd = Math.max(latestEnd, toastEnd(extra[i]))
     var headline = Strings.t(root.lang, "moreMeetings", extra.length)
     var id = "summary-" + atSec
-    trackToast({ id: id, title: headline, start: atSec, end: latestEnd }, headline)
+    trackToast({ id: id, start: atSec, end: latestEnd })
     enqueueNotify({
       summary: headline,
       body: Strings.t(root.lang, "moreMeetingsBody"),
       glyph: "󰃭",
       urgency: "critical",
       safe: { summary: headline, body: "" }
-    }, id)
+    }, id, false)
   }
 
   // Every toast this service sends is recorded with the notification id the
-  // helper reports (0 until it does), so it can be replaced by id once the
-  // meeting is over. Omarchy ignores CloseNotification for its popups
-  // (measured on 4.x) and dismisses by summary substring only, which would put
-  // the title on a command line again -- hence the replacement.
-  function trackToast(entry, headline) {
+  // helper reports (0 until it does) and the time it was sent, so it can be
+  // replaced by id once the meeting is over. Omarchy ignores
+  // CloseNotification for its popups (measured on 4.x) and dismisses by
+  // summary substring only, which would put the title on a command line again
+  // -- hence the replacement.
+  function trackToast(entry) {
     var id = String(entry.id)
     for (var i = 0; i < root.openToasts.length; i++) if (root.openToasts[i].id === id) return
-    root.openToasts = root.openToasts.concat([{ id: id, headline: headline, end: toastEnd(entry), nid: 0 }])
+    root.openToasts = root.openToasts.concat([{ id: id, end: toastEnd(entry), nid: 0, sent: Date.now() }])
     saveState()
   }
 
@@ -1025,7 +1126,7 @@ Item {
     for (var i = 0; i < root.openToasts.length; i++) {
       var toast = root.openToasts[i]
       if (toast.id === id) {
-        next.push({ id: toast.id, headline: toast.headline, end: toast.end, nid: nid })
+        next.push({ id: toast.id, end: toast.end, nid: nid, sent: toast.sent })
         hit = true
       } else next.push(toast)
     }
@@ -1034,15 +1135,42 @@ Item {
     saveState()
   }
 
-  function enqueueNotify(payload, toastId) {
-    root.notifyQueue = root.notifyQueue.concat([{ payload: payload, toastId: toastId }])
+  // A toast's replacement has run its course -- sent, answered "gone" (the
+  // user closed it first), or failed: the entry is done with either way, or a
+  // helper that keeps failing would be retried every second.
+  function forgetToast(id) {
+    var next = root.openToasts.filter(function(toast) { return toast.id !== id })
+    if (next.length === root.openToasts.length) return
+    root.openToasts = next
+    saveState()
+  }
+
+  function enqueueNotify(payload, toastId, replace) {
+    root.notifyQueue = root.notifyQueue.concat([{ payload: payload, toastId: toastId, replace: replace === true }])
     pumpNotify()
+  }
+
+  // Whether a job for this toast is queued or running: its first send
+  // (replace false) or its replacement (replace true).
+  function notifyPending(toastId, replace) {
+    var jobs = root.notifyCurrent !== null ? [root.notifyCurrent].concat(root.notifyQueue) : root.notifyQueue
+    for (var i = 0; i < jobs.length; i++)
+      if (jobs[i].toastId === toastId && jobs[i].replace === replace) return true
+    return false
+  }
+
+  // The first send of this toast, if it is still waiting in the queue.
+  function dropQueuedSend(toastId) {
+    var next = root.notifyQueue.filter(function(job) { return job.toastId !== toastId || job.replace })
+    if (next.length !== root.notifyQueue.length) root.notifyQueue = next
   }
 
   function pumpNotify() {
     if (notifySender.running || root.notifyCurrent !== null || root.notifyQueue.length === 0) return
     root.notifyCurrent = root.notifyQueue[0]
     root.notifyQueue = root.notifyQueue.slice(1)
+    root.notifyStartedAtSec = Math.floor(Date.now() / 1000)
+    root.notifyReapStage = 0
     notifySender.command = ["/usr/bin/python3", root.notifyPath]
     notifySender.running = true
   }
@@ -1050,14 +1178,19 @@ Item {
   // Once a meeting is over its toast is replaced, by notification id, with a
   // low-urgency "meeting ended" that Omarchy lets expire after its own 5 s
   // minimum (toastReplaceExpireMs is only the request) -- no title, no IPC
-  // argument. A toast without an id (the helper failed, or the shell restarted
-  // since) is forgotten; it still closes by click or right click, and the join
-  // script checks the end anyway.
+  // argument. The entry stays until that replacement has run: the notify
+  // queue lives in memory, and after a remount the next tick sends it again
+  // from the state file. A toast without an id is kept while the helper is
+  // sending it -- a slow helper answers after the meeting was withdrawn, and
+  // the id must land on the entry -- and forgotten otherwise (the helper
+  // failed, or the shell restarted since): it still closes by click or right
+  // click, and the join script checks the end anyway. A first send still
+  // waiting in the queue goes with it: a meeting that is over or off gets no
+  // toast at all. Not held back after a start: a remount keeps the shell
+  // process, its toasts and their ids, and a shell restart drops the ids
+  // (toastsShellPid) before anything could be replaced.
   function clearEndedToasts(atSec) {
     if (root.openToasts.length === 0) return
-    // startedAtSec is 0 until Component.onCompleted; a tick before that must
-    // not slip past the settle window.
-    if (root.startedAtSec === 0 || atSec - root.startedAtSec < root.toastSettleSeconds) return
     var kept = []
     var replaced = 0
     var forgotten = 0
@@ -1068,6 +1201,8 @@ Item {
         continue
       }
       if (toast.nid > 0) {
+        kept.push(toast)
+        if (notifyPending(toast.id, true)) continue
         enqueueNotify({
           summary: Strings.t(root.lang, "meetingEnded"),
           body: "",
@@ -1075,21 +1210,33 @@ Item {
           urgency: "low",
           replaces_id: toast.nid,
           expire_ms: root.toastReplaceExpireMs,
+          // Omarchy restores popups after a restart under their old ids, which
+          // the next daemon hands out again: the helper counts only popup
+          // files from this send on (see bin/omeetingbar-notify).
+          sent_ms: toast.sent > 0 ? toast.sent : 0,
           safe: { summary: Strings.t(root.lang, "meetingEnded"), body: "" }
-        }, null)
+        }, toast.id, true)
         replaced += 1
-      } else forgotten += 1
+      } else if (root.notifyCurrent !== null && root.notifyCurrent.toastId === toast.id
+        && !root.notifyCurrent.replace) kept.push(toast)
+      else {
+        dropQueuedSend(toast.id)
+        forgotten += 1
+      }
     }
     if (replaced === 0 && forgotten === 0) return
-    root.openToasts = kept
-    saveState()
+    if (forgotten > 0) {
+      root.openToasts = kept
+      saveState()
+    }
     logState("toasts-cleared", "replaced=" + replaced + " forgotten=" + forgotten)
   }
 
-  // An alert withdrawn before it was shown (cancelled or declined while the
-  // queue waited) would leave a toast with a live join link behind. Its end is
-  // pulled to now, and clearEndedToasts replaces it on the next tick like any
-  // other ended toast. The caller saves state.
+  // A meeting that is off -- cancelled, or declined -- must not leave a toast
+  // with a live join link behind, whether its alert was shown or not. Its end
+  // is pulled to now, and clearEndedToasts replaces it on the next tick like
+  // any other ended toast. Returns whether anything changed; the caller saves
+  // state.
   function withdrawToast(id, atSec) {
     var key = String(id)
     var next = []
@@ -1097,25 +1244,58 @@ Item {
     for (var i = 0; i < root.openToasts.length; i++) {
       var toast = root.openToasts[i]
       if (toast.id === key && atSec < toast.end) {
-        next.push({ id: toast.id, headline: toast.headline, end: atSec, nid: toast.nid })
+        next.push({ id: toast.id, end: atSec, nid: toast.nid, sent: toast.sent })
         hit = true
       } else next.push(toast)
     }
-    if (!hit) return
+    if (!hit) return false
     root.openToasts = next
     logState("toast-withdrawn", "id=" + key)
+    return true
   }
 
-  // A child process, not a detached one, so closing the alert can cut it short.
-  // A second meeting in the same minute does not restart a sound still playing.
-  function playSound() {
+  // Alert.qml echoes an alert's id back through its cleanText, so ids that come
+  // from the overlay are compared in that same form.
+  function overlayKey(id) {
+    return String(id === undefined || id === null ? "" : id).replace(/\s+/g, " ").replace(/^ | $/g, "")
+  }
+
+  // Alert.qml asks this when a payload without a start reaches an open
+  // overlay. The host keeps the payload of a summon that was hidden while
+  // Alert.qml was still loading -- cancelPendingSummon, the IPC dismiss -- and
+  // delivers it right ahead of the next summon of the overlay, which may be
+  // that empty one from the bar's panel hotkey: the alert it opened is then
+  // one the service has given up on. A test or preview the user asked for
+  // since is wanted.
+  function alertWanted(id) {
+    if (root.lastSummonKind === "dismissed") return false
+    if (root.lastSummonKind !== "queue") return true
+    var key = overlayKey(id)
+    for (var i = 0; i < root.alertQueue.length; i++) if (root.alertQueue[i].id === key) return true
+    return false
+  }
+
+  // A child process, not a detached one, so closing the alert can cut it
+  // short, and capped at soundCapSeconds by `timeout`. A second meeting in the
+  // same minute does not restart a sound still playing; it stays the first
+  // one's.
+  function playSound(owner) {
     if (root.soundPath === "" || !root.soundAvailable || soundPlayer.running) return
-    soundPlayer.command = ["pw-play", root.soundPath]
+    root.soundOwner = overlayKey(owner)
+    root.soundStopRequested = false
+    soundPlayer.command = ["timeout", "-k", "5", String(root.soundCapSeconds), "pw-play", root.soundPath]
     soundPlayer.running = true
   }
 
-  function stopSound() {
-    if (soundPlayer.running) soundPlayer.running = false
+  // An alert that closes stops its own sound only: an older alert reaching
+  // its hard cap must not cut short the alarm of one that fired meanwhile.
+  // Without an owner -- the IPC dismiss, or an Alert.qml from before 1.3.0
+  // that is still loaded -- any sound stops.
+  function stopSound(owner) {
+    if (!soundPlayer.running) return
+    if (owner !== undefined && owner !== null && overlayKey(owner) !== root.soundOwner) return
+    root.soundStopRequested = true
+    soundPlayer.running = false
   }
 
   // What the last summon was for. drainQueue may only confirm a queued alert as
@@ -1159,10 +1339,25 @@ Item {
     return root.shell.isPluginOpen(id) === true
   }
 
+  // A queue head that was summoned but not confirmed yet may still be loading:
+  // the host delivers its payload once Alert.qml has loaded, and open() shows
+  // it -- for a meeting withdrawn in the meantime. Hiding cancels that load.
+  // Called before the head is dequeued; never from overlayShown, where a hide
+  // would break the next payload of the same delivery loop.
+  function cancelPendingSummon(entry) {
+    if (!entry || entry.summonedAtSec === 0 || entry.shownAt > 0 || root.lastSummonKind !== "queue") return
+    confirmTimer.stop()
+    var id = root.pluginId()
+    if (id === "" || !root.shell || typeof root.shell.hide !== "function" || !alertOpen()) return
+    root.shell.hide(id)
+    logState("alert-summon-cancelled", "id=" + entry.id)
+  }
+
   function probeLock(force) {
     if (lockProbe.running) return
     if (!force && root.nowSec - root.lastLockProbeSec < root.lockProbeIntervalSeconds) return
     root.lastLockProbeSec = root.nowSec
+    if (root.lockProbePendingSinceSec === 0) root.lockProbePendingSinceSec = root.nowSec
     lockProbe.running = true
   }
 
@@ -1191,7 +1386,7 @@ Item {
     logState("alert-shown", "id=" + entry.id)
   }
 
-  function fireEvent(entry, atSec, ordinal) {
+  function fireEvent(entry, atSec) {
     // "notified" is persisted before any side effect: a crash below must not
     // repeat the notification or the sound, on this tick or after a hot
     // reload. The display is not woken here but in drainQueue, right before
@@ -1200,9 +1395,15 @@ Item {
     saveState()
     logState("notified", "id=" + entry.id + " lead=" + (entry.start - atSec) + "s")
 
-    // Beyond maxToastsPerTick in one tick, tick() sends one summary toast.
-    if (root.notifyEnabled && (ordinal || 0) < root.maxToastsPerTick) sendNotification(entry, atSec)
-    playSound()
+    // Past the burst's budget the meeting waits for the summary toast that
+    // flushBurst sends once the burst is over.
+    if (root.notifyEnabled) {
+      if (root.burstToasts < root.maxToastsPerBurst) {
+        root.burstToasts += 1
+        sendNotification(entry)
+      } else root.burstOverflow = root.burstOverflow.concat([entry])
+    }
+    playSound(entry.id)
 
     // Whether the overlay reaches the screen is the second, separate fact: it
     // is queued here and only marked shown once a witness confirms it. A full
@@ -1224,7 +1425,8 @@ Item {
   function requeueUnshown(atSec) {
     for (var i = 0; i < root.events.length; i++) {
       var entry = root.events[i]
-      if (entry.start - atSec > root.alertLeadSeconds) break
+      if (entry.start - atSec > root.maxLeadSeconds) break
+      if (entry.start - atSec > leadFor(entry)) continue
       // Re-arming is an alert too: a meeting that ended, or that was declined
       // while it sat unshown, must not come back to the screen.
       if (!isAlertable(entry, atSec)) continue
@@ -1247,6 +1449,7 @@ Item {
       // One exception: an alert that is still on screen is popped when it
       // closes, never yanked out from under the user.
       if (i === 0 && stale.shownAt > 0 && open) continue
+      if (i === 0) cancelPendingSummon(stale)
       dequeueAlert(i)
       if (stale.shownAt === 0) setAlertState(stale.id, { failed: atSec })
       saveState()
@@ -1292,12 +1495,21 @@ Item {
       var liveIndex = eventIndexOf(head.id)
       if (!isAlertable(liveIndex !== -1 ? root.events[liveIndex] : head, atSec)) {
         setAlertState(head.id, { failed: atSec })
+        cancelPendingSummon(head)
         dequeueAlert(0)
         withdrawToast(head.id, atSec)
         saveState()
         logState("alert-withdrawn", "id=" + head.id + " no longer alertable")
         return
       }
+    }
+
+    // The queue's payloads predate a clock jump as much as the cache does: a
+    // meeting cancelled while the machine slept would be summoned, and the
+    // display woken, before the fetch after the jump could withdraw it.
+    if (head.shownAt === 0 && jumpHoldActive(atSec)) {
+      root.deferredReason = "refreshing"
+      return
     }
 
     // Nothing draws over the WlSessionLock surface, so a locked session waits
@@ -1325,6 +1537,7 @@ Item {
       // The overlay never reported itself open. The notification and the sound
       // already went out, so give this id up instead of summoning it forever.
       setAlertState(head.id, { failed: atSec })
+      cancelPendingSummon(head)
       dequeueAlert(0)
       saveState()
       logState("alert-unconfirmed", "id=" + head.id + " attempts=" + head.attempts)
@@ -1334,8 +1547,10 @@ Item {
     // The display is woken once per alert, right before its first summon, and
     // only past a fresh "unlocked" answer: under the lock a wake lights the
     // panels, and Omarchy's one-shot blank timer never turns them off again.
-    // Re-summons leave it alone; test and preview alerts never come here.
-    if (head.attempts === 0 && root.wakeDisplayEnabled)
+    // Re-summons leave it alone; test and preview alerts never come here. A
+    // probe that was given up on lets the alert through (fail open) but does
+    // not wake the display: it is no answer that the session is unlocked.
+    if (head.attempts === 0 && root.wakeDisplayEnabled && root.lockAnswerSure)
       Quickshell.execDetached(["omarchy-brightness-display", "on"])
     head.attempts += 1
     head.summonedAtSec = atSec
@@ -1361,12 +1576,58 @@ Item {
       // every day, and nothing keeps the machine up for a meeting that is over
       // or that the user said no to.
       if (!isAlertable(entry, atSec)) continue
+      // Not either for an alert that has done its job: once it has been on
+      // screen for a moment the overlay holds its own inhibitor (Alert.qml,
+      // at most 180 s), and this one would keep an unattended session
+      // unlocked until start + grace. One that failed will not come back. A
+      // `shown` in the future (the clock stepped back) counts as long ago.
+      var state = stateOf(entry.id)
+      if (state !== null && (state.failed > 0 || (state.shown > 0
+        && (atSec - state.shown >= root.inhibitHandoverSeconds || atSec < state.shown)))) continue
       wanted = true
       break
     }
     if (wanted === root.inhibitActive) return
     root.inhibitActive = wanted
     logState("inhibitor", wanted ? "on" : "off")
+  }
+
+  // After a backward clock step every stamp below lies in the future, and
+  // every throttle computes now - stamp: interval fetches, the fetch and
+  // notify watchdogs, lock probing, re-summons and save retries would stall
+  // until the clock caught up -- two hours for an RTC kept in local time.
+  function rebaseStamps(atSec) {
+    root.lastFetchAtSec = Math.min(root.lastFetchAtSec, atSec)
+    root.lastFetchStartedAtSec = Math.min(root.lastFetchStartedAtSec, atSec)
+    root.notifyStartedAtSec = Math.min(root.notifyStartedAtSec, atSec)
+    // One interval back, so the next probe may go out at once.
+    root.lastLockProbeSec = Math.min(root.lastLockProbeSec, atSec - root.lockProbeIntervalSeconds)
+    root.lockProbePendingSinceSec = Math.min(root.lockProbePendingSinceSec, atSec)
+    root.saveRetryAtSec = Math.min(root.saveRetryAtSec, atSec)
+    root.lastPruneAtSec = Math.min(root.lastPruneAtSec, atSec)
+    for (var i = 0; i < root.alertQueue.length; i++) {
+      var pending = root.alertQueue[i]
+      if (pending.summonedAtSec > atSec) pending.summonedAtSec = atSec
+    }
+  }
+
+  // Right after a clock jump the cache predates the sleep: until a fetch
+  // started after the jump has landed (bounded by fireHoldSeconds) nothing
+  // fires, and no queued alert reaches the screen for the first time.
+  function jumpHoldActive(atSec) {
+    return atSec < root.fireHoldUntilSec && (fetchProcess.running || root.jumpRefetchPending)
+  }
+
+  // The meetings past a burst's toast budget share one summary toast once the
+  // burst is over -- unless there is just one: a summary for one meeting saves
+  // no toast and loses its join link.
+  function flushBurst(atSec) {
+    var extra = root.burstOverflow
+    root.burstToasts = 0
+    if (extra.length === 0) return
+    root.burstOverflow = []
+    if (extra.length === 1) sendNotification(extra[0])
+    else sendSummaryNotification(extra, atSec)
   }
 
   function tick() {
@@ -1381,12 +1642,29 @@ Item {
     root.lastTickMs = ms
     if (jumped) {
       logState("clock-jump", Math.round(sinceLastTickMs / 1000) + "s")
+      if (sinceLastTickMs < 0) rebaseStamps(atSec)
+      // The last lock answer predates the jump, whichever way it went.
+      root.lockKnownAtSec = 0
+      // A lock probe or a notify helper running across the jump did not run
+      // for the time the clock skipped, so neither is reaped as hung for it.
+      // The probe's answer is not taken (see lockProbeStale). The fetch is
+      // different: one from before a suspend is reaped on purpose (#0 above).
+      if (root.lockProbePendingSinceSec > 0) root.lockProbePendingSinceSec = atSec
+      if (lockProbe.running) root.lockProbeStale = true
+      if (notifySender.running) root.notifyStartedAtSec = atSec
       pruneState(atSec)
-      runFetch("clock-jump")
       root.fireHoldUntilSec = atSec + root.fireHoldSeconds
+      root.jumpRefetchPending = true
+      // Refused while a fetch from before the jump still runs. The re-run is
+      // retried below, and the interval fetch is due the moment it is gone.
+      if (!runFetch("clock-jump")) root.lastFetchAtSec = 0
     }
 
     checkFetchWatchdog(atSec)
+    // The fetch that ran across a suspend is reaped by the watchdog above
+    // (its age counts the sleep); the re-run goes out once it is gone.
+    if (root.jumpRefetchPending && atSec < root.fireHoldUntilSec) runFetch("clock-jump")
+    checkNotifyWatchdog(atSec)
 
     if (root.stateDirty && atSec >= root.saveRetryAtSec && root.saveAttempts < root.maxSaveAttempts) {
       retrySaveState()
@@ -1397,35 +1675,41 @@ Item {
     root.armed = root.stateLoaded && upcoming !== null && !isNotified(upcoming.id)
     updateInhibit(atSec)
 
-    // A lock probe that never answers must not be what keeps the alert off the
-    // screen: reap it and treat the session as usable.
-    if (lockProbe.running && atSec - root.lastLockProbeSec >= root.lockProbeTimeoutSeconds) {
-      lockProbe.running = false
+    // A lock probe that never answers -- hung, or never started at all, which
+    // emits no `exited` -- must not be what keeps the alert off the screen:
+    // give up on it and treat the session as usable.
+    if (root.lockProbePendingSinceSec > 0
+      && atSec - root.lockProbePendingSinceSec >= root.lockProbeTimeoutSeconds) {
+      var hung = lockProbe.running
+      root.lockProbePendingSinceSec = 0
+      if (hung) lockProbe.running = false
       root.sessionLocked = false
       root.lockKnownAtSec = atSec
-      logState("lock-probe-timeout", "at=" + root.lastLockProbeSec)
+      root.lockAnswerSure = false
+      logState("lock-probe-timeout", hung ? "hung" : "not started")
     }
     // Anything still waiting for the screen needs a current lock answer, and
     // this is the only place a probe is started outside fireEvent.
     if (root.alertQueue.length > 0 && root.alertQueue[0].shownAt === 0) probeLock(false)
 
     // Right after a clock jump the cache predates the sleep. Firing waits for
-    // the forced fetch (bounded by fireHoldSeconds), so a meeting cancelled or
-    // moved while the machine slept does not wake, notify and ring.
-    var holdFires = fetchProcess.running && atSec < root.fireHoldUntilSec
+    // a fetch started after the jump to land (bounded by fireHoldSeconds), so
+    // a meeting cancelled or moved while the machine slept does not wake,
+    // notify and ring -- also when the fetch that ran across the suspend kept
+    // the re-run out at first.
+    var holdFires = jumpHoldActive(atSec)
     if (root.stateLoaded && root.cacheLoaded && root.configLoaded && !holdFires) {
       // Two meetings in the same minute are two alerts: every due event fires
       // this tick, not only the earliest one. Bounded because fireEvent marks
       // each id notified before dueEvent looks again.
-      var fired = []
-      for (var fires = 0; fires < 8; fires++) {
+      var fired = 0
+      for (; fired < root.maxFiresPerTick; fired++) {
         var due = dueEvent(atSec)
         if (due === null) break
-        fireEvent(due, atSec, fired.length)
-        fired.push(due)
+        fireEvent(due, atSec)
       }
-      if (root.notifyEnabled && fired.length > root.maxToastsPerTick)
-        sendSummaryNotification(fired.slice(root.maxToastsPerTick), atSec)
+      // A burst ends with the first tick whose loop did not hit the cap.
+      if (fired < root.maxFiresPerTick) flushBurst(atSec)
       requeueUnshown(atSec)
     }
 
@@ -1625,7 +1909,7 @@ Item {
       calendar: Strings.t(root.lang, "testCalendar"),
       location: ""
     }, true, "test")
-    if (summoned) playSound()
+    if (summoned) playSound("test")
     return summoned
   }
 
@@ -1661,6 +1945,9 @@ Item {
       saveState()
       logState("alert-dismissed", "dropped=" + dropped)
     }
+    // Whatever the host still holds from a summon that was loading is not
+    // wanted any more (see alertWanted); the next summon sets the kind anew.
+    root.lastSummonKind = "dismissed"
     return root.shell.hide(id) === true ? "ok" : "failed"
   }
 
@@ -1734,6 +2021,9 @@ Item {
       // The fetcher replaces the cache with os.replace, which moves the inode
       // out from under the file watch, so the reload has to be explicit.
       cacheFile.reload()
+      // Once per fetch cycle the sound file is looked for again, so one added
+      // or removed after the config was read does not go unnoticed.
+      root.probeSound()
     }
   }
 
@@ -1742,9 +2032,18 @@ Item {
     command: ["omarchy-shell", "lock", "isLocked"]
     stdout: StdioCollector { id: lockProbeOut; waitForEnd: true }
     onExited: function(exitCode) {
+      root.lockProbePendingSinceSec = 0
+      // Asked before a clock jump: no answer for the session after it. The
+      // next tick asks again.
+      if (root.lockProbeStale) {
+        root.lockProbeStale = false
+        return
+      }
       // A probe that cannot answer must never swallow the alert: only a literal
       // "true" defers it.
-      root.sessionLocked = exitCode === 0 && String(lockProbeOut.text || "").trim() === "true"
+      var answer = String(lockProbeOut.text || "").trim()
+      root.sessionLocked = exitCode === 0 && answer === "true"
+      root.lockAnswerSure = exitCode === 0 && (answer === "true" || answer === "false")
       root.lockKnownAtSec = Math.floor(Date.now() / 1000)
       // Drained from here as well, so an alert appears one probe after the
       // unlock instead of waiting for the next tick.
@@ -1759,6 +2058,18 @@ Item {
 
   Process {
     id: soundPlayer
+    stderr: StdioCollector { id: soundErr; waitForEnd: true }
+    onExited: function(exitCode) {
+      var stopped = root.soundStopRequested
+      root.soundOwner = ""
+      root.soundStopRequested = false
+      // A sound that stopSound cut short is no failure, whatever exit the
+      // player or `timeout` reports for it.
+      if (stopped) return
+      if (exitCode === 124) root.logState("sound-capped", "after=" + root.soundCapSeconds + "s")
+      else if (exitCode !== 0)
+        root.logState("sound-failed", "exit=" + exitCode + " " + root.lastLine(soundErr.text))
+    }
   }
 
   // One notification at a time through bin/omeetingbar-notify. The content is
@@ -1779,20 +2090,39 @@ Item {
       var job = root.notifyCurrent
       root.notifyCurrent = null
       var answer = String(notifyOut.text || "").trim()
-      if (job && job.toastId !== null && exitCode === 0 && /^\d+$/.test(answer))
+      if (job && job.replace) root.forgetToast(job.toastId)
+      else if (job && job.toastId !== null && exitCode === 0 && /^\d+$/.test(answer))
         root.setToastNid(job.toastId, Number(answer))
       if (exitCode !== 0) root.logState("notify-failed", "exit=" + exitCode + " " + root.lastLine(notifyErr.text))
       root.pumpNotify()
+    }
+    // A helper that fails to start emits no `exited` (Quickshell 0.3.1,
+    // measured), and the queue would wait on it for the rest of the session.
+    // After a normal run `exited` comes first: it has cleared notifyCurrent,
+    // or started the next job, which reads as running here.
+    onRunningChanged: {
+      if (notifySender.running || root.notifyCurrent === null) return
+      var job = root.notifyCurrent
+      root.notifyCurrent = null
+      root.logState("notify-failed", "not started")
+      if (job.replace) root.forgetToast(job.toastId)
+      Qt.callLater(root.pumpNotify)
     }
   }
 
   Process {
     id: soundProbe
     onExited: function(exitCode) {
-      root.soundAvailable = exitCode === 0
       // A config reload can move the path while the probe runs; that answer
-      // belongs to the previous file.
-      if (root.probedSoundPath !== root.soundPath) root.probeSound()
+      // belongs to the previous file and is not taken.
+      if (root.probedSoundPath !== root.soundPath) {
+        root.probeSound()
+        return
+      }
+      root.soundAvailable = exitCode === 0
+      // Under the lock the sound is the only cue that reaches the user, so a
+      // path that leads nowhere gets its journal line.
+      if (exitCode !== 0) root.logState("sound-missing", root.soundPath)
     }
   }
 
@@ -1880,7 +2210,6 @@ Item {
   }
 
   Component.onCompleted: {
-    root.startedAtSec = Math.floor(Date.now() / 1000)
     ensureCacheDir()
     // Both are read blocking: the notified/shown state and any queue left by
     // the previous mount have to be known before the first tick can fire or
