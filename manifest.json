@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.disy-mk.omeetingbar",
   "name": "OMeetingBar",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "author": "Manuel Knitza",
   "license": "MIT",
   "homepage": "https://github.com/disy-mk/OMeetingBar",
@@ -35,7 +35,7 @@
         "label": "Full colour from (minutes)",
         "description": "This long before the start the bar entry shows its colour at full strength; before that it is slightly dimmed.",
         "min": 0,
-        "max": 120,
+        "max": 1440,
         "step": 1,
         "defaultValue": 15
       },
@@ -44,8 +44,8 @@
         "type": "integer",
         "label": "Maximum title length (characters)",
         "description": "Longer meeting titles are truncated in the bar.",
-        "min": 8,
-        "max": 120,
+        "min": 4,
+        "max": 200,
         "step": 1,
         "defaultValue": 28
       },

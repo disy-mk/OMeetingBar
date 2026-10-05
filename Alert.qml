@@ -217,7 +217,9 @@ Item {
     return Strings.t(root.lang, "runningForMin", Math.floor(since / 60))
   }
 
-  readonly property string titleText: root.title || Strings.t(root.lang, "meeting")
+  // A meeting without a title is named as the bar and the agenda name it
+  // ("untitled" is in every released Strings.js, so a cached copy has it).
+  readonly property string titleText: root.title || Strings.t(root.lang, "untitled")
 
   readonly property string rangeText: {
     if (!root.hasStart) return ""

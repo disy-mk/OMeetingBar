@@ -27,14 +27,17 @@ Item {
   // 6.11 offers no way to clear (Qt.clearComponentCache does not exist), so the
   // old code runs on until `omarchy restart shell` while root.manifest already
   // names the installed version. Only this constant says which code is running.
-  readonly property string codeVersion: "1.4.0"
+  readonly property string codeVersion: "1.5.0"
   // Handed to every fetch. The fetcher is read from disk on every run, so after
   // an update it is already the new code while this service may still be the
-  // old one; this tells it which service started it (one before 1.1.0 sets
-  // nothing). A property rather than an inline literal only because qmllint
-  // types the literal as QVariantMap against Process.environment's
-  // QVariantHash; Quickshell takes either.
-  readonly property var fetchEnvironment: ({ OMEETINGBAR_SERVICE: root.codeVersion })
+  // old one; OMEETINGBAR_SERVICE tells it which service started it (one before
+  // 1.1.0 sets nothing). OMEETINGBAR_LANG is the UI language this service
+  // resolved, so the fetcher's warnings speak the bar's language even when the
+  // config cannot be read and the locale variables would say otherwise. A
+  // property rather than an inline literal only because qmllint types the
+  // literal as QVariantMap against Process.environment's QVariantHash;
+  // Quickshell takes either.
+  readonly property var fetchEnvironment: ({ OMEETINGBAR_SERVICE: root.codeVersion, OMEETINGBAR_LANG: root.lang })
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR")
@@ -142,6 +145,14 @@ Item {
   property var config: ({})
   property bool configLoaded: false
   property bool configValid: true
+  // The text of the config in force, to tell an edit from a save that changed
+  // nothing; and an edit that still waits for its fetch (see tick).
+  property string appliedConfigText: ""
+  property bool configRefetchPending: false
+  property int configEditAtSec: 0
+  // How long an edit holds firing at most while its fetch cannot start yet:
+  // an older fetch still running is killed by the watchdog at 60 s.
+  readonly property int configHoldSeconds: 75
 
   // At most 900 s, the backoff's own ceiling below: anything longer was cut
   // to 900 there anyway, and `status` should report the interval in effect.
@@ -155,7 +166,9 @@ Item {
   // The longest lead any entry gets (see leadFor), where the start-ordered
   // scans may stop.
   readonly property int maxLeadSeconds: Math.max(root.alertLeadSeconds, root.zeroLengthMinLeadSeconds)
-  readonly property int autoDismissSeconds: intConfig("auto_dismiss_seconds", 0, 3600)
+  // At most 600 s: Alert.qml ends every alert then (hardDismissSeconds), and
+  // `status` should report the value in effect.
+  readonly property int autoDismissSeconds: intConfig("auto_dismiss_seconds", 0, 600)
   readonly property int inhibitLeadSeconds: intConfig("inhibit_lead_seconds", 0, 7200)
   readonly property int graceSeconds: intConfig("grace_seconds", 0, 3600)
   readonly property string soundPath: soundPathOf(configValue("sound"))
@@ -238,7 +251,7 @@ Item {
   property string soundOwner: ""
   property bool soundStopRequested: false
   // Why the head of the queue is not on screen right now:
-  // "" (nothing pending) | refreshing (clock-jump hold) | locked | lock-unknown
+  // "" (nothing pending) | refreshing (clock-jump or config-edit hold) | locked | lock-unknown
   // | waiting | summon-failed.
   property string deferredReason: ""
   property int lastLockProbeSec: 0
@@ -280,7 +293,9 @@ Item {
 
   readonly property string statusMessage: {
     if (!root.runtimeReady) return Strings.t(root.lang, "statusRuntimeMissing")
-    if (!root.configValid) return Strings.t(root.lang, "statusConfigUnreadable")
+    // After a valid read, a broken file keeps those values (applyConfig).
+    if (!root.configValid)
+      return Strings.t(root.lang, root.appliedConfigText !== "" ? "statusConfigKept" : "statusConfigUnreadable")
     if (root.cacheStatus === "unknown") return Strings.t(root.lang, "statusCacheReading")
     if (root.cacheStatus === "missing") return Strings.t(root.lang, "statusCacheMissing")
     if (root.cacheStatus === "invalid") return Strings.t(root.lang, "statusCacheUnreadable")
@@ -315,47 +330,77 @@ Item {
     return value === undefined || value === null ? root.configDefaults[key] : value
   }
 
+  // The plugin's one rule for an integer setting, shared with the fetcher's
+  // load_config and Widget.numberOption (docs/SPEC.md, "Configuration"): a JSON
+  // number, or a string holding a decimal number; rounded half up (Math.round),
+  // then clamped. Number()'s own leniency is not the rule -- "" would be 0, true
+  // 1 and [5] 5 -- so those keep the default, as the fetcher reports them.
+  function numberOf(value) {
+    if (typeof value === "number") return value
+    if (typeof value === "string" && /^\s*-?\d+(\.\d+)?\s*$/.test(value)) return Number(value)
+    return NaN
+  }
+
   function intConfig(key, min, max) {
-    var n = Math.round(Number(configValue(key)))
-    if (!isFinite(n)) n = Math.round(Number(root.configDefaults[key]))
-    return Math.max(min, Math.min(max, n))
+    var n = numberOf(configValue(key))
+    if (!isFinite(n)) n = Number(root.configDefaults[key])
+    return Math.max(min, Math.min(max, Math.round(n)))
   }
 
-  // Style.boolToken is the one boolean parser in this plugin; Widget.qml reads
-  // the same keys with it, so a "yes"/"1"/"on" in omeetingbar.json cannot make the
-  // bar and the alert path disagree. An unrecognised value keeps the default.
+  // Style.boolToken is the one boolean parser in this plugin; Widget.qml and
+  // the fetcher read the same keys by it, so a "yes"/"1"/"on" in
+  // omeetingbar.json cannot make the bar and the alert path disagree. An
+  // unrecognised value -- an object or a list included, which boolToken would
+  // read through String() -- keeps the default.
   function boolConfig(key) {
-    return Style.boolToken(configValue(key), root.configDefaults[key] === true)
+    var value = configValue(key)
+    var fallback = root.configDefaults[key] === true
+    if (value !== null && typeof value === "object") return fallback
+    return Style.boolToken(value, fallback)
   }
 
+  // A string setting is a string: String() would read ["de"] as "de", which
+  // the fetcher reports as invalid.
   function stringConfig(key) {
     var value = configValue(key)
-    return value === undefined || value === null ? "" : String(value)
+    return typeof value === "string" ? value : ""
   }
 
   // `sound` is a path to an audio file: "~/…" is expanded, surrounding spaces
   // are dropped, and a boolean -- false, "off", "no", "0" -- turns the alarm
-  // off, while true keeps the default. null or a missing key is the default.
+  // off, while true keeps the default. null or a missing key is the default,
+  // and so is anything else (a number, an object, a list), as the fetcher
+  // reports it: read through String() it would be a path to nothing, and the
+  // alarm silent.
   function soundPathOf(value) {
+    var fallback = String(root.configDefaults.sound)
+    if (value !== null && typeof value === "object") return fallback
     var flag = Style.boolToken(value, null)
     if (flag === false) return ""
-    if (flag === true) return String(root.configDefaults.sound)
-    var text = String(value === undefined || value === null ? "" : value).trim()
+    if (flag === true || typeof value !== "string") return fallback
+    var text = value.trim()
     if (text === "~" || text.indexOf("~/") === 0) text = root.home + text.slice(1)
     return text
   }
 
-  // Only #rrggbb is accepted: a typo must fall back to the documented default
-  // rather than reach QML as an invalid colour, which paints black.
+  // Only a string holding #rrggbb is accepted: a typo must fall back to the
+  // documented default rather than reach QML as an invalid colour, which
+  // paints black.
   function colorConfig(key, fallback) {
     var group = configValue("colors")
     var value = Util.isPlainObject(group) ? group[key] : undefined
-    if (value === undefined || value === null) return fallback
-    var text = String(value).trim()
+    if (typeof value !== "string") return fallback
+    var text = value.trim()
     return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
   }
 
-  function applyConfig(raw) {
+  // `present` says whether the file exists: missing, it means the defaults.
+  // Present but unusable -- empty (an editor between truncate and write), not
+  // JSON, not an object, unreadable -- the last valid config stays in force
+  // and only configValid drops: a trailing comma must not switch the toasts,
+  // the sound and the display wake back on. Before any valid read there is no
+  // last config, and the defaults apply (a broken file at startup).
+  function applyConfig(raw, present) {
     var text = String(raw || "").trim()
     var parsed = null
     if (text !== "") {
@@ -366,14 +411,36 @@ Item {
       }
     }
     var valid = Util.isPlainObject(parsed)
-    root.config = valid ? parsed : ({})
-    root.configValid = valid || text === ""
+    var firstRead = !root.configLoaded
+    if (valid) {
+      // A real edit after the first read also starts a fetch, so a new
+      // exclusion applies before the next alert fires, not up to
+      // fetch_interval_seconds later (see tick). So does fixing a broken
+      // file, even back to the text in force: the fetches in between read the
+      // broken one, and their warning would stay until the next interval.
+      if (!firstRead && (text !== root.appliedConfigText || !root.configValid)) {
+        root.configRefetchPending = true
+        root.configEditAtSec = Math.floor(Date.now() / 1000)
+      }
+      root.config = parsed
+      root.appliedConfigText = text
+    } else if (present !== true) {
+      if (!firstRead && root.appliedConfigText !== "") {
+        root.configRefetchPending = true
+        root.configEditAtSec = Math.floor(Date.now() / 1000)
+      }
+      root.config = ({})
+      root.appliedConfigText = ""
+    } else if (firstRead) {
+      root.config = ({})
+    }
+    root.configValid = valid || present !== true
     root.configLoaded = true
     // Editing the config is the moment to retry: switching backend to eds once
     // the packages are there must not wait out a 15-minute backoff.
     root.fetchFailStreak = 0
     root.lastFetchLogged = ""
-    if (!root.configValid) logState("config-invalid", root.configPath)
+    if (!root.configValid) logState("config-invalid", root.configPath + (firstRead ? "" : " (last valid kept)"))
     else logState("config-loaded", "lead=" + root.alertLeadSeconds + "s grace=" + root.graceSeconds + "s")
     probeSound()
   }
@@ -900,8 +967,14 @@ Item {
     root.fetchKilled = false
     root.fetchKillSent = false
     fetchProcess.running = true
-    // Whatever asked for it, a fetch started now postdates any clock jump.
+    // Whatever asked for it, a fetch started now postdates any clock jump,
+    // and reads the config as it is now. One that follows an edit holds firing
+    // until it lands, like the re-run after a jump (fireHoldActive).
     root.jumpRefetchPending = false
+    if (root.configRefetchPending) {
+      root.configRefetchPending = false
+      root.fireHoldUntilSec = Math.max(root.fireHoldUntilSec, root.lastFetchAtSec + root.fireHoldSeconds)
+    }
     return true
   }
 
@@ -1037,9 +1110,10 @@ Item {
   // The headline reaches D-Bus as a plain string through bin/omeetingbar-notify
   // (stdin JSON, never argv), so no option parser ever sees it, and the
   // helper's Gio-less fallback sends the content-free `safe` text instead.
+  // A meeting without a title is named as the bar and the agenda name it.
   function notificationHeadline(title) {
     var text = String(title || "").trim()
-    return text === "" ? Strings.t(root.lang, "meeting") : text
+    return text === "" ? Strings.t(root.lang, "untitled") : text
   }
 
   // Omarchy renders a toast's body as StyledText (the summary is plain text),
@@ -1508,8 +1582,9 @@ Item {
 
     // The queue's payloads predate a clock jump as much as the cache does: a
     // meeting cancelled while the machine slept would be summoned, and the
-    // display woken, before the fetch after the jump could withdraw it.
-    if (head.shownAt === 0 && jumpHoldActive(atSec)) {
+    // display woken, before the fetch after the jump could withdraw it. The
+    // same goes for a meeting a config edit has just excluded.
+    if (head.shownAt === 0 && fireHoldActive(atSec)) {
       root.deferredReason = "refreshing"
       return
     }
@@ -1607,17 +1682,22 @@ Item {
     root.lockProbePendingSinceSec = Math.min(root.lockProbePendingSinceSec, atSec)
     root.saveRetryAtSec = Math.min(root.saveRetryAtSec, atSec)
     root.lastPruneAtSec = Math.min(root.lastPruneAtSec, atSec)
+    root.configEditAtSec = Math.min(root.configEditAtSec, atSec)
     for (var i = 0; i < root.alertQueue.length; i++) {
       var pending = root.alertQueue[i]
       if (pending.summonedAtSec > atSec) pending.summonedAtSec = atSec
     }
   }
 
-  // Right after a clock jump the cache predates the sleep: until a fetch
-  // started after the jump has landed (bounded by fireHoldSeconds) nothing
-  // fires, and no queued alert reaches the screen for the first time.
-  function jumpHoldActive(atSec) {
-    return atSec < root.fireHoldUntilSec && (fetchProcess.running || root.jumpRefetchPending)
+  // Right after a clock jump the cache predates the sleep, and right after a
+  // config edit it predates the new exclusions: until a fetch started after
+  // either has landed (bounded by fireHoldSeconds once it runs) nothing fires,
+  // and no queued alert reaches the screen for the first time. An edit whose
+  // fetch cannot start yet -- an older one still runs -- holds for at most
+  // configHoldSeconds.
+  function fireHoldActive(atSec) {
+    if (atSec < root.fireHoldUntilSec && (fetchProcess.running || root.jumpRefetchPending)) return true
+    return root.configRefetchPending && atSec - root.configEditAtSec < root.configHoldSeconds
   }
 
   // The meetings past a burst's toast budget share one summary toast once the
@@ -1666,6 +1746,8 @@ Item {
     // The fetch that ran across a suspend is reaped by the watchdog above
     // (its age counts the sleep); the re-run goes out once it is gone.
     if (root.jumpRefetchPending && atSec < root.fireHoldUntilSec) runFetch("clock-jump")
+    // A config edit fetches as soon as no other fetch runs (see applyConfig).
+    if (root.configRefetchPending) runFetch("config")
     checkNotifyWatchdog(atSec)
 
     if (root.stateDirty && atSec >= root.saveRetryAtSec && root.saveAttempts < root.maxSaveAttempts) {
@@ -1698,8 +1780,9 @@ Item {
     // a fetch started after the jump to land (bounded by fireHoldSeconds), so
     // a meeting cancelled or moved while the machine slept does not wake,
     // notify and ring -- also when the fetch that ran across the suspend kept
-    // the re-run out at first.
-    var holdFires = jumpHoldActive(atSec)
+    // the re-run out at first. A config edit holds the same way, so a meeting
+    // just put on the blocklist does not fire from the cache before it.
+    var holdFires = fireHoldActive(atSec)
     if (root.stateLoaded && root.cacheLoaded && root.configLoaded && !holdFires) {
       // Two meetings in the same minute are two alerts: every due event fires
       // this tick, not only the earliest one. Bounded because fireEvent marks
@@ -1847,6 +1930,7 @@ Item {
       },
       configLoaded: root.configLoaded,
       configValid: root.configValid,
+      configFetchPending: root.configRefetchPending,
       runtimeReady: root.runtimeReady,
       soundAvailable: root.soundAvailable,
       soundPlaying: soundPlayer.running,
@@ -2134,14 +2218,20 @@ Item {
     blockLoading: true
     watchChanges: true
     printErrors: false
-    onLoaded: root.applyConfig(text())
-    onLoadFailed: root.applyConfig("")
+    onLoaded: root.applyConfig(text(), true)
+    // Only a missing file means the defaults; any other failure is a file that
+    // exists and cannot be used, which keeps the last valid config.
+    onLoadFailed: function(error) { root.applyConfig("", error !== FileViewError.FileNotFound) }
     onFileChanged: reload()
   }
 
   FileView {
     id: cacheFile
     path: root.cachePath
+    // Synchronous: the reload in fetchProcess's onExited has to land before
+    // the next tick, which lifts the fire hold of a clock jump or a config
+    // edit -- else that tick still fires from the cache the hold was for.
+    blockLoading: true
     watchChanges: true
     printErrors: false
     onLoaded: root.applyCache(text())
@@ -2215,8 +2305,11 @@ Item {
     ensureCacheDir()
     // Both are read blocking: the notified/shown state and any queue left by
     // the previous mount have to be known before the first tick can fire or
-    // summon anything, and the config before it decides when.
-    applyConfig(configFile.text())
+    // summon anything, and the config before it decides when. The config's
+    // blocking read reports through onLoaded / onLoadFailed, which apply it;
+    // this only covers a read that reported neither.
+    var configText = configFile.text()
+    if (!root.configLoaded) applyConfig(configText, configFile.loaded)
     loadState(stateFile.text())
     logState("service-ready", root.runtimeReady ? "" : "no XDG_RUNTIME_DIR")
     runFetch("startup")
