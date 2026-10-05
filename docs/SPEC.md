@@ -17,7 +17,8 @@ Plugin id: `io.github.disy-mk.omeetingbar` (ids starting with `omarchy.` are rej
 | `Widget.qml` | `bar-widget` | next-meeting text in the bar, and the host of the agenda popup |
 | `Popup.qml` | — | the agenda popup body (loaded by `Widget.qml`; not an entry point) |
 | `Providers.js` | — | video providers: host → name, Nerd-Font glyph, brand colour; imported by `Popup.qml` and `Alert.qml` |
-| `Strings.js` | — | every QML-side UI string in German and English, plus the language rule (`pick`); imported by all four QML files |
+| `Strings.js` | — | every QML-side UI string in German and English, plus the language rule (`pick`); imported by all four QML files and `Days.js` |
+| `Days.js` | — | calendar arithmetic: a day's first local instant (`dayStart`, equal to the fetcher's `_local_epoch`), calendar days between two instants and the day in front of a start time (`Widget.qml`, `Popup.qml`, `Alert.qml`), and the countdown's parts and words (`Widget.qml`, `Popup.qml`; the alert keeps its own second-by-second countdown) |
 | `bin/omeetingbar-fetch` | — | python3, writes the event cache (backends: eds / ics / demo) |
 | `bin/omeetingbar-join` | — | POSIX sh, click action of a meeting notification: `omeetingbar-join <event id> [<grace seconds>]` looks the event up by id in the 0600 cache and opens its link only until the meeting ends (a zero-length one until `start + grace`); the legacy form `omeetingbar-join <url> <end>` is still accepted for one or two releases (firing step 2) |
 | `bin/omeetingbar-notify` | — | python3 (Gio D-Bus), sends or replaces a notification from a JSON payload on **stdin**, so no toast text or link is ever an argument of a plugin process; prints the notification id |
@@ -38,6 +39,11 @@ consumer that answers one of them on its own silently disagrees with the other t
    agenda** this is `status.next` and the popup's notion of next; the bar label, the popup hero and
    `preview` speak for the **alertable view** of the same list (no all-day, no declined while
    `skip_declined`, not over), so they can legitimately name a different meeting than `status.next`.
+   One exception, for the bar label and the popup hero only (`Widget.nextEvent`, which the popup
+   is handed): while the first meeting of that view is running, an alertable meeting that starts
+   within `widget.warn_minutes` takes over, so a conference running all day — or the last minutes
+   of a call — does not hide the standup about to begin. `warn_minutes: 0` turns it off; the alert
+   path, `status.next` and `preview` keep the plain rule.
    "Over" is `max(end, start) <= now` on every surface, `isAlertable()` included — a zero-length
    occurrence (invariant 2's fallback) is therefore over the second it starts, everywhere.
 2. **`end` is the fetcher's word.** No consumer invents a duration. A missing, non-numeric or
@@ -151,9 +157,15 @@ Semantics:
   `Strings.js` (QML) or the fetcher's `MESSAGES` table, key-for-key identical in both languages
   with the same placeholders — never inline. Dates and weekday names follow the UI language
   (`Qt.locale("de_DE")` / `Qt.locale("en_US")`, so a German UI on an en_US session still says
-  "Mo"), times stay 24 h in both like Omarchy's own bar clock, the ISO week reads "KW 40" /
+  "Mo."), times stay 24 h in both like Omarchy's own bar clock, the ISO week reads "KW 40" /
   "W 40". Manifest texts (the bar's settings UI) cannot be localised and are English.
-- `fetch_interval_seconds` — how often the QML service runs the fetcher (local read).
+- `fetch_interval_seconds` — how often the QML service runs the fetcher (local read); 5 to 900,
+  clamped. 900 is also the failure backoff's ceiling, so nothing longer could take effect, and
+  `status` reports the clamped value. The bar calls a cache outdated past `900 + 120` s: the
+  longest gap a running service leaves between two written caches is that ceiling plus a run,
+  which the watchdog ends at 60 s. A run the watchdog has to end writes no cache, so fetches that
+  keep hanging do get flagged — rightly, the data is old, even though the tooltip's question
+  ("läuft der OMeetingBar-Dienst?") then has the answer yes.
 - `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it.
   Default 7 days, because the bar's promise is to *always* name the next meeting: on a Friday
   evening that is Monday's first one, and a 12 h horizon left the bar blank all weekend. The
@@ -200,6 +212,11 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   the fetcher is allowed to write `end == start` for an occurrence without a length.
 - `url`: `https://…` or `""` (invariant 3). The fetcher never writes any other scheme, and every
   consumer still re-validates.
+- `title`, `calendar`, `location`: plain text with whitespace collapsed, capped at 200, 120 and
+  200 characters, and without the bidi embedding, override and isolate controls (U+202A–U+202E,
+  U+2066–U+2069; `_short`): an unterminated one reverses everything after it on the line it is
+  drawn in, the bar label's countdown included. The widget's parser and the alert's payload
+  cleaning drop them again.
 - `id`: stable across runs — `sha1(uid + "@" + instance_start_epoch)[:16]`. Must be identical for
   the same occurrence on every run, or the alert fires repeatedly. An event without a UID hashes
   `"~" + title` in its place, so two UID-less meetings at the same time stay two events.
@@ -218,7 +235,11 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   dates nearest to `start`/`end`): on all-day entries only. `signin_needed_at` (unix seconds,
   present only when set): the eds backend's sign-in stamp, see *Network freshness*. All three are
   for the fetcher's next run and every other consumer ignores them: carry-forward matches the
-  uid (display names are not unique), `calendars_exclude` matches it as well as the name, and an
+  uid (display names are not unique), `calendars_exclude` matches it as well as the name (names
+  compared on both sides in the form the cache writes them — bidi controls dropped, whitespace
+  collapsed, lower-cased — on live sources as on cache entries, so an entry typed the way a name
+  reads on screen and one pasted with a control in it both match; `title_blocklist` terms lose
+  their bidi controls the same way, and a term that was nothing else is ignored), and an
   all-day entry is rebuilt from its dates in the current zone, because its epochs are the
   midnights of the zone that wrote it.
 - `status: "error"` + human-readable `error` when the backend fails; `events` then keeps the last
@@ -336,7 +357,7 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 | `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
 | `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
 | `omarchy-shell omeetingbar dismiss` | hide the alert, stop the alarm sound and discard the **whole** pending queue (entries that never reached the screen are recorded as `failed`). Unlike Esc in the overlay, which closes only the head and lets `drainQueue` summon the next queued alert — an explicit dismiss means "give me the screen back" |
-| `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed to the widget on the focused monitor (`Widget.qml`'s handler) — the target to bind a Hyprland key to |
+| `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed the way the bar routes its own panel hotkeys: to the copy whose agenda is open, else to the widget on the focused monitor; `isOpen` is true while any copy's agenda is open (`Widget.qml`'s handler, see the widget contract) — the target to bind a Hyprland key to |
 
 ## Overlay contract — `Alert.qml`
 
@@ -364,7 +385,10 @@ Requirements:
 - Opaque themed background (this is a *blanking* alert, not a toast): use `qs.Commons`
   (`Color`, `Style`, `Util`) and `qs.Ui` — third-party plugins may import these.
 - Content: big countdown ("in 47 s" → "jetzt"), meeting title, start–end local time, calendar name,
-  location if present, and the join hint when a URL exists.
+  location if present, and the join hint when a URL exists. A start that is not today carries its
+  day in front of the time: "morgen", else the short date in the form the bar's tooltip and the
+  agenda use (`dateShort`: "So., 11. Okt." / "Sun, Oct 11"; seen only for `preview` of a meeting
+  further out, or a grace alert just after midnight).
 - Keys: Return/Enter → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
   dismiss; Escape or any other key → dismiss; bare modifiers do nothing. Space is no join key:
   it is the key most likely to be in flight while the user is typing. Full-size `MouseArea` →
@@ -428,11 +452,27 @@ Requirements:
   because the cache may not exist yet.
 - Renders e.g. `󰃭 14:00 Standup · 12m` in `colors.upcoming`, switching to `colors.running` once the
   meeting has started. A meeting that is not today carries a day prefix — `morgen 09:00`, or the
-  short weekday (`So. 10:15`) beyond that — and a countdown of a day or more reads in days
-  (`2d`), because the bar always names the next meeting inside the fetcher's seven-day window and
-  a bare `09:00` on a Friday for a Monday meeting would be a lie. `widget.warn_minutes` no longer decides *whether* there is colour — it drives
+  short weekday (`So. 10:15`) beyond that, and the short date (`Mo., 12. Okt.`) seven or more days
+  out, where a weekday alone would repeat: the default seven-day lookahead already reaches a day
+  with today's weekday, and `lookahead_minutes` goes up to 30 days. The bar always names the next
+  meeting, and a bare `09:00` on a Friday for a Monday meeting would be a lie. A meeting that
+  began before today and is still running names its day the same way (`Mo. 23:00 Late call ·
+  läuft`). The countdown (`Days.countdown`, the popup's too): minutes, then hours and minutes, and
+  the calendar days to a meeting on a later calendar day once it is 24 h or more away —
+  `morgen 20:00` read at 07:00 is `1d` (not round(37 h) = `2d`), Friday evening to Monday `3d`,
+  while `morgen 08:00` read at 22:00 still reads `10h`; a meeting later the same day stays in hours
+  even on the 25-hour day. Running, the tooltip counts elapsed time, in whole 24-hour days past a
+  day ("Läuft seit 1 h 10 min.", "Läuft seit 1 Tag." — also for Monday 09:00 read on Wednesday
+  08:00), and whole hours drop the minutes ("Beginnt in 2 h."). A meeting that runs past midnight
+  names the day at both ends of the tooltip's range ("heute 23:00 – morgen 01:00"). The title is
+  wrapped in a first-strong isolate (U+2068 … U+2069) in the label and the tooltip: a title in a
+  right-to-left script otherwise sets the direction of the whole line and drags the countdown into
+  it (measured: "14:00 12 · <title>m").
+  `widget.warn_minutes` no longer decides *whether* there is colour — it drives
   the brightness: full strength inside the window, 75 % alpha outside it, so "soon" stays readable
-  at a glance without inventing a third colour. Truncates the title to `widget.max_title_chars`;
+  at a glance without inventing a third colour. It also marks when a meeting about to start takes
+  the label over from one still running (invariant 1's exception). Truncates the title to `widget.max_title_chars`
+  (never through a surrogate pair: a cut that would leave half of one drops it);
   collapses to zero width only when the whole agenda is empty (if `hide_when_empty`): while today
   or tomorrow still hold entries it stays as a dimmed `󰃭 —`, because the left click is the popup's
   mouse entry point and "what did I have today, what is tomorrow" is exactly the evening question.
@@ -447,8 +487,14 @@ Requirements:
   the plugin by manifest kind and reaches `Alert.open("{}")` — so `Alert.qml` refuses to blank for a
   payload without a start; (b) the bar instantiates the widget once per monitor and Quickshell keeps
   only the first `IpcHandler` registration, so the `omeetingbar-agenda` handler never acts on its own
-  instance but routes through `bar.summonBarWidget/hideBarWidget/isBarWidgetOpen(moduleName)`, which
-  picks the widget on the focused screen.
+  instance. A third-party widget's `bar` is the plugin facade (`Ui/PluginBarApi.qml`), which has no
+  `summonBarWidget` but lists this module's live copies (`moduleWidgets(moduleName)`), so the
+  handler picks among them by the bar's own rules (`BarModel.pickPanelSlot`): a copy whose agenda
+  is open first, so `close` and `toggle` reach the one the user sees; among those the copy on
+  Hyprland's focused monitor (its screen read as `item.QsWindow.window.screen.name`, like
+  `Bar.qml`); and a drawn copy (visible, non-zero size) over a placeholder. `isOpen` is true while
+  any copy's agenda is open. A bar that offers `summonBarWidget/hideBarWidget/isBarWidgetOpen` is
+  asked instead.
 - The widget keeps reading the cache and the config; the popup renders what it is handed. `events`
   is the full agenda, while the bar label, its colour, the tooltip and "next meeting" all come from
   an alertable-filtered view of it (no declined, no all-day, not over), so their meaning is
@@ -461,7 +507,15 @@ Requirements:
   to the label and the reason to the tooltip, and keeps the widget visible even when
   `hide_when_empty` would collapse it — a degraded state the user cannot see is not reported.
 - Applies invariants 1–3 in its own cache parser: it drops non-https urls, collapses a broken
-  `end` to `start`, and picks the next event with `max(end, start) > now`.
+  `end` to `start`, and picks the next event with `max(end, start) > now`. It also drops the bidi
+  embedding, override and isolate controls (U+202A–U+202E, U+2066–U+2069) from title, calendar and
+  location, as the fetcher does at the source: an unterminated one reverses the rest of the label,
+  countdown included. `Alert.qml`'s `cleanText` does the same for the payload. Both write the
+  controls as `\uXXXX` escapes in their regex, never as the characters themselves: invisible
+  characters in source are the "Trojan Source" pattern, and an editor that drops them silently
+  turns the class into one that deletes every hyphen. An entry whose `start` (or `end`) lies
+  outside what a JavaScript `Date` can hold (±8.64e12 s) is dropped (its `end` collapsed), or every
+  date and countdown would read `NaN`.
 - Host injects `bar`, `moduleName`, `settings` into bar widgets; read the reference widgets under
   `/usr/share/omarchy/shell/plugins/bar/` for the exact contract and styling conventions.
 
@@ -482,17 +536,46 @@ file talks to the outside world.
   the timeline strip, `PanelSeparator`, a `HEUTE · DO., 10. SEPT. (KW 37)` section (ISO week, computed
   in QML — Qt has no format token for it), `PanelSeparator`, the
   same for `MORGEN`, then — only when non-empty — a `DEMNÄCHST` section with the next (at most
-  five) meetings after tomorrow, their time column reading `So. 10:15` like the bar label, the
+  five) meetings after tomorrow, their time column reading the weekday and time (`So. 10:15`)
+  within six days and the date without its weekday (`12. Okt.`) beyond, where a weekday alone
+  would repeat — the date and the time together do not fit the 84 px column (measured), so the
+  time is in the row's tooltip — then the
   degraded/empty message, `PanelSeparator`, the footer action rows. The later section exists
   because the bar promises to always name the next meeting: on a Friday evening that is Monday.
+- Days and rows: the sections' bounds are the first local instant of each day (`Days.dayStart`),
+  the fetcher's `_local_epoch` exactly — measured equal for every day of 2026 in 13 zones,
+  Santiago, the Azores, Havana, Beirut and Cairo included, where DST switches at midnight and a
+  plain `Date(y, m, d)` lands an hour off. A meeting that runs past midnight is listed under both
+  days, and each row prints only its own day's part with `…` at the cut: `23:00–…` under HEUTE,
+  `…–01:00` under MORGEN, `…–…` on a day it runs through. Its tooltip keeps the whole range with
+  the date at both ends. The formatters that turn an instant into wall-clock text (`clockTime`,
+  `dayShort`, `dayLabel`, the DEMNÄCHST column) read `zoneKey` — the zone's abbreviation now and
+  the UTC offsets of today and the next 31 days, so two zones that switch DST on the same date at
+  different hours (Havana, New York) still differ — so the rows follow a time-zone change under a
+  running shell (`omarchy-menu-timezone`) within a second instead of keeping the old times until
+  their section's content changes. The key also changes once a day while a DST switch lies inside
+  its window, a harmless re-render.
+- The hero's meta line is one elided row of capitals (about 270 px), so it is kept short: a
+  meeting already under way gets no day in front (its countdown says how long it has run; the bar
+  label still names the day); one that is not today gets its day in the compact form — "morgen",
+  the weekday within six days, the date without its weekday beyond (`12. Okt.`) — and a coarse
+  countdown: whole hours, and minutes in the alert's short words ("in 45 min"). A meeting that
+  ends on a later day at or after its start time reads `09:00–…` (a conference from Monday 09:00 to
+  Thursday 17:00 is not one day's `09:00–17:00`); an overnight call keeps `23:00–01:00`, and a
+  zero-length occurrence reads as one time. Measured on the real `PanelHero` inside the panel's
+  inset: none of the day-prefixed lines is cut off in either language.
 - Rows are `CursorSurface`, and the panel owns the cursor state (`cursorActive`, `focusSection`,
   `selectedIndex`); a row must never colour itself from `containsMouse`, or mouse and keyboard show
   two highlights at once. Hover goes through `Ui/PointerMoveGate` (reset on every keyboard move):
   Qt re-delivers hover to whatever a keyboard scroll slides under a stationary pointer, and without
   the gate `j`/`k` could not cross the viewport edge while the mouse rested on the list. A keyboard
-  move sets one `revealPending` token that the newly selected row consumes (deferred, because a
-  freshly created row reports `y = 0` until the Column's polish), so Repeater rebuilds under an open
-  popup never scroll. Cursor transitions toggle `cursorActive` off and on around the two writes, so
+  move arms one `revealPending` token before its selection and clears it right after, so exactly
+  the row it selects consumes it (the reveal itself is deferred, because a freshly created row
+  reports `y = 0` until the Column's polish): Repeater rebuilds under an open popup never scroll,
+  and neither does a later hover. `open()` resets the token and the gate, so a pointer resting
+  where the join row maps cannot select it; that relies on Qt delivering the hover to the button's
+  own HoverHandler before the card-wide one primes the gate (measured with Qt 6.11.2). Cursor
+  transitions toggle `cursorActive` off and on around the two writes, so
   no row is selected with the old index in the new section for a frame. Row states: finished → 45 % opacity, running → `current` + bold + the
   running colour, declined → `font.strikeout` (lowercase "o"; it leaves `implicitWidth` untouched).
 - The timeline strip carries **no hour numbers**, and that is a deliberate scar rather than an
@@ -509,7 +592,14 @@ file talks to the outside world.
   the clock's track/fill with the `Style.cornerRadius > 0 ? height / 2 : 0` guard (this theme is
   square), `PanelSlider`'s fraction-positioned ticks, greedy lane packing capped at 3 lanes, and a
   now-marker in `Style.selectedStateColor(fg, Color.accent)` — theme chrome, so the plugin's two
-  colours keep meaning "meeting state".
+  colours keep meaning "meeting state". A rail is 4 to 14 hours; when today's day is longer than
+  that, its rail starts no earlier than an hour before the current hour, so "now" stays on it.
+  Bars are half-open like the sections: a meeting that starts at or after the rail's end, or ended
+  at or before its start, is left off (its row still lists it) instead of drawing a stub at the
+  edge. The notch count is read off `stripWindow` itself and
+  capped at 15: read off `stripStartSec`/`stripEndSec`, two separate bindings, it was seen with a
+  start of 0 beside the old end when the rail went empty, and the notch `Repeater` froze the shell
+  creating half a million delegates.
 - Every `Text` sets `textFormat: Text.PlainText`: meeting titles are untrusted third-party input.
   Nerd-font glyphs sit in a fixed-width centred `Item` (single-cell advance, up to 15 px of paint).
 - The provider glyph per row and the join footer come from `Providers.js`, the one table shared
@@ -589,11 +679,22 @@ file talks to the outside world.
   preview has been shown since the shell started, `Popup.qml` if the agenda was never opened —
   load as new code beside the old `Service.qml` and `Widget.qml`, so a release must keep them
   compatible with the previous version's alert payload and popup bindings. They also run
-  against the previous version's JavaScript: the engine caches `Strings.js` and `Providers.js`
-  for its whole life (measured with Quickshell 0.3.1 / Qt 6.11.2: a never-loaded component gets
-  the new QML with the old JS imports), so a new key there reads as its raw name and a new
-  function is missing, and `open()` would throw. New QML may use a new key or JS function only
-  behind a fallback or a `typeof` check; check each release's QML against the previous tag's JS.
+  against the previous version's JavaScript: the engine caches every JavaScript file it has loaded
+  — `Strings.js`, `Providers.js`, and from 1.4.0 `Days.js` — for its whole life (measured with
+  Quickshell 0.3.1 / Qt 6.11.2: a never-loaded component gets the new QML with the old JS
+  imports), so a new key there reads as its raw name and a new function is missing, and `open()`
+  would throw. New QML may use a new key or JS function only behind a fallback or a `typeof`
+  check. A JavaScript file that is new in a release has no cached copy and loads fresh, but its
+  own imports are the cached ones: `Days.js` therefore uses only `Strings` keys and functions that
+  every published release has. Check each release's QML and JS against the JS of every release a
+  user may still be updating from, not only the previous tag — a marketplace user can skip
+  versions (1.1.0 → 1.4.0). Measured for 1.4.0: the new `Popup.qml` and `Days.js` hosted by every
+  `Widget.qml` from 1.0.0 to 1.3.0, and the new `Alert.qml` with those releases' payloads, each
+  with that release's `Strings.js` and `Providers.js`, load and render without an error or a raw
+  key. The other way round — a downgrade without a restart, as when a dev checkout goes back to
+  an older commit — a never-loaded old QML file gets the new cached JS, so a key or function the
+  previous release's QML calls stays one release after its last use: 1.4.0 keeps `weekday()`,
+  `weekdays` and `alertDate`, which only the 1.3.x alert read.
 - **Firing** every alertable event (invariant 1) with `start - now <= alert_lead_seconds` (at
   least `zeroLengthMinLeadSeconds`, 5 s, for a zero-length occurrence: see the config) and
   `now - start <= grace_seconds` whose id is not in `notified` — all of them on the same tick,
