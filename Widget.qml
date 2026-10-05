@@ -1,8 +1,10 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Days.js" as Days
 import "Strings.js" as Strings
 
 // Next-meeting label for the bar, and the host of the agenda popup.
@@ -75,9 +77,13 @@ BarWidget {
   // A cache nobody refreshes any more still parses fine, so the widget would
   // happily show yesterday's list. The service writes every minute by
   // default; well past that means it is not running, and the alert will not
-  // fire either — say so instead of looking healthy.
+  // fire either — say so instead of looking healthy. The longest gap a
+  // running service leaves is 900 s (fetch_interval_seconds is capped there,
+  // and so is the failure backoff) plus the run itself, which the watchdog
+  // ends at 60 s; the margin keeps a healthy cache from being flagged for a
+  // few seconds at the end of every slow cycle.
   readonly property real cacheAge: cacheGeneratedAt > 0 ? nowSec - cacheGeneratedAt : -1
-  readonly property bool cacheOutdated: cacheAge > 900
+  readonly property bool cacheOutdated: cacheAge > 900 + 120
 
   // The cache is the agenda now, so the bar has to filter it back down to
   // what it has always meant: the meetings that can still interrupt you.
@@ -118,8 +124,8 @@ BarWidget {
   readonly property string labelText: {
     if (vertical) return hasWarning ? warnGlyph : glyph
     if (!hasEvent) return glyph + " —" + warnMark
-    return glyph + " " + timeLabel(nextEvent) + " " + truncate(nextEvent.title, maxTitleChars)
-      + " · " + shortCountdown(secondsToStart) + warnMark
+    return glyph + " " + timeLabel(nextEvent) + " " + isolate(truncate(nextEvent.title, maxTitleChars))
+      + " · " + shortCountdown(nextEvent.start) + warnMark
   }
 
   // One place for the hint, so it can never promise a binding the button
@@ -165,15 +171,12 @@ BarWidget {
       return lines.join("\n")
     }
 
-    var day = dayPrefix(nextEvent)
-    if (day !== "" && day !== Strings.t(root.lang, "tomorrow"))
-      day = new Date(Number(nextEvent.start) * 1000).toLocaleDateString(root.uiLocale, Strings.t(root.lang, "dateShort"))
-    lines.push((day === "" ? "" : day + "  ") + timeRange(nextEvent) + "  " + truncate(nextEvent.title, 64))
+    lines.push(rangeLine(nextEvent) + "  " + isolate(truncate(nextEvent.title, 64)))
     var meta = []
     if (nextEvent.calendar !== "") meta.push(nextEvent.calendar)
     if (nextEvent.location !== "") meta.push(truncate(nextEvent.location, 48))
     if (meta.length > 0) lines.push(meta.join(" · "))
-    lines.push(longCountdown(secondsToStart))
+    lines.push(longCountdown(nextEvent.start))
     lines.push(clickHint)
     return lines.join("\n")
   }
@@ -318,29 +321,57 @@ BarWidget {
   function truncate(value, limit) {
     var s = String(value || "")
     if (limit <= 1 || s.length <= limit) return s
-    return s.substring(0, limit - 1) + "…"
+    var cut = s.substring(0, limit - 1)
+    // substring() counts UTF-16 units: an emoji cut in half would leave a lone
+    // high surrogate, drawn as a replacement box in front of the ellipsis.
+    var last = cut.charCodeAt(cut.length - 1)
+    if (last >= 0xD800 && last <= 0xDBFF) cut = cut.substring(0, cut.length - 1)
+    return cut + "…"
+  }
+
+  // A title in a right-to-left script would otherwise set the direction of
+  // the whole line and drag the countdown into it ("14:00 12 · <title>m").
+  // First-strong isolate and pop (U+2068, U+2069) keep it to itself; collapse()
+  // has already dropped any isolate the title brought along, so the pair always
+  // closes.
+  function isolate(text) {
+    return "\u2068" + text + "\u2069"
   }
 
   function clockTime(seconds) {
     return Qt.formatDateTime(new Date(seconds * 1000), "HH:mm")
   }
 
-  // Local midnight `offset` days from now, via Date components so the DST
-  // days keep their 23 and 25 hours (never now + n * 86400).
-  function dayStartSec(offset) {
-    var d = new Date(nowSec * 1000)
-    return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset).getTime() / 1000)
-  }
-
   // "" today, "tomorrow" for tomorrow, else the short weekday — the bar always
   // names the next meeting even when it is on Monday, and a bare "09:00" for a
-  // Monday meeting read on Friday would be a lie. The weekday follows the UI
-  // language (uiLocale), not the session locale.
+  // Monday meeting read on Friday would be a lie. A meeting that began before
+  // today and is still running names its day too ("Mo. 23:00 Late call ·
+  // läuft"), and further than six days either way it is the short date
+  // (Days.dayPrefix). Both follow the UI language, not the session locale.
   function dayPrefix(event) {
+    return Days.dayPrefix(root.lang, root.nowSec, Number(event.start))
+  }
+
+  // The tooltip names the day in full: "" today, "tomorrow", else the short
+  // date. `named` says "today" too, for the far end of a meeting that runs
+  // past midnight.
+  function tooltipDay(sec, named) {
+    var days = Days.daysBetween(root.nowSec, sec)
+    if (days === 0) return named ? Strings.t(root.lang, "today") : ""
+    if (days === 1) return Strings.t(root.lang, "tomorrow")
+    return new Date(sec * 1000).toLocaleDateString(root.uiLocale, Strings.t(root.lang, "dateShort"))
+  }
+
+  // The tooltip's first line before the title. A meeting that runs past
+  // midnight carries its day at both ends ("today 23:00 – tomorrow 01:00"),
+  // so a late call does not read as one that ends before it starts.
+  function rangeLine(event) {
     var start = Number(event.start)
-    if (start < dayStartSec(1)) return ""
-    if (start < dayStartSec(2)) return Strings.t(root.lang, "tomorrow")
-    return new Date(start * 1000).toLocaleDateString(root.uiLocale, "ddd")
+    var end = Math.max(Number(event.end), start)
+    if (!event.allDay && end > Days.dayStart(start, 1))
+      return tooltipDay(start, true) + " " + clockTime(start) + " – " + tooltipDay(end, true) + " " + clockTime(end)
+    var day = tooltipDay(start, false)
+    return (day === "" ? "" : day + "  ") + timeRange(event)
   }
 
   function timeLabel(event) {
@@ -357,30 +388,25 @@ BarWidget {
     return clockTime(event.start) + "–" + clockTime(event.end)
   }
 
-  function shortCountdown(delta) {
-    if (delta < -60) return Strings.t(root.lang, "running")
-    if (delta < 60) return Strings.t(root.lang, "now")
-    var minutes = Math.floor(delta / 60)
-    if (minutes < 60) return minutes + "m"
-    var hours = Math.floor(minutes / 60)
-    // Past a day the hour count stops meaning anything at a glance; the label
-    // already carries the weekday, so the countdown just says how many days.
-    if (hours >= 24) return Math.round(delta / 86400) + "d"
-    var rest = minutes % 60
-    return rest > 0 ? hours + "h" + rest + "m" : hours + "h"
+  // Counted by Days.countdown, the popup's rule too. Past a day the hour count
+  // stops meaning anything at a glance; the label already carries the day, so
+  // a meeting on a later calendar day and 24 h or more away counts in calendar
+  // days: "morgen 20:00" read at 07:00 is 1d, while "morgen 08:00" read at
+  // 22:00 is still 10h.
+  function shortCountdown(startSec) {
+    var parts = Days.countdown(root.nowSec, Number(startSec))
+    if (parts.phase === "running") return Strings.t(root.lang, "running")
+    if (parts.phase === "now") return Strings.t(root.lang, "now")
+    if (parts.unit === "minutes") return parts.value + "m"
+    if (parts.unit === "hours") return parts.minutes > 0 ? parts.hours + "h" + parts.minutes + "m" : parts.hours + "h"
+    return parts.value + "d"
   }
 
-  function longCountdown(delta) {
-    if (delta < -60) return Strings.t(root.lang, "runningForDot", minutesWord(Math.floor(-delta / 60)))
-    if (delta < 60) return Strings.t(root.lang, "startsNow")
-    var minutes = Math.floor(delta / 60)
-    if (minutes < 60) return Strings.t(root.lang, "startsIn", minutesWord(minutes))
-    if (minutes >= 24 * 60) {
-      var days = Math.round(delta / 86400)
-      return Strings.t(root.lang, "startsIn", Strings.count(root.lang, days, "oneDay", "nDays"))
-    }
-    return Strings.t(root.lang, "startsIn",
-      Strings.t(root.lang, "hoursMin", Math.floor(minutes / 60), minutes % 60))
+  function longCountdown(startSec) {
+    var parts = Days.countdown(root.nowSec, Number(startSec))
+    if (parts.phase === "now") return Strings.t(root.lang, "startsNow")
+    return Strings.t(root.lang, parts.phase === "running" ? "runningForDot" : "startsIn",
+      Days.spanText(root.lang, parts, false))
   }
 
   function minutesWord(minutes) {
@@ -475,13 +501,15 @@ BarWidget {
     for (var i = 0; i < list.length && out.length < 512; i++) {
       var raw = list[i]
       if (!Util.isPlainObject(raw)) continue
+      // Unix seconds a JavaScript Date can hold (±8.64e12): beyond that every
+      // date and countdown would read NaN.
       var start = Number(raw.start)
-      if (!isFinite(start)) continue
+      if (!isFinite(start) || Math.abs(start) > 8.64e12) continue
       // The fetcher owns the duration; nothing here invents one. A missing or
       // reversed end simply collapses to the start (a zero-length occurrence),
       // which the alertable filter still shows until its start has passed.
       var end = Number(raw.end)
-      if (!isFinite(end) || end < start) end = start
+      if (!isFinite(end) || end < start || end > 8.64e12) end = start
       out.push({
         id: String(raw.id || ""),
         title: collapse(raw.title) || Strings.t(root.lang, "untitled"),
@@ -510,8 +538,12 @@ BarWidget {
     return /^https:\/\/[^\s\\]+$/i.test(url) ? url : ""
   }
 
+  // Also drops the bidi embedding, override and isolate controls (U+202A to
+  // U+202E, U+2066 to U+2069): an unterminated one in a title reverses the rest
+  // of the label, countdown included. The fetcher already strips them; this is
+  // the second line, for a cache written by anything else.
   function collapse(value) {
-    return String(value || "").replace(/\s+/g, " ").trim()
+    return String(value || "").replace(/[\u202A-\u202E\u2066-\u2069]/g, "").replace(/\s+/g, " ").trim()
   }
 
   function shortError(value) {
@@ -613,16 +645,17 @@ BarWidget {
   // fullscreen alert's, so the bar's own bar-widget panel route never reaches
   // this widget. Without this handler the agenda would be mouse-only: no
   // keybinding, no scripting, and nothing to drive a screenshot from.
-  // One instance per bar (so per monitor) registers this target; the shell logs
-  // that the later registration is unused and the first one answers, which is
-  // the same shape several first-party widgets already have.
   // One IpcHandler per bar — so per monitor — and Quickshell keeps only the
-  // first registration. Whichever instance answers must therefore not act on
-  // itself: with two monitors that dragged a popup open on screen B over to
-  // screen A. It asks the bar to route to the widget on the FOCUSED screen,
-  // the same path the bar's own hotkeys take for first-party widgets
-  // (Bar.summonBarWidget → findPanelWidget → BarModel.pickPanelSlot). The
-  // local fallback only runs when a bar without that facade hosts us.
+  // first registration (the shell logs the later ones as unused, the same
+  // shape several first-party widgets have). Whichever instance answers must
+  // therefore not act on itself: with two monitors it opened the agenda on
+  // whichever screen registered first, said "false" while it was open on the
+  // focused one and could not close it there. It acts on the copy the bar's
+  // own hotkeys would pick (Bar.findPanelWidget → BarModel.pickPanelSlot).
+  // A third-party widget does not get that bar: its `bar` is the plugin facade
+  // (Ui/PluginBarApi.qml), which has no summonBarWidget but does list this
+  // module's live copies (moduleWidgets), so the pick is made here, by the same
+  // rules. Should a facade ever offer summonBarWidget, the bar picks instead.
   function routeToFocused(action) {
     var b = root.bar
     var id = root.moduleName
@@ -632,11 +665,62 @@ BarWidget {
       if (action === "close") return b.hideBarWidget(id) === true
       return (b.isBarWidgetOpen(id) ? b.hideBarWidget(id) : b.summonBarWidget(id)) === true
     }
-    if (action === "isOpen") return root.opened
-    if (action === "open") root.open()
-    else if (action === "close") root.close()
-    else root.toggle()
+    var peers = agendaPeers()
+    if (action === "isOpen") return openPeers(peers).length > 0
+    var target = pickPeer(peers)
+    if (action === "open") target.open()
+    else if (action === "close") target.close()
+    else target.toggle()
     return true
+  }
+
+  // Every live copy of this widget that hosts an agenda, this one included —
+  // one per bar, so one per monitor.
+  function agendaPeers() {
+    var b = root.bar
+    var list = []
+    try {
+      if (b && typeof b.moduleWidgets === "function") list = b.moduleWidgets(root.moduleName)
+    } catch (e) {
+      // A host that throws here leaves this copy to answer on its own, rather
+      // than the CLI with an error.
+      list = []
+    }
+    var out = []
+    for (var i = 0; list && i < list.length; i++) {
+      var item = list[i]
+      if (item && typeof item.open === "function" && typeof item.close === "function"
+        && typeof item.toggle === "function" && item.opened !== undefined && out.indexOf(item) < 0)
+        out.push(item)
+    }
+    if (out.indexOf(root) < 0) out.push(root)
+    return out
+  }
+
+  function openPeers(peers) {
+    return peers.filter(function(item) { return item.opened === true })
+  }
+
+  // BarModel.pickPanelSlot's rules: an open copy first, so close and toggle
+  // reach the agenda the user can see; among those the focused monitor's; and
+  // a copy the bar actually draws over a zero-size placeholder.
+  function pickPeer(peers) {
+    var pool = openPeers(peers)
+    if (pool.length === 0) pool = peers
+    var focused = Hyprland.focusedMonitor ? String(Hyprland.focusedMonitor.name || "") : ""
+    if (focused !== "") {
+      var onFocused = pool.filter(function(item) { return peerScreenName(item) === focused })
+      if (onFocused.length > 0) pool = onFocused
+    }
+    for (var i = 0; i < pool.length; i++)
+      if (pool[i].visible === true && pool[i].width > 0 && pool[i].height > 0) return pool[i]
+    return pool[0]
+  }
+
+  // The output a copy's bar is on, read the way Bar.qml reads it.
+  function peerScreenName(item) {
+    var window = item && item.QsWindow ? item.QsWindow.window : null
+    return window && window.screen ? String(window.screen.name || "") : ""
   }
 
   IpcHandler {

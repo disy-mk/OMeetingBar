@@ -27,7 +27,7 @@ Item {
   // 6.11 offers no way to clear (Qt.clearComponentCache does not exist), so the
   // old code runs on until `omarchy restart shell` while root.manifest already
   // names the installed version. Only this constant says which code is running.
-  readonly property string codeVersion: "1.3.0"
+  readonly property string codeVersion: "1.4.0"
   // Handed to every fetch. The fetcher is read from disk on every run, so after
   // an update it is already the new code while this service may still be the
   // old one; this tells it which service started it (one before 1.1.0 sets
@@ -143,7 +143,9 @@ Item {
   property bool configLoaded: false
   property bool configValid: true
 
-  readonly property int fetchIntervalSeconds: intConfig("fetch_interval_seconds", 5, 3600)
+  // At most 900 s, the backoff's own ceiling below: anything longer was cut
+  // to 900 there anyway, and `status` should report the interval in effect.
+  readonly property int fetchIntervalSeconds: intConfig("fetch_interval_seconds", 5, 900)
   // A backend that cannot work at all — eds before the packages are installed —
   // must not respawn python every interval for ever. Back off to at most 15 min
   // while it keeps failing; a single success drops straight back to normal.

@@ -72,6 +72,8 @@ var table = {
     clickJoinVia: "Klick: in %1 beitreten",
     clickOpenMeeting: "Klick: Meeting öffnen",
     // fullscreen alert
+    // weekdays and alertDate: unused since 1.4.0 (the alert writes dateShort),
+    // kept one more release with weekday() below -- see there.
     weekdays: ["So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"],
     alertDate: "%1, %2.%3.",
     over: "vorbei",
@@ -197,7 +199,7 @@ function pick(override, localeName) {
 }
 
 // The Qt locale to format dates with, so weekday names follow the UI language
-// rather than the session (a German UI on an en_US session says "Mo", not "Mon").
+// rather than the session (a German UI on an en_US session says "Mo.", not "Mon").
 function localeName(lang) {
   return lang === "de" ? "de_DE" : "en_US"
 }
@@ -219,6 +221,10 @@ function count(lang, n, oneKey, manyKey) {
   return n === 1 ? t(lang, oneKey) : t(lang, manyKey, n)
 }
 
+// Unused since 1.4.0. Kept one more release: the engine caches this file for
+// the shell's life, so after a downgrade without `omarchy restart shell` a
+// 1.3.x Alert.qml loading for the first time gets this copy, and its dayLabel
+// calls weekday() (docs/SPEC.md, "Version and updates").
 function weekday(lang, dayIndex) {
   return (table[lang] || table.en).weekdays[dayIndex]
 }

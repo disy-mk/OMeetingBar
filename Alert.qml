@@ -4,6 +4,7 @@ import Quickshell.Wayland
 import QtQuick
 import qs.Commons
 import qs.Ui
+import "Days.js" as Days
 import "Providers.js" as Providers
 import "Strings.js" as Strings
 
@@ -160,8 +161,12 @@ Item {
 
   // ---------------------------------------------------------- payload helpers
 
+  // Bidi embedding, override and isolate controls (U+202A to U+202E, U+2066 to
+  // U+2069) go too: an unterminated one reverses everything after it on its
+  // line. The fetcher strips them already; a hand-made summon does not.
   function cleanText(value) {
-    return String(value === undefined || value === null ? "" : value).replace(/\s+/g, " ").replace(/^ | $/g, "")
+    return String(value === undefined || value === null ? "" : value)
+      .replace(/[\u202A-\u202E\u2066-\u2069]/g, "").replace(/\s+/g, " ").replace(/^ | $/g, "")
   }
 
   function colorOr(value, fallback) {
@@ -187,22 +192,17 @@ Item {
     return root.pad2(d.getHours()) + ":" + root.pad2(d.getMinutes())
   }
 
-  function dayKey(d) {
-    return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate()
-  }
-
-  // Day names come from Strings.js, keyed by the UI language rather than by
-  // the session locale, and the date order with them ("Sa, 04.10." / "Sat, 10/04").
+  // "" today, "morgen" tomorrow, else the date in the short form the bar's
+  // tooltip and the agenda use ("So., 11. Okt." / "Sun, Oct 11"), in the UI
+  // language rather than the session locale. Seen only for `preview` of a
+  // meeting further out, or a grace alert just after midnight.
   function dayLabel(epoch, nowMs) {
     if (!(epoch > 0)) return ""
-    var d = new Date(epoch * 1000)
-    var today = new Date(nowMs)
-    if (root.dayKey(d) === root.dayKey(today)) return ""
-    var tomorrow = new Date(nowMs)
-    tomorrow.setDate(tomorrow.getDate() + 1)
-    if (root.dayKey(d) === root.dayKey(tomorrow)) return Strings.t(root.lang, "tomorrow")
-    return Strings.t(root.lang, "alertDate", Strings.weekday(root.lang, d.getDay()),
-      root.pad2(d.getDate()), root.pad2(d.getMonth() + 1))
+    var days = Days.daysBetween(nowMs / 1000, epoch)
+    if (days === 0) return ""
+    if (days === 1) return Strings.t(root.lang, "tomorrow")
+    return new Date(epoch * 1000).toLocaleDateString(Qt.locale(Strings.localeName(root.lang)),
+      Strings.t(root.lang, "dateShort"))
   }
 
   readonly property string countdownText: {

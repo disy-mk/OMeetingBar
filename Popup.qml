@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import qs.Commons
 import qs.Ui
+import "Days.js" as Days
 import "Providers.js" as Providers
 import "Strings.js" as Strings
 
@@ -132,9 +133,10 @@ Item {
   // The card surface they have to stand out against:
   readonly property color surfaceBg: Color.popups.background
 
-  // ---- Time. Day boundaries come from Date(y, m, d + n) arithmetic, never
-  //      from midnight + n * 86400: Europe/Berlin has a 23 h and a 25 h day
-  //      each year, and the naive form moves the boundary by an hour.
+  // ---- Time. A day starts at its first local instant (Days.dayStart, the
+  //      fetcher's _local_epoch), never at midnight + n * 86400: Europe/Berlin
+  //      has a 23 h and a 25 h day each year, and some zones switch DST at
+  //      midnight itself, where a plain Date(y, m, d) lands an hour off.
   readonly property real todayStartSec: dayStartSec(0)
   readonly property real tomorrowStartSec: dayStartSec(1)
   readonly property real dayAfterStartSec: dayStartSec(2)
@@ -143,9 +145,26 @@ Item {
   // once a second. Only the colours and the now-marker read nowSec directly.
   readonly property real nowHourStart: floorHourSec(nowSec)
 
+  // Changes when the session's time zone does: omarchy-menu-timezone switches
+  // it under a running shell. Every formatter that turns an instant into
+  // wall-clock text reads it (clockTime, dayShort, dayLabel, laterTime), so a
+  // row — whose own inputs never change — re-renders in the new zone instead
+  // of keeping the old times until its section's content changes. The offsets
+  // of today and of every day lookahead_minutes can reach (30 days), so two
+  // zones that agree today but switch DST on different dates still differ,
+  // and the zone's abbreviation, for two that switch on the same date at
+  // different hours (Havana's CDT and New York's EDT); the price is one
+  // harmless re-render a day while a DST switch lies inside that window, as
+  // the sample that crosses it changes.
+  readonly property string zoneKey: {
+    var parts = [Qt.formatDateTime(new Date(root.nowSec * 1000), "t")]
+    for (var day = 0; day <= 31; day++)
+      parts.push(new Date((root.nowSec + day * 86400) * 1000).getTimezoneOffset())
+    return parts.join("/")
+  }
+
   function dayStartSec(offset) {
-    var d = new Date(root.nowSec * 1000)
-    return Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate() + offset).getTime() / 1000)
+    return Days.dayStart(root.nowSec, offset)
   }
 
   // Subtract the wall-clock minutes and seconds instead of setMinutes(0):
@@ -253,11 +272,18 @@ Item {
     var span = hi - lo
     if (span < 4 * 3600) hi = lo + 4 * 3600
     else if (span > 14 * 3600) {
-      // Too long a day for one rail. Today's rail keeps "now" and the meetings
-      // still ahead and lets the morning fall off the left edge; tomorrow's has
-      // no now and keeps its start.
-      if (root.stripSource.today) lo = hi - 14 * 3600
-      else hi = lo + 14 * 3600
+      // Too long a day for one rail. Today's keeps "now" with an hour before it
+      // and lets the morning fall off the left edge — but never shifts so far
+      // right that the marker goes with it: at 07:10 with meetings at 07:30
+      // and 21:00 the rail runs 07:00–21:00, and the 21:00 meeting, which
+      // starts at the rail's end, is the one left off it (its row lists it).
+      // Tomorrow's has no now and keeps its start.
+      if (root.stripSource.today) {
+        lo = Math.max(lo, Math.min(root.nowHourStart - 3600, hi - 14 * 3600))
+        hi = lo + 14 * 3600
+      } else {
+        hi = lo + 14 * 3600
+      }
     }
     return { start: lo, end: hi }
   }
@@ -272,9 +298,17 @@ Item {
   // what happens — a var array with equal content does not rebuild a Repeater.
   // The loop that was actually observed came from the hour LABELS row, see the
   // strip below.)
+  //
+  // Read off stripWindow itself, not off stripStartSec/stripEndSec: those are
+  // two bindings, and when the window changes one is re-evaluated before the
+  // other. Measured: a rail going empty (a day change, the last timed meeting
+  // removed) showed this count a start of 0 beside the old end, half a million
+  // notches, and the Repeater below froze the shell creating them. 15 is a
+  // 14-hour rail's worth, the most there can be.
   readonly property int stripTickCount: {
-    if (!(root.stripEndSec > root.stripStartSec)) return 0
-    return Math.floor((root.stripEndSec - root.stripStartSec) / 3600) + 1
+    var win = root.stripWindow
+    if (!(win.end > win.start)) return 0
+    return Math.min(15, Math.floor((win.end - win.start) / 3600) + 1)
   }
 
   function tickSec(index) {
@@ -298,7 +332,10 @@ Item {
       if (!isFinite(start)) continue
       var end = Number(ev.end)
       if (!isFinite(end) || end < start) end = start
-      if (start >= root.stripEndSec || end < root.stripStartSec) continue
+      // Half-open, like the sections: a meeting that ended exactly at the
+      // rail's start is not on it (it drew as a stub at the left edge), one
+      // that starts at the rail's end is not either.
+      if (start >= root.stripEndSec || (end <= root.stripStartSec && start < root.stripStartSec)) continue
 
       var lane = -1
       for (var l = 0; l < lanes.length; l++) {
@@ -331,7 +368,6 @@ Item {
   // ---- Hero
   readonly property bool hasNext: nextEvent !== null && nextEvent !== undefined
   readonly property real nextStartSec: hasNext ? Number(nextEvent.start) : 0
-  readonly property real nextEndSec: hasNext ? Math.max(Number(nextEvent.end), nextStartSec) : 0
 
   readonly property string heroTitle: {
     if (root.pending) return Strings.t(root.lang, "loading")
@@ -357,13 +393,18 @@ Item {
           : Strings.t(root.lang, "noneTomorrow"))
     }
     var parts = []
-    var prefix = dayPrefixFor(root.nextStartSec)
+    // A meeting already under way needs no day in front: its countdown says
+    // how long it has been running, and the bar label still names the day.
+    var prefix = root.nextStartSec > root.nowSec ? dayPrefixFor(root.nextStartSec) : ""
     if (prefix !== "") parts.push(prefix)
     if (root.nextEvent.allDay === true) {
       parts.push(Strings.t(root.lang, "allDay"))
     } else {
-      parts.push(clockTime(root.nextStartSec) + "–" + clockTime(root.nextEndSec))
-      parts.push(countdownPhrase(root.nextStartSec - root.nowSec))
+      parts.push(heroRange(root.nextEvent))
+      // One elided line in capitals: with a day in front the minutes went to
+      // the ellipsis ("TOMORROW · 10:00–10:30 · IN 14 H 3…"), so a meeting on
+      // another day gets the coarse countdown — the bar's tooltip has the rest.
+      parts.push(countdownPhrase(root.nextStartSec, prefix !== ""))
     }
     return parts.join(" · ")
   }
@@ -431,7 +472,17 @@ Item {
   property bool revealPending: false
 
   function setCursor(section, index, fromKeyboard) {
-    root.cursorFromKeyboard = fromKeyboard === true
+    var keyboard = fromKeyboard === true
+    root.cursorFromKeyboard = keyboard
+    // The token is armed before the selection it is meant for and cleared
+    // right after it, so only the row this call selects can consume it: armed
+    // after, it was still pending when that row had already been selected —
+    // the first j revealed nothing, and the next hover scrolled the list away
+    // from under the pointer instead.
+    root.revealPending = keyboard
+    // A stationary pointer must not win the cursor back when the list
+    // scrolls under it — Qt re-delivers hover to whatever slides underneath.
+    if (keyboard) pointerGate.reset()
     // Written as one transition: with cursorActive kept on, the first write
     // (focusSection) briefly selected the row with the OLD index in the new
     // section, and a scroll followed that phantom selection.
@@ -439,12 +490,7 @@ Item {
     root.focusSection = section
     root.selectedIndex = index
     root.cursorActive = true
-    if (fromKeyboard === true) {
-      root.revealPending = true
-      // A stationary pointer must not win the cursor back when the list
-      // scrolls under it — Qt re-delivers hover to whatever slides underneath.
-      pointerGate.reset()
-    }
+    root.revealPending = false
   }
 
   function moveCursor(delta) {
@@ -473,12 +519,17 @@ Item {
     }
   }
 
+  // open() starts here. The gate starts over too: still primed from the last
+  // session, the hover that a pointer resting where the join row maps delivers
+  // on open selected that row, and Enter joined the meeting.
   function resetCursor() {
     var sections = root.cursorSections
     root.focusSection = sections.length > 0 ? sections[0] : "footer"
     root.selectedIndex = 0
     root.cursorActive = false
     root.cursorFromKeyboard = false
+    root.revealPending = false
+    pointerGate.reset()
   }
 
   // The agenda is rewritten under an open popup on every fetch, so the cursor
@@ -581,8 +632,11 @@ Item {
   }
 
   // ---- Formatting. Dates follow the UI language (uiLocale), not the session
-  //      locale; times stay 24 h in both, like Omarchy's own bar clock.
+  //      locale; times stay 24 h in both, like Omarchy's own bar clock. The
+  //      three functions that turn an instant into wall-clock text read
+  //      zoneKey, so every binding that calls them follows a zone change.
   function clockTime(sec) {
+    void root.zoneKey
     return Qt.formatTime(new Date(sec * 1000), "HH:mm")
   }
 
@@ -604,47 +658,88 @@ Item {
   }
 
   function dayShort(sec) {
+    void root.zoneKey
     return new Date(sec * 1000).toLocaleDateString(root.uiLocale, "ddd")
   }
 
   function dayLabel(sec) {
+    void root.zoneKey
     return new Date(sec * 1000).toLocaleDateString(root.uiLocale, Strings.t(root.lang, "dateShort"))
   }
 
   // The hero's meta line is one elided row: "SO., 13. SEPT. · 10:15–12:45 ·
-  // IN 2 TAGEN" lost its countdown to the ellipsis, so beyond tomorrow only the
-  // weekday goes in here (unambiguous inside a seven-day window); the rows and
-  // their tooltips carry the full date.
+  // IN 2 TAGEN" lost its countdown to the ellipsis, so the day goes in here in
+  // its short form (Days.dayPrefix, compact): "morgen", the weekday within six
+  // days, and the date without its weekday beyond ("12. Okt."). The rows'
+  // tooltips carry the full date.
   function dayPrefixFor(sec) {
-    if (sec < root.tomorrowStartSec) return ""
-    if (sec < root.dayAfterStartSec) return Strings.t(root.lang, "tomorrow")
-    return dayShort(sec)
+    return Days.dayPrefix(root.lang, root.nowSec, sec, true)
   }
 
-  function timeRangeText(ev) {
+  // The hero's range: a meeting that ends on a later day at or after its start
+  // time (a conference from Monday 09:00 to Thursday 17:00) shows its start
+  // and "…", since "09:00–17:00" would read as one day's slot. An overnight
+  // call keeps both times ("23:00–01:00"): an end before the start can only be
+  // the next morning.
+  function heroRange(ev) {
+    var start = Number(ev.start)
+    var end = Math.max(Number(ev.end), start)
+    var days = Days.daysBetween(start, end)
+    var from = new Date(start * 1000)
+    var to = new Date(end * 1000)
+    var endsLater = days > 1 || (days === 1
+      && to.getHours() * 60 + to.getMinutes() >= from.getHours() * 60 + from.getMinutes())
+    return endsLater && ev.allDay !== true ? clockTime(start) + "–…" : timeRangeText(ev)
+  }
+
+  // The DEMNÄCHST time column, 84 px wide: "So. 10:15" within six days.
+  // Beyond, where a weekday alone would repeat, the date without its weekday
+  // ("12. Okt.") and no time, which would not fit beside it (measured); the
+  // row's tooltip has both.
+  function laterTime(ev) {
+    void root.zoneKey
+    var start = Number(ev.start)
+    var day = Days.dayPrefix(root.lang, root.nowSec, start, true)
+    if (ev.allDay === true || Math.abs(Days.daysBetween(root.nowSec, start)) >= 7) return day
+    return day + " " + clockTime(start)
+  }
+
+  // A meeting that runs past midnight is listed under both days, and each row
+  // prints only its own day's part, with "…" at the cut — "23:00–…" under
+  // HEUTE, "…–01:00" under MORGEN — so it no longer reads as a second call.
+  // Without bounds (the hero, a DEMNÄCHST row) it is the whole range; a NaN
+  // bound compares false and clips nothing.
+  function timeRangeText(ev, dayStart, dayEnd) {
     if (ev.allDay === true) return Strings.t(root.lang, "allDay")
     var start = Number(ev.start)
     var end = Math.max(Number(ev.end), start)
-    return end > start ? clockTime(start) + "–" + clockTime(end) : clockTime(start)
+    if (!(end > start)) return clockTime(start)
+    return (start < dayStart ? "…" : clockTime(start)) + "–" + (end > dayEnd ? "…" : clockTime(end))
   }
 
-  function countdownPhrase(delta) {
-    if (delta <= -60) return Strings.t(root.lang, "runningFor", minutesPhrase(Math.floor(-delta / 60)))
-    if (delta < 60) return Strings.t(root.lang, "now")
-    var minutes = Math.floor(delta / 60)
-    if (minutes < 60) return Strings.t(root.lang, "inX", minutesPhrase(minutes))
-    var hours = Math.floor(minutes / 60)
-    if (hours >= 24) {
-      var days = Math.round(delta / 86400)
-      return Strings.t(root.lang, "inX", Strings.count(root.lang, days, "oneDay", "nDays"))
-    }
-    var rest = minutes % 60
-    return Strings.t(root.lang, "inX", rest > 0
-      ? Strings.t(root.lang, "hoursMin", hours, rest) : Strings.t(root.lang, "hoursOnly", hours))
+  // The whole range, for a row's tooltip: the day at both ends when it runs
+  // past midnight ("So., 11. Okt. 23:00 – Mo., 12. Okt. 01:00"), else the
+  // row's own range, prefixed with its day where no section header names it.
+  function fullRangeText(ev, withDay) {
+    var start = Number(ev.start)
+    var end = Math.max(Number(ev.end), start)
+    if (ev.allDay !== true && end > Days.dayStart(start, 1))
+      return dayLabel(start) + " " + clockTime(start) + " – " + dayLabel(end) + " " + clockTime(end)
+    return (withDay ? dayLabel(start) + "  " : "") + timeRangeText(ev)
   }
 
-  function minutesPhrase(minutes) {
-    return Strings.count(root.lang, minutes, "oneMinute", "nMinutes")
+  // Counted by Days.countdown, the bar's rule too: a meeting on a later
+  // calendar day and 24 h or more away counts in calendar days, so "morgen
+  // 20:00" read at 07:00 is "in 1 Tag". `coarse`, for the hero behind a day:
+  // whole hours, and minutes in the alert's short words ("in 45 min").
+  function countdownPhrase(startSec, coarse) {
+    var parts = Days.countdown(root.nowSec, startSec)
+    if (parts.phase === "now") return Strings.t(root.lang, "now")
+    var running = parts.phase === "running"
+    if (coarse === true && parts.unit === "minutes")
+      return Strings.t(root.lang, running ? "runningForMin" : "inMin", parts.value)
+    return Strings.t(root.lang, running ? "runningFor" : "inX",
+      Days.spanText(root.lang, parts, coarse === true))
   }
 
   // The plugin's two signal colours, with exactly the meaning they carry in
@@ -890,6 +985,8 @@ Item {
                 ev: modelData
                 rowIndex: index
                 sectionName: "today"
+                sectionStart: root.todayStartSec
+                sectionEnd: root.tomorrowStartSec
               }
             }
 
@@ -932,6 +1029,8 @@ Item {
                 ev: modelData
                 rowIndex: index
                 sectionName: "tomorrow"
+                sectionStart: root.tomorrowStartSec
+                sectionEnd: root.dayAfterStartSec
               }
             }
 
@@ -1088,9 +1187,14 @@ Item {
     required property var ev
     required property int rowIndex
     required property string sectionName
-    // Rows beyond tomorrow show "So. 10:00" in the time column — the bar
-    // label's format — instead of a range that would not say which day.
+    // Rows beyond tomorrow show their day in the time column instead of a
+    // range that would not say which day: "So. 10:00" within six days, the
+    // date further out (laterTime).
     property bool showDay: false
+    // The day this row is listed under, so a meeting that runs past midnight
+    // prints only that day's part (timeRangeText). NaN: no day, nothing clipped.
+    property real sectionStart: NaN
+    property real sectionEnd: NaN
 
     readonly property real startSec: Number(row.ev.start)
     readonly property real endSec: Math.max(Number(row.ev.end), row.startSec)
@@ -1107,8 +1211,8 @@ Item {
       && root.selectedIndex === row.rowIndex
 
     readonly property string rowTooltip: {
-      var lines = [(row.showDay ? root.dayLabel(row.startSec) + "  " : "")
-        + root.timeRangeText(row.ev) + "  " + String(row.ev.title || Strings.t(root.lang, "untitled"))]
+      var lines = [root.fullRangeText(row.ev, row.showDay)
+        + "  " + String(row.ev.title || Strings.t(root.lang, "untitled"))]
       var meta = []
       if (String(row.ev.calendar || "") !== "") meta.push(String(row.ev.calendar))
       if (String(row.ev.location || "") !== "") meta.push(String(row.ev.location))
@@ -1176,8 +1280,8 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         width: Style.space(84)
         text: row.showDay
-          ? root.dayShort(row.startSec) + (row.allDay ? "" : " " + root.clockTime(row.startSec))
-          : root.timeRangeText(row.ev)
+          ? root.laterTime(row.ev)
+          : root.timeRangeText(row.ev, row.sectionStart, row.sectionEnd)
         // The signal colour sits in the time column, so the list carries the
         // same two meanings as the bar without shouting them in every title.
         color: row.finished || row.allDay ? root.mutedFg : root.signalColor(row.startSec, row.endSec)

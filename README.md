@@ -154,7 +154,7 @@ save.
 | `ics_urls` | `[]` | Private ICS URLs for `backend: "ics"`. Treated as secrets — never logged. |
 | `lookahead_minutes` | `10080` | How far ahead meetings are fetched (7 days). The bar always names the next meeting in this window — on a Friday evening that is Monday's first one. Never shortens the two-day agenda. |
 | `refresh_seconds` | `300` | Minimum spacing between network refreshes (EDS `refresh_sync`). EDS alone would poll hourly. |
-| `fetch_interval_seconds` | `60` | How often the service reads the local calendar cache. Backs off to 15 min while a backend keeps failing. |
+| `fetch_interval_seconds` | `60` | How often the service reads the local calendar cache, 5 to 900 s. Backs off to 15 min while a backend keeps failing. |
 | `alert_lead_seconds` | `60` | Fullscreen alert this many seconds before start. |
 | `auto_dismiss_seconds` | `90` | The alert closes itself; `0` keeps it until dismissed (hard cap 10 min). |
 | `colors.running` | `#FF9500` | Colour for a running meeting — bar entry and alert countdown. `#rrggbb` only. |
@@ -170,7 +170,7 @@ save.
 | `skip_declined` | `true` | Declined invitations never alert but are listed, struck through, in the agenda. `false` treats them like any other meeting. |
 | `min_duration_minutes` | `0` | Ignore meetings shorter than this. |
 | `title_blocklist` | `[]` | Title fragments that exclude a meeting everywhere. |
-| `calendars_exclude` | `[]` | Calendar names or UIDs to ignore (case-insensitive). |
+| `calendars_exclude` | `[]` | Calendar names or UIDs to ignore (case-insensitive; a name as it reads on screen). |
 | `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. |
 | `widget.max_title_chars` | `28` | Truncate the title in the bar. |
 | `widget.hide_when_empty` | `true` | Collapse the bar entry when the agenda is empty. |
@@ -190,7 +190,7 @@ save.
 - From a keybinding or script:
 
 ```bash
-omarchy-shell omeetingbar-agenda toggle   # open/close the agenda popup
+omarchy-shell omeetingbar-agenda toggle   # open the agenda on the focused monitor, or close the open one
 omarchy-shell omeetingbar status          # JSON: backend, cache age, alert state (ids and times, no titles)
 omarchy-shell omeetingbar test            # fullscreen alert + sound now, synthetic, no calendar needed
 omarchy-shell omeetingbar refresh         # run the fetcher now
@@ -265,7 +265,7 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   gets its own); at most 512 occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 8,400 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
+  about 8,800 lines of QML, JavaScript, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 

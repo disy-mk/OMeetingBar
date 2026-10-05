@@ -515,9 +515,31 @@ def _not_future(stamp, now):
     return stamp if stamp <= now else now - 1
 
 
+# Bidi embedding, override and isolate controls, U+202A-U+202E and
+# U+2066-U+2069. An unterminated one in a title reverses everything after it
+# on the line it is drawn in -- the bar label's countdown included -- and none
+# of them is whitespace to split(), so _short drops them before it collapses
+# the spaces. Code points rather than literal characters, so the source shows
+# what it removes.
+_BIDI_CONTROLS = dict.fromkeys([*range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+
+
 def _short(value, limit=140):
-    text = " ".join(str(value).split())
+    text = " ".join(str(value).translate(_BIDI_CONTROLS).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _name_key(value):
+    """How a calendar name meets calendars_exclude: in the form the cache
+    writes it (bidi controls dropped, whitespace collapsed, as _short does),
+    lower-cased, on both sides -- so an entry typed the way the name reads on
+    screen and one pasted with a control in it both match, on a live source as
+    on a cache entry. A uid only loses its case, as before."""
+    return " ".join(str(value).translate(_BIDI_CONTROLS).split()).lower()
+
+
+def _excluded_names(config):
+    return {key for key in (_name_key(name) for name in config["calendars_exclude"]) if key}
 
 
 # A quoted span: opening and closing mark of one pair, nothing quoted inside.
@@ -783,8 +805,11 @@ def apply_filters(events, config, now, window_end):
     `now` is therefore no longer read; it stays in the signature because the
     diagnose path and merge_inject call this with the same four arguments.
     """
-    blocked = [term.lower() for term in config["title_blocklist"] if term.strip()]
-    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+    # Titles reach the cache without bidi controls (_short), so the terms lose
+    # theirs too -- and a term that was nothing else would match every title.
+    blocked = [term for term in (term.translate(_BIDI_CONTROLS).lower() for term in config["title_blocklist"])
+               if term.strip()]
+    excluded = _excluded_names(config)
     min_seconds = config["min_duration_minutes"] * 60
 
     kept = []
@@ -795,7 +820,7 @@ def apply_filters(events, config, now, window_end):
         # By display name or by uid, like calendar_excluded() on the live
         # sources -- the uid also reaches stale and carried-forward entries,
         # whose source may be unreachable right now.
-        if (event["calendar"].strip().lower() in excluded
+        if (_name_key(event["calendar"]) in excluded
                 or event.get("calendar_uid", "") in excluded):
             continue
         if any(term in event["title"].lower() for term in blocked):
@@ -1827,7 +1852,7 @@ def calendar_excluded(source, excluded):
     all lower case already."""
     if not excluded:
         return False
-    name = (source.get_display_name() or "").strip().lower()
+    name = _name_key(source.get_display_name() or "")
     uid = (source.get_uid() or "").strip().lower()
     return name in excluded or uid in excluded
 
@@ -1943,7 +1968,7 @@ def read_eds(config, now, window_start, window_end, cache, cache_path, force_ref
         # the filter silently does nothing and declined meetings still raise a
         # fullscreen alert. That has to be visible, not silent.
         warnings.append(_("skipDeclinedNoIdentity"))
-    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+    excluded = _excluded_names(config)
 
     # EDS's own refresh interval defaults to 60 minutes, which is far too coarse
     # for a meeting alarm, so a network refresh is pushed by hand -- but only
@@ -2369,7 +2394,7 @@ def diagnose_calendars(config):
         sources = calendar_sources(registry, roots)
     except Exception as exc:
         return [_("calQueryFailed", _scrub(exc, 80))]
-    excluded = {name.strip().lower() for name in config["calendars_exclude"] if name.strip()}
+    excluded = _excluded_names(config)
     skipped = sum(1 for source in sources if calendar_excluded(source, excluded))
     return [
         _("calAccounts", len(roots)),
