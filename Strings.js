@@ -1,13 +1,14 @@
 .pragma library
 
 // Every user-facing string of the QML side, in German and English. The plugin
-// follows the session locale (LANG of the shell process, read as
-// Qt.locale().name) unless omeetingbar.json pins `language` to "de" or "en";
-// English is the fallback for every other locale. Keep the two blocks
-// key-for-key identical — a missing key falls back to English at runtime, and
-// the test script in the repo's docs checks parity. "%1", "%2" are placeholders
-// for t()'s extra arguments. bin/omeetingbar-fetch carries its own table for
-// the messages it writes into the cache.
+// follows the session locale (the shell process's, read as Qt.locale().name,
+// which honours LANGUAGE) unless omeetingbar.json pins `language` to "de" or
+// "en"; English is the fallback for every other locale. Keep the two blocks
+// key-for-key identical with the same placeholders: a missing key falls back
+// to English at runtime, and nothing in the repo checks this, so add every key
+// to both blocks. "%1", "%2" are placeholders for t()'s extra arguments.
+// bin/omeetingbar-fetch carries its own table for the messages it writes into
+// the cache.
 
 var table = {
   de: {
@@ -34,12 +35,12 @@ var table = {
     clickHint: "Links: Agenda öffnen · Rechts/Mitte: aktualisieren",
     runtimeMissing: "OMeetingBar: XDG_RUNTIME_DIR ist nicht gesetzt, der Termin-Cache ist nicht lesbar.",
     noDataYet: "Noch keine Termindaten.",
-    notConnected: "Der Kalender ist wahrscheinlich noch nicht verbunden — siehe README.",
+    notConnected: "Der Kalender ist wahrscheinlich noch nicht verbunden – siehe README.",
     cacheUnreadable: "Termin-Cache ist unlesbar.",
     calendarError: "Kalenderfehler: %1",
     lastKnown: "Angezeigt werden die letzten bekannten Termine.",
     limited: "Eingeschränkt: %1",
-    dataAge: "Daten sind %1 alt — läuft der OMeetingBar-Dienst?",
+    dataAge: "Daten sind %1 alt – läuft der OMeetingBar-Dienst?",
     noUpcomingDot: "Kein anstehender Termin.",
     agendaLists: "Die Agenda zeigt %1 (auch erledigte und abgelehnte).",
     runningForDot: "Läuft seit %1.",
@@ -55,7 +56,7 @@ var table = {
     noneTomorrow: "keine morgen",
     reading: "Termindaten werden gelesen …",
     dataUnreadable: "Termindaten sind nicht lesbar.",
-    dataOutdated: "Termindaten sind veraltet — läuft der OMeetingBar-Dienst?",
+    dataOutdated: "Termindaten sind veraltet – läuft der OMeetingBar-Dienst?",
     noJoinLink: "Kein Meeting-Link",
     joinVia: "In %1 beitreten",
     openMeeting: "Meeting öffnen",
@@ -87,9 +88,10 @@ var table = {
     queuedN: "Danach folgen noch %1 Termine",
     // service: notification and `status`
     statusRuntimeMissing: "XDG_RUNTIME_DIR ist nicht gesetzt",
-    statusConfigUnreadable: "omeetingbar.json ist unlesbar — Standardwerte aktiv",
+    statusConfigUnreadable: "omeetingbar.json ist unlesbar – Standardwerte aktiv",
+    statusConfigKept: "omeetingbar.json ist unlesbar – die zuletzt gültigen Werte gelten weiter",
     statusCacheReading: "Cache wird gelesen",
-    statusCacheMissing: "Noch kein Cache — Abruf läuft",
+    statusCacheMissing: "Noch kein Cache – Abruf läuft",
     statusCacheUnreadable: "Cache ist unlesbar",
     statusFetchFailed: "Kalenderabruf fehlgeschlagen",
     statusNoneInWindow: "Keine Termine im Vorschaufenster",
@@ -124,28 +126,28 @@ var table = {
     clickHint: "Left: open agenda · Right/middle: refresh",
     runtimeMissing: "OMeetingBar: XDG_RUNTIME_DIR is not set, the event cache cannot be read.",
     noDataYet: "No calendar data yet.",
-    notConnected: "The calendar is probably not connected yet — see the README.",
+    notConnected: "The calendar is probably not connected yet – see the README.",
     cacheUnreadable: "The event cache is unreadable.",
     calendarError: "Calendar error: %1",
     lastKnown: "Showing the last known meetings.",
     limited: "Limited: %1",
-    dataAge: "Data is %1 old — is the OMeetingBar service running?",
+    dataAge: "Data is %1 old – is the OMeetingBar service running?",
     noUpcomingDot: "No upcoming meeting.",
     agendaLists: "The agenda lists %1 (finished and declined ones included).",
     runningForDot: "Running for %1.",
     startsNow: "Starts now.",
     startsIn: "Starts in %1.",
     // agenda popup
-    loading: "Loading meetings …",
+    loading: "Loading meetings…",
     noData: "No calendar data",
     noUpcoming: "No upcoming meeting",
     noMeetings: "No meetings",
     noneTodayTomorrow: "no meetings today or tomorrow",
     today: "today",
     noneTomorrow: "none tomorrow",
-    reading: "Reading calendar data …",
+    reading: "Reading calendar data…",
     dataUnreadable: "Calendar data cannot be read.",
-    dataOutdated: "Calendar data is outdated — is the OMeetingBar service running?",
+    dataOutdated: "Calendar data is outdated – is the OMeetingBar service running?",
     noJoinLink: "No meeting link",
     joinVia: "Join via %1",
     openMeeting: "Open meeting",
@@ -175,9 +177,10 @@ var table = {
     queuedN: "%1 more meetings follow",
     // service: notification and `status`
     statusRuntimeMissing: "XDG_RUNTIME_DIR is not set",
-    statusConfigUnreadable: "omeetingbar.json is unreadable — using defaults",
+    statusConfigUnreadable: "omeetingbar.json is unreadable – using defaults",
+    statusConfigKept: "omeetingbar.json is unreadable – the last valid settings still apply",
     statusCacheReading: "Reading cache",
-    statusCacheMissing: "No cache yet — fetching",
+    statusCacheMissing: "No cache yet – fetching",
     statusCacheUnreadable: "Cache is unreadable",
     statusFetchFailed: "Calendar fetch failed",
     statusNoneInWindow: "No meetings in the lookahead window",

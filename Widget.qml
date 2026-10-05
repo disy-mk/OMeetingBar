@@ -47,11 +47,12 @@ BarWidget {
   // mirrors an alert-side decision (invariant 5 — a declined meeting never
   // blanks the screen while it is on, but stays in the agenda), and a bar
   // layout entry must not be able to disagree with what the service does.
-  readonly property bool skipDeclined: Style.boolToken(fileConfig.skip_declined, true)
+  readonly property bool skipDeclined: boolOf(fileConfig.skip_declined, true)
   // ---- UI language: omeetingbar.json's `language` ("de" | "en" | "auto"),
   //      else the session locale, else English. Pushed to the popup; the
   //      service resolves it the same way for the alert and the notifications.
-  readonly property string lang: Strings.pick(fileConfig.language, Qt.locale().name)
+  readonly property string lang: Strings.pick(
+    typeof fileConfig.language === "string" ? fileConfig.language : "", Qt.locale().name)
   readonly property var uiLocale: Qt.locale(Strings.localeName(lang))
   // ---- Cache state. "unknown" until the first read resolves, so a present
   //      cache never flashes the placeholder on startup.
@@ -304,30 +305,40 @@ BarWidget {
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
 
-  // ---- Option resolution
+  // ---- Option resolution: the plugin's one rule for a setting (docs/SPEC.md,
+  //      "Configuration"), shared with Service.qml and the fetcher, which is
+  //      where a value that does not follow it gets reported.
 
+  // An integer: a JSON number, or a string holding a decimal number; rounded
+  // half up, then clamped. Number()'s own leniency is not the rule -- "" would
+  // be 0 and true 1 -- so those keep the default.
   function numberOption(key, fileValue, fallback, min, max) {
-    var n = Number(setting(key, fileValue))
+    var value = setting(key, fileValue)
+    var n = typeof value === "number" ? value
+      : (typeof value === "string" && /^\s*-?\d+(\.\d+)?\s*$/.test(value) ? Number(value) : NaN)
     if (!isFinite(n)) return fallback
     return Math.max(min, Math.min(max, Math.round(n)))
   }
 
-  // Only #rrggbb: an invalid colour string paints black in QML, so a typo in
-  // omeetingbar.json must fall back to the documented default instead.
+  // Only a string holding #rrggbb: an invalid colour string paints black in
+  // QML, so a typo in omeetingbar.json must fall back to the documented
+  // default instead -- and so must a list, which String() would read.
   function colorOption(fileValue, fallback) {
-    if (fileValue === undefined || fileValue === null) return fallback
-    var text = String(fileValue).trim()
+    if (typeof fileValue !== "string") return fallback
+    var text = fileValue.trim()
     return /^#[0-9a-fA-F]{6}$/.test(text) ? text : fallback
   }
 
+  // Style.boolToken is the one boolean parser in this plugin — the service and
+  // the fetcher read the same keys by it, so a "yes"/"1"/"on" in
+  // omeetingbar.json can never make the bar hide a meeting the service still
+  // alerts on. An object or a list keeps the default, as there.
   function boolOption(key, fileValue, fallback) {
-    return Style.boolToken(setting(key, fileValue), fallback)
+    return boolOf(setting(key, fileValue), fallback)
   }
 
-  // Style.boolToken is the one boolean parser in this plugin — the service
-  // reads the same keys with it, so a "yes"/"1"/"on" in omeetingbar.json can never
-  // make the bar hide a meeting the service still alerts on.
-  function boolValue(value, fallback) {
+  function boolOf(value, fallback) {
+    if (value !== null && typeof value === "object") return fallback
     return Style.boolToken(value, fallback)
   }
 
@@ -434,20 +445,22 @@ BarWidget {
 
   // ---- Parsing
 
-  function applyConfig(body) {
+  // Service.applyConfig's rule: a file that exists but cannot be used as
+  // written -- empty (an editor between truncate and write), not JSON, not an
+  // object -- keeps the last valid config, so the bar and the alert path keep
+  // agreeing (skip_declined, language); only a missing file means the defaults.
+  function applyConfig(body, present) {
     var text = String(body || "").trim()
-    if (text === "") {
-      fileConfig = ({})
-      return
+    var parsed = null
+    if (text !== "") {
+      try {
+        parsed = JSON.parse(text)
+      } catch (e) {
+        parsed = null
+      }
     }
-    try {
-      var json = JSON.parse(text)
-      fileConfig = Util.isPlainObject(json) ? json : ({})
-    } catch (e) {
-      // omeetingbar.json caught mid-edit: fall back to the built-in defaults
-      // rather than to whatever half a file parses as.
-      fileConfig = ({})
-    }
+    if (Util.isPlainObject(parsed)) fileConfig = parsed
+    else if (present !== true) fileConfig = ({})
   }
 
   function setCache(state, error, stale, generatedAt, list, warning) {
@@ -501,7 +514,10 @@ BarWidget {
       setCache("ok", "", json.stale === true, generatedAt, list,
         warning !== "" && error !== "" ? warning + " · " + error : warning || error)
     } else {
-      setCache("error", error || "unbekannter Fehler", json.stale === true, generatedAt, list, warning)
+      // An error cache without its text (never written by the fetcher) still
+      // says what failed, in the UI language.
+      setCache("error", error || Strings.t(root.lang, "statusFetchFailed"), json.stale === true,
+        generatedAt, list, warning)
     }
   }
 
@@ -629,8 +645,8 @@ BarWidget {
     path: root.configPath
     watchChanges: true
     printErrors: false
-    onLoaded: root.applyConfig(text())
-    onLoadFailed: root.fileConfig = ({})
+    onLoaded: root.applyConfig(text(), true)
+    onLoadFailed: function(error) { root.applyConfig("", error !== FileViewError.FileNotFound) }
     onFileChanged: reload()
   }
 

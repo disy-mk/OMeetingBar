@@ -79,14 +79,24 @@ esac
 # skip_declined off in omeetingbar.json (false, "off", "no", 0 -- the
 # service's own boolean rule) lets the click through, as it does the alert.
 if [ "$declined" = true ]; then
-  # Exactly one JSON object, as the service's JSON.parse demands: a file it
-  # rejects (trailing data, two objects) keeps the default here too. A number
-  # reads the way JavaScript's String() writes it, so 0.0 and -0 are "0".
-  skip=$(jq -rs 'if length == 1 and (.[0] | type) == "object" and (.[0] | has("skip_declined"))
-    then .[0].skip_declined
-      | (if type == "number" then (if . == 0 then "0" elif . == 1 then "1" else tostring end) else tostring end)
-      | ascii_downcase | gsub("^\\s+|\\s+$"; "") else "" end' \
-    "${HOME:-/nonexistent}/.config/omarchy/omeetingbar.json" 2>/dev/null)
+  config="${HOME:-/nonexistent}/.config/omarchy/omeetingbar.json"
+  skip=""
+  if [ -e "$config" ]; then
+    # Exactly one JSON object, as the service's JSON.parse demands. A number
+    # reads the way JavaScript's String() writes it, so 0.0 and -0 are "0".
+    # Anything else -- unreadable, not JSON, trailing data, two objects -- is
+    # a file the service does not use: it keeps its last valid config then,
+    # and this script takes the value the fetcher kept in the cache.
+    skip=$(jq -rs 'if length == 1 and (.[0] | type) == "object"
+      then (if (.[0] | has("skip_declined")) then .[0].skip_declined
+        | (if type == "number" then (if . == 0 then "0" elif . == 1 then "1" else tostring end) else tostring end)
+        | ascii_downcase | gsub("^\\s+|\\s+$"; "") else "" end)
+      else "<broken>" end' "$config" 2>/dev/null) || skip="<broken>"
+  fi
+  if [ "$skip" = "<broken>" ]; then
+    skip=$(jq -r 'if (.settings | type) == "object" and (.settings.skip_declined | type) == "boolean"
+      then .settings.skip_declined | tostring else "" end' "$cache" 2>/dev/null)
+  fi
   case $skip in
     false | 0 | no | off) ;;
     *) exit 0 ;;

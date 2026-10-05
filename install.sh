@@ -39,9 +39,12 @@ Usage: ./install.sh [--dry-run] [--uninstall]
 
 Installs and registers the $PLUGIN_ID plugin in the running Omarchy shell.
 
-  --uninstall Reverse what this script created: the PATH wrapper, the runtime
-              cache and the bar entry. Leaves your config, the packages and
-              the Google account alone and says so.
+  --uninstall Disable the plugin, which removes the bar entry (and its own
+              settings) and stops the service (fetches, toasts, sound) and the
+              fullscreen alert; then remove the PATH wrapper this script created
+              and the plugin's runtime cache. Leaves your config, the packages,
+              the Google account and Omarchy's notification history alone, and
+              says so.
   --dry-run   Print every change without making one.
   -h, --help  This text.
 
@@ -91,6 +94,23 @@ done
 if (( UNINSTALL )); then
   step "Uninstall"
   runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}/omeetingbar"
+  # Disable first: the plugin's service writes the runtime cache, and while it
+  # runs it writes it again within fetch_interval_seconds of any removal.
+  still_enabled=0
+  if omarchy-shell shell ping >/dev/null 2>&1; then
+    if (( DRY_RUN )); then say "  would run: omarchy plugin disable $PLUGIN_ID"
+    elif omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1; then
+      say "  plugin disabled: bar entry, service (fetches, toasts, sound) and fullscreen alert are off"
+    else
+      still_enabled=1
+      warn "could not disable the plugin over IPC — run: omarchy plugin disable $PLUGIN_ID"
+    fi
+  else
+    # Not answering is not the same as not running, and a shell that is down
+    # starts the still enabled plugin again the next time it comes up.
+    still_enabled=1
+    warn "omarchy-shell is not answering; disable the plugin with: omarchy plugin disable $PLUGIN_ID"
+  fi
   for w in "$HOME/.local/bin/omeetingbar-fetch" "$LEGACY_WRAPPER"; do
     # Only a wrapper that points at THIS plugin is ours to remove.
     if [[ -f $w ]] && grep -q "omarchy/plugins/" "$w" && grep -q "omeetingbar-fetch\|meetings-fetch" "$w"; then
@@ -98,20 +118,37 @@ if (( UNINSTALL )); then
     fi
   done
   if [[ -d $runtime_dir ]]; then
-    if (( DRY_RUN )); then say "  would remove $runtime_dir"; else rm -rf -- "$runtime_dir"; say "  removed $runtime_dir"; fi
-  fi
-  if omarchy-shell shell ping >/dev/null 2>&1; then
-    if (( DRY_RUN )); then say "  would run: omarchy plugin disable $PLUGIN_ID"
-    elif omarchy plugin disable "$PLUGIN_ID" >/dev/null 2>&1; then say "  bar entry removed (omarchy plugin disable)"
-    else warn "could not disable the plugin over IPC — remove the bar entry with: omarchy plugin disable $PLUGIN_ID"; fi
-  else
-    warn "omarchy-shell is not running; remove the bar entry later with: omarchy plugin disable $PLUGIN_ID"
+    if (( DRY_RUN )); then say "  would remove $runtime_dir"
+    else
+      # A fetch the service started just before the disable may still be
+      # writing the cache: give it up to ten seconds to finish first.
+      timed_out=0
+      if command -v pgrep >/dev/null 2>&1; then
+        timed_out=1
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+          if ! pgrep -u "$UID" -f "plugins/$PLUGIN_ID/bin/omeetingbar-fetch" >/dev/null 2>&1; then
+            timed_out=0
+            break
+          fi
+          sleep 1
+        done
+      fi
+      rm -rf -- "$runtime_dir"
+      say "  removed $runtime_dir"
+      if (( still_enabled )); then
+        warn "the plugin is still enabled, and its service writes $runtime_dir again; once it is disabled: rm -rf $runtime_dir"
+      elif (( timed_out )); then
+        warn "a fetch was still running after 10 s and may write $runtime_dir again; if it is back: rm -rf $runtime_dir"
+      fi
+    fi
   fi
   say ""
   say "  Left in place on purpose:"
   say "    $CONFIG_FILE   (your settings)"
   say "    the Arch packages   (sudo pacman -Rs evolution-data-server gnome-online-accounts gnome-online-accounts-gtk)"
   say "    the Google account  (remove it in gnome-online-accounts-gtk)"
+  say "    Omarchy's notification history  (omarchy-shell notifications clear empties all of it)"
+  say "    meeting toasts still on screen  (close them; a click no longer joins)"
   say "  To delete the plugin files themselves: omarchy plugin remove $PLUGIN_ID"
   exit 0
 fi
@@ -143,8 +180,10 @@ fi
 
 if [[ -e $CONFIG_FILE ]]; then
   say "  $CONFIG_FILE exists — left untouched"
-  jq -e . "$CONFIG_FILE" >/dev/null 2>&1 ||
-    warn "$CONFIG_FILE is not valid JSON; the plugin will fall back to its built-in defaults"
+  # The plugin uses the file only as one JSON object; `jq -e .` alone would
+  # also pass a list and fail a file holding false.
+  jq -e 'type == "object"' "$CONFIG_FILE" >/dev/null 2>&1 ||
+    warn "$CONFIG_FILE is not a JSON object; a running plugin keeps its last valid settings, a fresh start uses the defaults"
 elif (( DRY_RUN )); then
   say "  would create $CONFIG_FILE from config.example.json (mode 0600)"
 else
@@ -160,8 +199,10 @@ fi
 # cannot tell apart from a real change.
 config_backend="eds"
 if [[ -e $CONFIG_FILE ]]; then
+  # Any case and surrounding spaces, as the plugin reads it.
   config_backend=$(jq -r '
-    if type == "object" and (.backend | type) == "string" then .backend else "eds" end
+    if type == "object" and (.backend | type) == "string"
+    then .backend | ascii_downcase | gsub("^\\s+|\\s+$"; "") else "eds" end
   ' "$CONFIG_FILE" 2>/dev/null) || config_backend="eds"
   [[ -n $config_backend ]] || config_backend="eds"
 fi
@@ -205,7 +246,7 @@ fi
 # on PATH makes `omeetingbar-fetch --diagnose` work from anywhere. Not named
 # omarchy-* on purpose: the omarchy CLI resolves `omarchy <group> <action>` to
 # omarchy-<group>-<action> on PATH, and this is not a first-party command.
-step "Wrapper auf PATH"
+step "Wrapper on PATH"
 WRAPPER="$HOME/.local/bin/omeetingbar-fetch"
 wrapper_body="#!/usr/bin/env bash
 # Thin wrapper for the $PLUGIN_ID event fetcher, so it is reachable from any
@@ -218,11 +259,11 @@ exec /usr/bin/python3 \"\$HOME/.config/omarchy/plugins/$PLUGIN_ID/bin/omeetingba
 # Both sides go through command substitution so the trailing newline is stripped
 # from each: comparing against $wrapper_body directly never matches.
 if [[ -e $WRAPPER ]] && [[ $(cat "$WRAPPER" 2>/dev/null) == "$(printf '%s' "$wrapper_body")" ]]; then
-  say "  $WRAPPER ist aktuell"
+  say "  $WRAPPER is up to date"
 elif (( DRY_RUN )); then
   say "  would write $WRAPPER (mode 0755)"
 else
-  say "  schreibe $WRAPPER"
+  say "  writing $WRAPPER (mode 0755)"
   install -Dm755 /dev/stdin "$WRAPPER" <<<"$wrapper_body"
 fi
 if [[ -f $LEGACY_WRAPPER ]] && grep -q "omarchy/plugins/" "$LEGACY_WRAPPER" && grep -q "meetings-fetch" "$LEGACY_WRAPPER"; then
@@ -231,7 +272,7 @@ if [[ -f $LEGACY_WRAPPER ]] && grep -q "omarchy/plugins/" "$LEGACY_WRAPPER" && g
 fi
 case ":$PATH:" in
   *":$HOME/.local/bin:"*) : ;;
-  *) warn "$HOME/.local/bin liegt nicht auf dem PATH — der Wrapper ist dann nicht aufrufbar." ;;
+  *) warn "$HOME/.local/bin is not on PATH — the wrapper cannot be called by name." ;;
 esac
 
 # ------------------------------------------------------------- registration

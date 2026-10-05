@@ -110,13 +110,80 @@ supply these defaults and never crash on a missing/broken file:
 }
 ```
 
+**One reading rule per value type, in every reader.** The fetcher (`parse_config_value`),
+`Service.qml` (`intConfig`, `boolConfig`, `colorConfig`, `soundPathOf`) and `Widget.qml`
+(`numberOption`, `boolOf`, `colorOption`) read a value the same way, so the warning the user
+sees and what the alert path does cannot disagree:
+
+| Type | Accepted | Anything else |
+|---|---|---|
+| integer | a JSON number, or a string holding a decimal number (`"120"`, `" 7.5 "`); rounded half up like JavaScript's `Math.round`, then clamped to the key's range | the default |
+| boolean | `true`/`false`, `1`/`0`, or `"true"`/`"1"`/`"yes"`/`"on"` and `"false"`/`"0"`/`"no"`/`"off"` in any case, surrounding spaces ignored — Omarchy's `Style.boolToken` | the default, for an object or a list too |
+| list | a list of strings; a bare string counts as a list of one | items that are not strings (or not text: a lone surrogate) are dropped; a list with none left, or anything else, is the default |
+| word (`backend`, `language`) | a string holding one of the listed words, in any case, surrounding spaces ignored | the default (`["de"]` is no language) |
+| colour (`colors.*`) | a string holding `#rrggbb`, surrounding spaces ignored | the default |
+| `sound` | a string (a path, see below) or a boolean | the default |
+
+The details are JavaScript's, because the QML side is: "spaces" are what `\s` and `trim()`
+match (the fetcher copies that set — Python's own differs in U+001C–U+001F, U+0085 and U+FEFF),
+digits are ASCII, and both sides read the file itself alike: invalid UTF-8 replaced, the text
+trimmed before parsing (a BOM is fine), `NaN` and `Infinity` refused like `JSON.parse` refuses
+them. `null` counts as unset. The ranges: `lookahead_minutes` 0–43200 (30 days),
+`alert_lead_seconds` and `grace_seconds` 0–3600, `auto_dismiss_seconds` 0–600 (the overlay's
+hard dismiss), `inhibit_lead_seconds` 0–7200, `fetch_interval_seconds` 5–900, `refresh_seconds`
+and `min_duration_minutes` from 0 up, `widget.warn_minutes` 0–1440, `widget.max_title_chars`
+4–200. The fetcher checks every key, including those only the QML reads — the QML side has no
+way to put a config problem in front of the user — and its `warning` (see the event cache)
+names what it rejected, what it clamped (`grace_seconds 7200 → 3600`; the clamped value
+applies), the lists it dropped items from and the keys it does not know (at most five, each
+shortened), so a typo is seen. The file is named `omeetingbar.json`, not by its path, and a
+parse error by line and column: the bar's tooltip cuts every line at 140 characters (Bar.qml's
+tooltip neither wraps nor limits its width), and the typical message has to fit. `status` has
+the whole text as `cacheWarning`.
+
+**A file that cannot be used as written** — unreadable, not JSON, not an object, or empty, as
+it is for a moment while an editor saves — takes nothing away while the shell runs:
+- `Service.qml` and `Widget.qml` keep the last valid config, all of it, and only the service's
+  `configValid` drops (`status`, and the status message "the last valid settings still apply"):
+  a trailing comma must not switch the toasts, the sound and the display wake back on, nor let
+  the bar disagree with the alert path. What they have not read yet they cannot keep: a broken
+  file at startup — after a shell restart, a plugin reload, or for a bar created meanwhile (a new
+  monitor) — means the defaults until it is fixed, and so does a file that does not exist.
+- The fetcher writes its own keys' values — every key it reads except `ics_urls` (feed URLs are
+  bearer tokens and never enter the cache) and `language` (the service passes its own in) — into
+  the cache as `settings` (`KEPT_KEYS`), and a run that cannot use the file falls back to them,
+  as does a run that rejects one of those values, for that key. So a syntax error or a rejected
+  value neither puts every excluded meeting back on the alert path nor switches an `ics` setup
+  over to `eds`, and the warning says the last valid settings still apply. A misspelled key name
+  is not covered: the key is simply missing (its default applies) and is named as unknown. `bin/omeetingbar-join` takes
+  `skip_declined` from the same place while the file is not usable. Residual gap: the cache is on
+  tmpfs, so after a reboot or the end of the login session there is nothing to fall back on, the
+  defaults apply and the warning says that instead.
+
+**An edit applies on save.** Both QML files read the config through a `FileView` that watches
+it, and the fetcher reads it on every run. A save that changes the text after the first read —
+or removes a file that held settings, or makes a broken file usable again, even with the text in
+force before — also starts a fetch at once (`runFetch("config")`), so a new exclusion or backend
+applies before the next alert fires rather than up to `fetch_interval_seconds` later. Until that
+fetch has finished no alert fires and no queued alert reaches the screen for the first time
+(`deferredReason` "refreshing") — the same hold as after a clock jump (`fireHoldActive`), bounded
+by `fireHoldSeconds` (30 s) once the fetch runs and by `configHoldSeconds` (75 s) while an older
+fetch still holds the re-entrancy guard (the watchdog terminates that one at 45 s and kills it at
+60 s). The cache the fetch wrote is read synchronously in its `exited` handler
+(`blockLoading`), so the tick that lifts the hold already sees it. `status` shows
+`configFetchPending` until that fetch has started, then `fetch.running` with `fetch.reason`
+"config". A save that changes nothing starts no fetch, nor does a broken one. Continuous saves
+(an editor's autosave) keep the hold alive as long as they come, a fetch each.
+
 Semantics:
 - `alert_lead_seconds` — fire the fullscreen alert this many seconds before `start`. A
   zero-length occurrence (`end == start`) gets at least 5 s (`zeroLengthMinLeadSeconds`): it is
   over the second it starts (invariant 1), so with a lead of 0 no tick could find it both due
   and not over.
 - `grace_seconds` — if we were suspended/locked and missed the moment, still fire up to this
-  long after `start` (an event whose start is older than that is never alerted).
+  long after `start` (an event whose start is older than that is never alerted). At most 3600
+  in every reader — the fetcher, the service and `omeetingbar-join`, which gets it from the
+  click action — so all three draw the same window.
 - `inhibit_lead_seconds` — hold a Wayland idle inhibitor from `start - this` until
   `start + grace_seconds`, so the session cannot blank/lock right before a meeting — or until
   the alert has been on screen for 5 s (`inhibitHandoverSeconds`), when the overlay's own
@@ -135,7 +202,8 @@ Semantics:
   Only `#rrggbb` is accepted — an invalid colour string paints black in QML, so anything else falls
   back to the default. These are deliberately not theme tokens: they are the plugin's own signal.
 - `auto_dismiss_seconds` — 0 means "stay until dismissed", bounded by the overlay's 600 s hard
-  dismiss (see the overlay contract).
+  dismiss (see the overlay contract); a larger value is clamped to 600 and reported as such, so
+  `status` names the dismiss that happens.
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
 - `notify_details` — default `true`: a meeting's toast carries the title plus the location, or
   the calendar name when there is no location. `false` sends a toast without title, location
@@ -149,11 +217,19 @@ Semantics:
   the user, so a path that is not a file is logged (`sound-missing`), and so is a player that
   fails (`sound-failed`, with the last line of its stderr) or hits the cap (`sound-capped`); the
   file is looked for again after every fetch.
-- `language` — `"de"`, `"en"` or `"auto"` (default). Resolved in exactly two places with the
-  same rule: `Strings.pick(override, Qt.locale().name)` in `Strings.js` (Widget, Popup via the
-  widget, Service; the alert gets the result in its payload as `lang`) and `pick_language()` in
-  the fetcher (`LC_ALL`, `LC_MESSAGES`, `LANG`). "auto" means `de*` → German, everything else →
-  English; English is also the fallback for a missing key. Every user-facing string lives in
+- `language` — `"de"`, `"en"` or `"auto"` (default), in any case. Resolved in exactly two places
+  with the same rule: `Strings.pick(override, Qt.locale().name)` in `Strings.js` (Widget, Popup
+  via the widget, Service; the alert gets the result in its payload as `lang`) and
+  `pick_language()` in the fetcher. "auto" follows the locale the way Qt reads it (measured with
+  Qt 6.11.2): the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that is set, unless `LANGUAGE`'s
+  first entry names a language and that locale is not exactly `C` or `POSIX` — then that entry
+  (`LANGUAGE=de` over `LANG=en_US.UTF-8` gives a German UI; `C.UTF-8` is not `C`; an empty first
+  entry, as in `:de`, names none). `de*` — and Qt's three-letter `deu` — → German, everything
+  else → English. The service hands the language it resolved to every fetch
+  as `OMEETINGBAR_LANG`, which the fetcher puts before its own environment, so the messages it
+  writes into the cache speak the bar's language whatever environment the shell passes on; a run
+  from a terminal resolves the rule from that terminal's. English is also the fallback for a
+  missing key. Every user-facing string lives in
   `Strings.js` (QML) or the fetcher's `MESSAGES` table, key-for-key identical in both languages
   with the same placeholders — never inline. Dates and weekday names follow the UI language
   (`Qt.locale("de_DE")` / `Qt.locale("en_US")`, so a German UI on an en_US session still says
@@ -165,17 +241,19 @@ Semantics:
   longest gap a running service leaves between two written caches is that ceiling plus a run,
   which the watchdog ends at 60 s. A run the watchdog has to end writes no cache, so fetches that
   keep hanging do get flagged — rightly, the data is old, even though the tooltip's question
-  ("läuft der OMeetingBar-Dienst?") then has the answer yes.
+  ("is the OMeetingBar service running?" / "läuft der OMeetingBar-Dienst?") then has the
+  answer yes.
 - `lookahead_minutes` — only ever **extends** the agenda past tomorrow; it can never shorten it.
   Default 7 days, because the bar's promise is to *always* name the next meeting: on a Friday
   evening that is Monday's first one, and a 12 h horizon left the bar blank all weekend. The
-  popup lists today and tomorrow in full and the next few later events under DEMNÄCHST. The
+  popup lists today and tomorrow in full and the next few later events under UPCOMING
+  (DEMNÄCHST). The
   fetcher's window is `[local midnight today, local midnight the day after tomorrow)`, widened to
   cover `now - grace_seconds … now + lookahead_minutes` so the alert horizon can only grow. Compute
   the day boundaries with `datetime.date` arithmetic plus naive `.timestamp()`, **never**
   `midnight + N * 86400`: Europe/Berlin has a 25 h and a 23 h day each year, and the naive form was
   measured to move the agenda end by ±1 h — losing tomorrow's late meetings, or leaking a
-  day-after-tomorrow meeting into the "Morgen" section.
+  day-after-tomorrow meeting into the TOMORROW (MORGEN) section.
 
 ## Event cache — `$XDG_RUNTIME_DIR/omeetingbar/events.json`
 
@@ -203,7 +281,8 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
     { "id": "9f2c…", "title": "Standup", "start": 1757503200, "end": 1757505000,
       "all_day": false, "declined": false, "url": "https://meet.google.com/abc-defg-hij",
       "calendar": "Work", "location": "", "calendar_uid": "1d5f0c9e…" }
-  ]
+  ],
+  "settings": { "backend": "eds", "title_blocklist": ["Focus time"] }
 }
 ```
 
@@ -216,7 +295,11 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   200 characters, and without the bidi embedding, override and isolate controls (U+202A–U+202E,
   U+2066–U+2069; `_short`): an unterminated one reverses everything after it on the line it is
   drawn in, the bar label's countdown included. The widget's parser and the alert's payload
-  cleaning drop them again.
+  cleaning drop them again. A meeting without a title has `title` `""` from 1.5.0 — bar, agenda,
+  alert and toast name it in the UI language ("Ohne Titel"/"Untitled") — where earlier fetchers
+  wrote a placeholder, "(ohne Titel)" or "(untitled)"; a stale or carried entry with one is read
+  back as `""`. A `title_blocklist` term that is part of either placeholder ("untitled",
+  "ohne titel") still matches such a meeting, so a blocklist written against them keeps working.
 - `id`: stable across runs — `sha1(uid + "@" + instance_start_epoch)[:16]`. Must be identical for
   the same occurrence on every run, or the alert fires repeatedly. An event without a UID hashes
   `"~" + title` in its place, so two UID-less meetings at the same time stay two events.
@@ -242,16 +325,26 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   their bidi controls the same way, and a term that was nothing else is ignored), and an
   all-day entry is rebuilt from its dates in the current zone, because its epochs are the
   midnights of the zone that wrote it.
+- `settings` (from 1.5.0; absent when there is nothing in it): the values of the fetcher's own
+  keys (`KEPT_KEYS`: all it reads but `ics_urls` and `language`) that `omeetingbar.json` set and
+  the run applied — a clamped value counts — plus the ones it fell back to, for the next run to
+  fall back on while the file cannot be used (see *Config*). A key the file does not set is not
+  in it. It is the user's own config, not calendar content, but a blocklist term or a calendar
+  name can be telling, so it stays in this 0600 file. Read back with the same rules (the file is
+  user-writable); `bin/omeetingbar-join` reads `skip_declined` from it, every other consumer
+  ignores it.
 - `status: "error"` + human-readable `error` when the backend fails; `events` then keeps the last
   known good list if one is available (write `stale: true` in that case), re-validated with the
   rules a fresh entry is written by (the URL passes the provider allow-list again, text fields are
   capped), re-filtered with the current config and without occurrences that ended before the
   agenda window. A deliberate state is not a failure — no Google account, no enabled calendar, no
   `ics_urls` — and drops the list, so a removed account's meetings stop alerting, and the sign-in
-  stamp; a broken `omeetingbar.json` (unreadable, not an object, invalid values — a capped option
-  is not broken) keeps the list, as it may be what made the state look deliberate. Never put tokens,
+  stamp; a broken `omeetingbar.json` (unreadable, not JSON, not an object, or a value the reading
+  rules reject for a key the fetcher itself reads — a clamped value, an unknown key or a rejected
+  key only the QML reads is not broken) keeps the list, as it may be what made the state look
+  deliberate. Never put tokens,
   URLs with secrets, attendee emails or full ICS text into `error`; calendars are named by
-  position ("Kalender 2") because display names are often an address, and backend error text is
+  position ("Calendar 2" / "Kalender 2") because display names are often an address, and backend error text is
   scrubbed before it is quoted: URLs, then the names the run knows (the calendar's display name,
   the account's addresses), then quoted spans holding an `@` or a space, then any address
   (`<url>`, `<name>`, `<email>`) — and only then shortened, so a cut cannot leave half an address
@@ -260,8 +353,11 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   filtering** — an empty list from a failed run is never dressed up as `"ok"`. "Nothing on your
   calendar" and "your calendar could not be read" must not look alike to the user.
 - `warning`: always present, `""` when there is nothing to report. Non-empty means *usable but
-  degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds invalid values
-  and the documented defaults were used, one of several calendars failed while the others
+  degraded* — the run produced events, but on fallbacks: e.g. `omeetingbar.json` holds values the
+  reading rules reject (the defaults were used, or for the fetcher's own keys their last valid
+  values), values clamped to their range, list items that are not strings or keys nobody reads
+  (see *Config*),
+  one of several calendars failed while the others
   delivered (its previous events were carried forward), the pushed network refresh failed or
   has not succeeded for longer than 30 min or `refresh_seconds`, whichever is longer, a Google
   sign-in is due, a calendar, feed or series hit an instance cap, a feed's broken or runaway
@@ -352,10 +448,10 @@ image-selector, omarchy.indicators). All args and returns are **strings**.
 
 | Call | Effect |
 |---|---|
-| `omarchy-shell omeetingbar status` | JSON string: `version` (the code answering, `codeVersion`), `installedVersion` (the manifest the host last read, `""` when unknown) and `restartNeeded` (`installedVersion` non-empty and different from `version`; see *Version and updates*), backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, effective settings, paths. Events and queue entries carry ids and times only, never titles or calendar names — `status` is what ends up in bug reports |
+| `omarchy-shell omeetingbar status` | JSON string: `version` (the code answering, `codeVersion`), `installedVersion` (the manifest the host last read, `""` when unknown) and `restartNeeded` (`installedVersion` non-empty and different from `version`; see *Version and updates*), backend, cache status/`error`/`warning`/age, next event, armed/inhibiting/locked, pending alert queue, last fetch outcome, config state (`configValid` false while a broken file keeps the last valid settings or, at startup, the defaults; `configFetchPending` while an edit waits for its fetch), effective settings, paths. Events and queue entries carry ids and times only, never titles or calendar names — `status` is what ends up in bug reports |
 | `omarchy-shell omeetingbar refresh` | run the fetcher now |
 | `omarchy-shell omeetingbar test` | show a synthetic alert immediately and play the alarm sound (no calendar needed), so the whole cue, Esc included, can be tried |
-| `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
+| `omarchy-shell omeetingbar preview` | show the alert for the event the alert path would fire on next (`isAlertable`'s view — a running meeting past its grace window is skipped even though the bar still shows it as "running"/"läuft"), without touching `notified`/`shown`; a preview or test overlay is never mistaken for a queued alert's confirmation (`lastSummonKind`) |
 | `omarchy-shell omeetingbar dismiss` | hide the alert, stop the alarm sound and discard the **whole** pending queue (entries that never reached the screen are recorded as `failed`). Unlike Esc in the overlay, which closes only the head and lets `drainQueue` summon the next queued alert — an explicit dismiss means "give me the screen back" |
 | `omarchy-shell omeetingbar-agenda open` / `close` / `toggle` / `isOpen` | the agenda popup, routed the way the bar routes its own panel hotkeys: to the copy whose agenda is open, else to the widget on the focused monitor; `isOpen` is true while any copy's agenda is open (`Widget.qml`'s handler, see the widget contract) — the target to bind a Hyprland key to |
 
@@ -371,10 +467,16 @@ function close() { }
 
 Payload:
 ```json
-{ "title": "…", "start": 1757503200, "end": 1757505000, "url": "…", "calendar": "…",
-  "location": "…", "auto_dismiss": 90,
+{ "id": "9f2c…", "lang": "de", "title": "…", "start": 1757503200, "end": 1757505000,
+  "url": "…", "calendar": "…", "location": "…", "auto_dismiss": 90,
   "colors": { "running": "#FF9500", "upcoming": "#00BEFF" }, "queued": 0, "test": false }
 ```
+
+`id` is the event id (`"test"` for the test alert); the overlay hands it back in
+`service.overlayShown(id)`, `service.stopSound(id)` and `service.alertWanted(id)`. `lang` is the
+service's resolved UI language (`"de"`/`"en"`, see `language`), so the alert speaks the language
+of the bar it belongs to; without it the overlay falls back to the session locale
+(`Strings.pick(payload.lang, Qt.locale().name)`).
 
 Requirements:
 - `Variants { model: Quickshell.screens }` → one `PanelWindow` per monitor (eDP-1 and DP-1 here),
@@ -450,6 +552,17 @@ Requirements:
 - Reads the cache and config itself via `FileView` (`watchChanges: true`, and
   `onFileChanged: reload()` — it does **not** auto-reload). Watch the parent *directory* too,
   because the cache may not exist yet.
+- The three `widget.*` keys come from three layers, most specific first: the bar entry's inline
+  settings in `shell.json` (`BarWidget.setting()`), then `omeetingbar.json`'s `widget` block, then
+  the defaults. `omarchy plugin enable` puts a bare `{id}` entry in the bar — the manifest's
+  `barWidget.defaults` never land in `shell.json` — so the file decides until
+  `omarchy bar set io.github.disy-mk.omeetingbar <key> <value>` writes a value there, which then
+  wins; `omarchy bar set … <key> null --json` hands the key back to the file. The manifest's
+  `schema` (ranges as in the code: `warn_minutes` 0–1440, `max_title_chars` 4–200) is metadata:
+  nothing in Omarchy 4.0.x reads its `min`/`max`. A value there that the reading rules reject
+  (`omarchy bar set … warn_minutes abc`) still wins and means the default; nothing reports it,
+  since the fetcher does not read `shell.json`. `skip_declined` and `language` are read from the
+  file only, as the service reads them, so a bar entry cannot disagree with the alert path.
 - Renders e.g. `󰃭 14:00 Standup · 12m` in `colors.upcoming`, switching to `colors.running` once the
   meeting has started. A meeting that is not today carries a day prefix — `morgen 09:00`, or the
   short weekday (`So. 10:15`) beyond that, and the short date (`Mo., 12. Okt.`) seven or more days
@@ -709,7 +822,9 @@ file talks to the outside world.
   on its way out. The queue's payloads predate the sleep as much as the cache does, so in the
   same window no queued alert is summoned for the first time either (`deferredReason`
   "refreshing"): an alert queued under the lock before a suspend, for a meeting cancelled
-  meanwhile, must not be shown — and wake the display — before that fetch can withdraw it.
+  meanwhile, must not be shown — and wake the display — before that fetch can withdraw it. A
+  config edit holds firing the same way until its fetch has landed (see *Config*: "An edit
+  applies on save"), so a meeting the edit excludes does not fire from the old cache.
   1. persist the id to `notified` in the state file first (so a crash cannot cause a re-fire loop),
   2. if `notify`: a critical toast through `bin/omeetingbar-notify`, run as a child `Process`
      one at a time (`notifyQueue`) with the payload written to its **stdin** — title, body,
@@ -744,7 +859,9 @@ file talks to the outside world.
      is explicitly off in `omeetingbar.json` (`false`, `"off"`, `"no"`, `0`: the plugin's
      boolean rule, read with `jq` from exactly one JSON object as the service's `JSON.parse`
      reads it, numbers the way JavaScript's `String()` writes them), the same rule the alert
-     follows. So the URL
+     follows; while the file exists but is no such object, the service keeps its last valid
+     config, and the script takes the `skip_declined` the fetcher kept in the cache's
+     `settings` (a JSON boolean, or nothing). So the URL
      never appears on a command line, nor in Omarchy's persisted notification files, before the
      browser launch itself. The legacy form `omeetingbar-join <url> <end>` is still accepted for
      one or two releases, with its 1.0.x rules (https, no whitespace or backslash, nothing once a
@@ -807,8 +924,8 @@ file talks to the outside world.
      IPC dismiss (`lastSummonKind` "dismissed") — so the withdrawn alert leaves at once.
 - **Bounds on calendar input**: `normalizeEvents` keeps at most `maxEvents` (512) occurrences,
   chosen by the fetcher's relevance rule (`capByRelevance`, see *Bounds* under the fetcher; ties
-  broken by start, then id, since Qt's JS sort is not stable; the service's `grace_seconds` is
-  capped at an hour, the fetcher's at six), and
+  broken by start, then id, since Qt's JS sort is not stable; `grace_seconds` is capped at an
+  hour on both sides, so both rank by the same window), and
   drops a URL longer than `maxUrlChars` (2048). Both bound hostile input: a
   `FREQ=SECONDLY` rule expands to hundreds of thousands of instances, and an invite can carry a
   URL of any length. No argv limit is at stake: no notification carries a URL (the click action
@@ -901,7 +1018,8 @@ file talks to the outside world.
   instance with the new code: `omarchy-shell omeetingbar status` kept returning the old schema after
   the file change, after `omarchy-shell shell rescanPlugins`, and after clearing
   `~/.cache/quickshell/qmlcache`. Only `omarchy restart shell` loads changed service code.
-  Config changes do apply immediately (the config is read through a `FileView`).
+  Config changes do apply on save (the config is read through a `FileView`), and an edit starts
+  a fetch as well (see *Config*).
 - `backend: "demo"` must work end to end so the whole plugin can be tested before a Google
   account exists (it did here: GOA/EDS were installed only after the first version ran). The
   required packages are exactly `evolution-data-server`, `gnome-online-accounts`,
@@ -1088,7 +1206,8 @@ Verified API recipe — follow it exactly:
   query of the window (`get_object_list_as_comps_sync`) then fails: a calendar factory that died
   hands over nothing and no error, which read as an empty calendar. Occurrences that fail to
   convert fail the calendar only when they are at least as many as the converted ones; fewer are
-  a warning ("n Termine nicht auswertbar") and the rest is used. A failing calendar is reported as
+  a warning ("Calendar 2: events unparseable (3)." / "Kalender 2: Termine nicht auswertbar (3).")
+  and the rest is used. A failing calendar is reported as
   "Kalender N (…)" in `warning` (or in `error` when nothing at all was read), and its events from
   the previous cache are carried forward (with `_join_path: "cache"`) — matched by
   `calendar_uid`, since a healthy namesake's deleted meeting must not come back (entries from

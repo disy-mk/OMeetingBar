@@ -18,9 +18,9 @@ around it.
 - **Agenda popup** (left click) — today and tomorrow, MeetingBar-style: a timeline strip, one
   row per meeting with the provider's mark in its brand colour, finished rows dimmed, the running
   one emphasised, declined invitations struck through, then the next few later meetings
-  ("Demnächst"), and footer actions (join, create, refresh, open calendar).
+  ("UPCOMING"; German UI: "DEMNÄCHST"), and footer actions (join, create, refresh, open calendar).
 - **Fullscreen alert** — configurable lead time (default 60 s), auto-dismiss, `Enter` joins the
-  meeting in its provider (the hint names it: "in Teams beitreten"), `Esc` dismisses it and
+  meeting in its provider (the hint names it: "join via Teams"; German UI: "in Teams beitreten"), `Esc` dismisses it and
   silences the sound. It also sends a critical notification and plays a sound, so the alert
   reaches you even when the overlay cannot (see limits). The display is woken once, right
   before the alert is shown — never under the lock screen.
@@ -64,8 +64,10 @@ The fullscreen alert, a minute before the next meeting:
    5 min) still alerts.
 3. **The `ics` backend lags.** Google regenerates private iCal feeds roughly once a day. It
    exists as a backstop only; use `eds`.
-4. **Two UI languages.** German and English, picked from the session locale (`LANG` of the
-   shell: `de*` → German, everything else → English) or pinned with `language` in the config.
+4. **Two UI languages.** German and English, picked from the shell's locale the way Qt picks
+   it — `LC_ALL`, `LC_MESSAGES` or `LANG`, and `LANGUAGE`'s first entry wins unless that locale
+   is unset, `C` or `POSIX`: `de*` → German, everything else → English — or pinned with
+   `language` in the config.
    Other languages: `Strings.js` and the `MESSAGES` table in `bin/omeetingbar-fetch` are the
    two places to add one.
 5. **The timeline strip has no hour numbers.** A `Text` in that row triggers a Qt polish loop
@@ -138,48 +140,75 @@ the tooltip.
 omarchy plugin remove io.github.disy-mk.omeetingbar
 ```
 
-`--uninstall` removes the wrapper, the runtime cache (`$XDG_RUNTIME_DIR/omeetingbar/`) and
-the widget's bar entry. It leaves `~/.config/omarchy/omeetingbar.json` in place (your
-settings) and does not touch the packages or the Google account — remove those yourself if
-you want them gone (`gnome-online-accounts-gtk`, `sudo pacman -Rs …`).
+`--uninstall` first disables the plugin, which removes the bar entry (with any `omarchy bar set`
+values on it) and stops the service (fetches, toasts, sound) and the fullscreen alert, and then
+removes the wrapper and the runtime cache (`$XDG_RUNTIME_DIR/omeetingbar/`). If the shell does
+not answer, it says so and how to disable the plugin by hand: until then the service writes the
+cache again. It leaves `~/.config/omarchy/omeetingbar.json` in place (your settings) and does not
+touch the packages or the Google account — remove those yourself if you want them gone
+(`gnome-online-accounts-gtk`, `sudo pacman -Rs …`). Meeting toasts still on screen stay there
+until you close them (a click no longer joins), and toasts you already closed stay in Omarchy's
+notification history until you clear it (`omarchy-shell notifications clear`, which empties the
+whole history).
 
 ## Configuration — `~/.config/omarchy/omeetingbar.json`
 
-Every key is optional; the defaults below apply when it is missing. The file is re-read on
-save.
+Every key is optional; the defaults below apply when it is missing or `null`. One rule holds for
+every value: a number may also be written as a string (`"120"`), is rounded to a whole number
+and kept inside its range; a switch also takes `1`/`0` and `"yes"`/`"no"`/`"on"`/`"off"`; a
+list may be a single string; text settings (`language`, `sound`, the colours) must be strings.
+A value that does not fit, a value moved into its range and a key nothing reads (a typo) are
+named in the bar's tooltip (its first 140 characters; `omarchy-shell omeetingbar status` shows
+all of it as `cacheWarning`). A value that does not fit counts as missing — for the fetcher's
+own keys (all but `ics_urls`, `language` and the ones only the bar and the alert read) the last
+valid value applies instead.
+
+A save applies at once and starts a fetch; alerts wait for it, up to 30 s, so a new exclusion is
+normally in force before the next alert fires. While the file cannot be read as JSON — a
+trailing comma, a half-written save — nothing loses its last valid value: the bar, the alert and
+the toasts keep theirs, and the fetcher keeps its own, remembered for this in the runtime cache;
+the tooltip says so. Fixing the file starts a fetch too. The gaps: the runtime cache is gone after
+a reboot or the end of the login session, and a shell restart, a plugin reload or a bar created
+meanwhile (a new monitor) starts from the defaults — in each case only until the file is fixed.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `backend` | `"eds"` | `eds` = Google via GOA/Evolution. `ics` = private iCal URLs (backstop, see limits). `demo` = synthetic events, no account needed. |
 | `ics_urls` | `[]` | Private ICS URLs for `backend: "ics"`. Treated as secrets — never logged. |
-| `lookahead_minutes` | `10080` | How far ahead meetings are fetched (7 days). The bar always names the next meeting in this window — on a Friday evening that is Monday's first one. Never shortens the two-day agenda. |
+| `lookahead_minutes` | `10080` | How far ahead meetings are fetched (7 days, at most 30). The bar always names the next meeting in this window — on a Friday evening that is Monday's first one. Never shortens the two-day agenda. |
 | `refresh_seconds` | `300` | Minimum spacing between network refreshes (EDS `refresh_sync`). EDS alone would poll hourly. |
 | `fetch_interval_seconds` | `60` | How often the service reads the local calendar cache, 5 to 900 s. Backs off to 15 min while a backend keeps failing. |
-| `alert_lead_seconds` | `60` | Fullscreen alert this many seconds before start. |
-| `auto_dismiss_seconds` | `90` | The alert closes itself; `0` keeps it until dismissed (hard cap 10 min). |
+| `alert_lead_seconds` | `60` | Fullscreen alert this many seconds before start, 0 to 3600. |
+| `auto_dismiss_seconds` | `90` | The alert closes itself after this long, 0 to 600; `0` keeps it until dismissed, for 10 min at most. |
 | `colors.running` | `#FF9500` | Colour for a running meeting — bar entry and alert countdown. `#rrggbb` only. |
 | `colors.upcoming` | `#00BEFF` | Colour for an upcoming meeting. |
-| `inhibit_lead_seconds` | `600` | Hold a Wayland idle inhibitor from this long before start, so the session cannot lock into the alert — until the alert has been on screen for 5 s (the alert then holds the session for at most 3 min itself) or `start + grace` has passed. |
-| `grace_seconds` | `300` | A meeting whose start is at most this long ago still alerts (suspend, lock). Older ones never do. |
-| `sound` | `…/alarm-clock-elapsed.oga` | An audio file, played with `pw-play` for at most 60 s. An absolute path or `~/…`; `""` or `false` = silent, `null` = the default. A path that is no file shows up in the log as `sound-missing`. |
-| `language` | `"auto"` | `"de"`, `"en"` or `"auto"` (session locale: `de*` → German, else English). Bar, popup, alert, notifications and the fetcher's messages follow it; dates and weekday names too. Times stay 24 h. |
+| `inhibit_lead_seconds` | `600` | Hold a Wayland idle inhibitor from this long before start, so the session cannot lock into the alert — until the alert has been on screen for 5 s (the alert then holds the session for at most 3 min itself) or `start + grace` has passed. 0 to 7200. |
+| `grace_seconds` | `300` | A meeting whose start is at most this long ago still alerts (suspend, lock). Older ones never do. At most 3600. |
+| `sound` | `…/alarm-clock-elapsed.oga` | An audio file, played with `pw-play` for at most 60 s. An absolute path or `~/…`; `""` or `false` = silent, `null` or anything that is neither a path nor a switch = the default. A path that is no file shows up in the log as `sound-missing`. |
+| `language` | `"auto"` | `"de"`, `"en"` or `"auto"` (the shell's locale, see limit 4). Bar, popup, alert, notifications and the fetcher's messages follow it; dates and weekday names too. Times stay 24 h. |
 | `notify` | `true` | Also send a critical notification (bypasses DND) through `bin/omeetingbar-notify`, which gets the text on stdin rather than as an argument (Omarchy's daemon still passes it to a bash job when it saves the toast; see privacy). Once the meeting is over it is replaced by a short "Meeting ended". `false` = no notification at all. |
 | `notify_details` | `true` | The notification shows the title, the time range and the location (or the calendar name). `false` = a toast without title, location or calendar name: only "Meeting"/"Termin" and the time range. See privacy. |
 | `wake_display` | `true` | `omarchy-brightness-display on` once, right before the alert is shown — never under the lock screen. |
 | `skip_all_day` | `true` | Keep all-day entries out of the cache. All-day entries never alert either way. |
 | `skip_declined` | `true` | Declined invitations never alert but are listed, struck through, in the agenda. `false` treats them like any other meeting. |
 | `min_duration_minutes` | `0` | Ignore meetings shorter than this. |
-| `title_blocklist` | `[]` | Title fragments that exclude a meeting everywhere. |
+| `title_blocklist` | `[]` | Title fragments that exclude a meeting everywhere (case-insensitive). A meeting without a title matches `untitled` and `ohne Titel`. |
 | `calendars_exclude` | `[]` | Calendar names or UIDs to ignore (case-insensitive; a name as it reads on screen). |
-| `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. A meeting this close to its start also takes over the bar entry from one still running. `0` turns both off. |
-| `widget.max_title_chars` | `28` | Truncate the title in the bar. |
+| `widget.warn_minutes` | `15` | Inside this window the bar entry shows full-strength colour; outside it 75 % alpha. A meeting this close to its start also takes over the bar entry from one still running. `0` turns both off; at most 1440. |
+| `widget.max_title_chars` | `28` | Truncate the title in the bar, 4 to 200. |
 | `widget.hide_when_empty` | `true` | Collapse the bar entry when the agenda is empty. |
+
+The three `widget.*` keys can also be set on the bar entry itself, e.g.
+`omarchy bar set io.github.disy-mk.omeetingbar warn_minutes 10`. A value set there wins over
+`omeetingbar.json` (even one the rules reject, which then means the default — the tooltip cannot
+report it); `omarchy bar set io.github.disy-mk.omeetingbar warn_minutes null --json` hands the
+key back to the file.
 
 ## Using it
 
 - **Left click** the bar entry → agenda popup. **Right/middle click** → refresh.
-- In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
-  `Tab` switches to the neighbouring panel.
+- In the popup: `↑`/`↓` or `j`/`k` move, `Enter` or `Space` joins the selected meeting, `r`
+  refreshes, `Esc` closes, `Tab`/`Shift+Tab` switch to the next/previous panel.
 - In the alert: `Enter` joins, `Esc` (or any other key, or a click) dismisses. Either way the
   sound stops. Keys and clicks in the first second after it appears are ignored, and so is
   typing that goes on past it (keys less than 0.4 s apart), so input already on its way can
@@ -193,11 +222,18 @@ save.
 omarchy-shell omeetingbar-agenda toggle   # open the agenda on the focused monitor, or close the open one
 omarchy-shell omeetingbar status          # JSON: backend, cache age, alert state (ids and times, no titles)
 omarchy-shell omeetingbar test            # fullscreen alert + sound now, synthetic, no calendar needed
+omarchy-shell omeetingbar preview         # the alert for the meeting it would fire on next; nothing is marked as alerted
 omarchy-shell omeetingbar refresh         # run the fetcher now
 omarchy-shell omeetingbar dismiss         # close the alert, stop the sound, drop queued alerts
+omeetingbar-fetch --refresh               # fetch now with a network refresh, ignoring refresh_seconds
 omeetingbar-fetch --diagnose              # packages, typelibs, GOA accounts, calendars found
 omeetingbar-fetch --in-seconds 90         # inject a test meeting 90 s out → real alert at T-60
 ```
+
+With the `eds` backend every refresh from the plugin — a right click, `r`, "Refresh now",
+`omarchy-shell omeetingbar refresh` — reads EDS's local copy at once, but asks Google again only
+once the last network refresh is `refresh_seconds` old (default 5 min). After a VPN outage,
+`omeetingbar-fetch --refresh` gets the current state right away.
 
 Hyprland example — `~/.config/hypr/bindings.lua` (`SUPER + SHIFT + M` is Omarchy's Music key,
 `SUPER + CTRL + M` is free):
@@ -212,9 +248,9 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
 |---|---|
 | Dim `󰃭 —` in the bar | `omarchy-shell omeetingbar status`, then `omeetingbar-fetch --diagnose`. Usually: packages missing, or no Google account connected yet. |
 | No alert | `status`: is the meeting in the cache (match it by start time — `status` prints no titles), is it `declined`, was it already `notified`? Was the session locked (limit 1)? |
-| Tooltip says "Calendar sync failed" or "Last successful calendar sync … ago" (German UI: "Kalender-Sync fehlgeschlagen", "Letzter erfolgreicher Kalender-Sync vor …") | EDS cannot reach Google: VPN or network down, or the account's login expired — open `gnome-online-accounts-gtk` and sign in again. Until then the plugin shows EDS's last local copy. `omeetingbar-fetch --diagnose` prints the last attempt and the last success. |
+| Tooltip says "Calendar sync failed", "Calendar sync partly failed (n of m)" or "Last successful calendar sync … ago" (German UI: "Kalender-Sync fehlgeschlagen", "Kalender-Sync teilweise fehlgeschlagen (n von m)", "Letzter erfolgreicher Kalender-Sync vor …") | EDS cannot reach Google: VPN or network down, or the account's login expired — open `gnome-online-accounts-gtk` and sign in again. Until then the plugin shows EDS's last local copy. `omeetingbar-fetch --diagnose` prints the last attempt and the last success. |
 | Tooltip says "Google sign-in needed – sign in again in gnome-online-accounts-gtk" (German UI: "Google-Anmeldung nötig – …") | EDS is waiting for credentials: the Google sign-in expired or was revoked. Open `gnome-online-accounts-gtk` and sign in again; the next refresh clears the hint. |
-| Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply immediately. |
+| Nothing changes after editing QML | `omarchy restart shell`. Saving a file reloads plugin code, but a running third-party *service* is not replaced by it — measured, not assumed. Config edits apply on save. |
 | Logs | `journalctl --user -t omarchy-shell -f` — the plugin logs one line per state change, never a meeting title. |
 
 ## Security and privacy
@@ -225,7 +261,9 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
 - The event cache lives in `$XDG_RUNTIME_DIR/omeetingbar/` (tmpfs, mode 0600, gone on
   reboot) and holds only title, times, join URL, calendar name and location, plus a calendar
   key (the EDS source id, or a hash of an ICS feed's URL, never the URL) and the dates of all-day
-  entries — no attendees, no descriptions.
+  entries — no attendees, no descriptions. It also keeps the fetcher's last valid settings,
+  your exclusions (`title_blocklist`, `calendars_exclude`) among them but never the `ics_urls`,
+  so that a broken config file does not switch them off.
   `omarchy-shell omeetingbar status` prints ids and times, never titles.
 - The plugin writes nothing from the calendar to the journal. One exception: joining hands the
   link to Omarchy's launcher, which logs the browser command line — link and passcode
@@ -265,7 +303,7 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   gets its own); at most 512 occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 8,800 lines of QML, JavaScript, Python and shell, and `docs/SPEC.md` explains every decision.
+  about 9,350 lines of QML, JavaScript, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 

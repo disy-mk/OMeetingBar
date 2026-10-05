@@ -753,10 +753,6 @@ Item {
     return Util.alpha(root.upcomingColor, 0.75)
   }
 
-  // Fallback only: the host pushes its own 1 Hz `nowSec` over this default,
-  // and then nothing reads this clock. It stays enabled while the panel is
-  // open all the same, so a popup that is rendered without a host — or before
-  // the first push lands — still counts down instead of freezing at the epoch.
   // Filters synthetic hover churn from rows moving under a stationary pointer;
   // the shell's clipboard and menu surfaces use the same gate.
   PointerMoveGate {
@@ -764,6 +760,10 @@ Item {
     referenceItem: agendaColumn
   }
 
+  // Fallback only: the host pushes its own 1 Hz `nowSec` over this default,
+  // and then nothing reads this clock. It stays enabled while the panel is
+  // open all the same, so a popup that is rendered without a host — or before
+  // the first push lands — still counts down instead of freezing at the epoch.
   SystemClock {
     id: fallbackClock
     enabled: root.opened
