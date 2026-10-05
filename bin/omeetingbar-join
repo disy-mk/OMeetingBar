@@ -4,9 +4,9 @@
 #
 # Looks the meeting up in the plugin's 0600 event cache and opens its join link
 # until the meeting ends, before its start too. Once it is over -- or the event
-# is gone from the cache -- it does nothing; the notification closes on click
-# either way, so a stale toast just clears instead of reopening a call that is
-# over.
+# is gone from the cache, or the user has declined it since -- it does nothing;
+# the notification closes on click either way, so a stale toast just clears
+# instead of reopening a call that is over or off.
 #
 # Only the event id and the grace window travel in the notification: the URL
 # never appears on a command line (or in Omarchy's notification history on
@@ -45,6 +45,7 @@ command -v jq >/dev/null 2>&1 || exit 0
 url=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .url // ""][0] // ""' "$cache" 2>/dev/null)
 start=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .start // 0][0] // 0' "$cache" 2>/dev/null)
 end=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .end // 0][0] // 0' "$cache" 2>/dev/null)
+declined=$(jq -r --arg id "$id" '[.events[]? | select(.id == $id) | .declined == true][0] // false' "$cache" 2>/dev/null)
 
 # Defence in depth: the fetcher only writes validated https URLs, but this is
 # the last hop before a browser launcher that takes options, so the same rule
@@ -72,4 +73,23 @@ case $start$end in
 esac
 [ "$end" -gt "$start" ] || end=$((start + grace))
 [ "$(date +%s)" -lt "$end" ] || exit 0
+
+# Declined since the toast went out: the service takes such a toast down on
+# its next fetch, and this covers a click before that. Only an explicit
+# skip_declined off in omeetingbar.json (false, "off", "no", 0 -- the
+# service's own boolean rule) lets the click through, as it does the alert.
+if [ "$declined" = true ]; then
+  # Exactly one JSON object, as the service's JSON.parse demands: a file it
+  # rejects (trailing data, two objects) keeps the default here too. A number
+  # reads the way JavaScript's String() writes it, so 0.0 and -0 are "0".
+  skip=$(jq -rs 'if length == 1 and (.[0] | type) == "object" and (.[0] | has("skip_declined"))
+    then .[0].skip_declined
+      | (if type == "number" then (if . == 0 then "0" elif . == 1 then "1" else tostring end) else tostring end)
+      | ascii_downcase | gsub("^\\s+|\\s+$"; "") else "" end' \
+    "${HOME:-/nonexistent}/.config/omarchy/omeetingbar.json" 2>/dev/null)
+  case $skip in
+    false | 0 | no | off) ;;
+    *) exit 0 ;;
+  esac
+fi
 exec omarchy-launch-browser "$url"

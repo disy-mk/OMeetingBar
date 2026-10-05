@@ -105,11 +105,17 @@ supply these defaults and never crash on a missing/broken file:
 ```
 
 Semantics:
-- `alert_lead_seconds` — fire the fullscreen alert this many seconds before `start`.
+- `alert_lead_seconds` — fire the fullscreen alert this many seconds before `start`. A
+  zero-length occurrence (`end == start`) gets at least 5 s (`zeroLengthMinLeadSeconds`): it is
+  over the second it starts (invariant 1), so with a lead of 0 no tick could find it both due
+  and not over.
 - `grace_seconds` — if we were suspended/locked and missed the moment, still fire up to this
   long after `start` (an event whose start is older than that is never alerted).
 - `inhibit_lead_seconds` — hold a Wayland idle inhibitor from `start - this` until
-  `start + grace_seconds`, so the session cannot blank/lock right before a meeting. The default is
+  `start + grace_seconds`, so the session cannot blank/lock right before a meeting — or until
+  the alert has been on screen for 5 s (`inhibitHandoverSeconds`), when the overlay's own
+  inhibitor takes over for at most 180 s, or has failed for good. An unattended machine is
+  then free to lock again instead of staying unlocked until `start + grace`. The default is
   **600**, deliberately larger than the idle timings on this machine (screensaver 150 s, lock
   300 s): a 300 s lead arrives after the blank has already happened and cannot undo a lock that is
   in progress, so the inhibitor has to be in place before the idle sequence can even start.
@@ -127,9 +133,16 @@ Semantics:
 - `refresh_seconds` — minimum spacing between *network* refreshes (EDS `refresh_sync`).
 - `notify_details` — default `true`: a meeting's toast carries the title plus the location, or
   the calendar name when there is no location. `false` sends a toast without title, location
-  or calendar name — summary "Termin"/"Meeting", body the countdown and the time range — with
-  the same click action, because the toast text leaves the plugin's control in Omarchy's
-  daemon (firing step 2). `notify: false` sends no toast at all.
+  or calendar name — summary "Termin"/"Meeting", body the time range — with the same click
+  action, because the toast text leaves the plugin's control in Omarchy's daemon (firing step
+  2). `notify: false` sends no toast at all.
+- `sound` — an audio file for `pw-play`. A leading `~/` is expanded and surrounding spaces are
+  dropped; `""` or a false boolean (`false`, `"off"`, `"no"`, `"0"`, the plugin's one boolean
+  rule) silences the alarm, `true` or `null` keep the default. It plays for at most 60 s
+  (`soundCapSeconds`, through `timeout`). Under the lock the sound is the only cue that reaches
+  the user, so a path that is not a file is logged (`sound-missing`), and so is a player that
+  fails (`sound-failed`, with the last line of its stderr) or hits the cap (`sound-capped`); the
+  file is looked for again after every fetch.
 - `language` — `"de"`, `"en"` or `"auto"` (default). Resolved in exactly two places with the
   same rule: `Strings.pick(override, Qt.locale().name)` in `Strings.js` (Widget, Popup via the
   widget, Service; the alert gets the result in its payload as `lang`) and `pick_language()` in
@@ -194,6 +207,11 @@ empties it). `notify_details: false` keeps meeting content out of the toast, `no
   `refresh_ok_at`: the last one that **succeeded** (the freshness). Both unix seconds, 0 for never.
   They differ on purpose: a refresh that keeps failing — revoked token, VPN down — must throttle
   like any other (or every run blocks on it again) and still be visible as "the data is old".
+  A stamp in the future means the clock stepped back since it was taken: a `refreshed_at` ahead
+  of now makes a refresh due (only an age of 0 up to `refresh_seconds` throttles), and a
+  `refresh_ok_at` in the future is read as now - 1, a success from before this run: the
+  staleness warning would otherwise stay quiet until the clock caught up — two hours for an RTC
+  kept in local time — and a refresh failing right after the step would not read as newer.
 - `calendar_uid`: the EDS source uid, lower-cased; for an ICS feed `ics-` plus the first 16 hex
   digits of the SHA-256 of its URL — a key, never the URL, which is a bearer token; `""` for demo
   and the test event. `date` and `end_date` (`YYYY-MM-DD`, `end_date` exclusive, both the local
@@ -256,7 +274,7 @@ restart during a lock.
       "allDay": false, "url": "https://meet.google.com/abc-defg-hij", "calendar": "Work",
       "location": "", "untilSec": 1757503500, "notifiedAt": 1757503140 }
   ],
-  "toasts": [ { "id": "<event id>", "headline": "Standup", "end": 1757505000, "nid": 12 } ],
+  "toasts": [ { "id": "<event id>", "end": 1757505000, "nid": 12, "sent": 1757503140215 } ],
   "toastsShellPid": 3364032,
   "fired": { "<event id>": 1757503140 }
 }
@@ -283,12 +301,16 @@ restart during a lock.
   can be shown. It is a queue, not one slot, because two meetings can come due while the session
   is locked; the head owns the overlay and the rest wait for it to close.
 - `toasts` — the meeting notifications this service sent and has not taken down yet: event id,
-  the headline it was sent with, `end` (`max(end, start + grace_seconds)`, so a meeting without a
-  real end keeps its toast as long as its alert stays relevant) and `nid`, the notification id
-  the helper reported (0 until it has). `toastsShellPid` is the shell process the ids belong to:
-  Omarchy's notification daemon restarts with the shell and numbers from 1 again, so entries
-  loaded under another `Quickshell.processId` keep their `end` but lose their `nid`. See "Toast
-  cleanup" under the firing rules. Merged by id on load, like the rest of the file.
+  `end` (`max(end, start + grace_seconds)`, so a meeting without a real end keeps its toast as
+  long as its alert stays relevant), `nid`, the notification id the helper reported (0 until it
+  has), and `sent`, the send time in milliseconds (see *Toast cleanup*: it tells the helper which
+  popup files are this toast's). An entry stays until its "Meeting ended" replacement has run,
+  so a replacement lost in a remount is sent again. `toastsShellPid` is the shell process the
+  ids belong to: Omarchy's notification daemon restarts with the shell and numbers from 1
+  again, so entries loaded under another `Quickshell.processId` keep their `end` but lose
+  their `nid` and `sent`. Files written before 1.3.0 also carry the `headline` each toast was
+  sent with; it is not read any more, and no meeting title is kept here. See "Toast cleanup"
+  under the firing rules. Merged by id on load, like the rest of the file.
 - `fired` — a schema-1 mirror (`id → notified`) written for readers of the old format and never
   read back. A file that *only* has `fired` is read as legacy: those ids count as notified **and**
   shown, because the old format cannot say whether the overlay was ever seen, and a surprise
@@ -343,19 +365,46 @@ Requirements:
   (`Color`, `Style`, `Util`) and `qs.Ui` — third-party plugins may import these.
 - Content: big countdown ("in 47 s" → "jetzt"), meeting title, start–end local time, calendar name,
   location if present, and the join hint when a URL exists.
-- Keys: Return/Enter/Space → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
-  dismiss; Escape or any other key → dismiss. Full-size `MouseArea` → dismiss.
+- Keys: Return/Enter → join (`Quickshell.execDetached(["omarchy-launch-browser", url])`) then
+  dismiss; Escape or any other key → dismiss; bare modifiers do nothing. Space is no join key:
+  it is the key most likely to be in flight while the user is typing. Full-size `MouseArea` →
+  dismiss. The decision is `keyAction(key, isAutoRepeat)` (`pass`/`swallow`/`join`/`dismiss`).
 - Input guard: keys and clicks within the first second — `keyGuardMs` (1000 ms) after `open()` —
-  are ignored. The overlay takes exclusive keyboard focus the instant it appears, and a Space or
-  Enter already on its way down must not join a meeting — the invite's URL — that the user has
-  not read yet; it can also map between the two clicks of a double-click, whose second click
-  must not clear the alert unread. A click is judged at its press, because it only reports at
-  the release, which may come after the guard. A negative age (the wall clock stepped back since
-  `open()`) ends the guard, so no clock correction can lock input out. `open()` restamps the
-  time for a queued follow-up alert, which re-arms the guard.
+  are ignored. The overlay takes exclusive keyboard focus the instant it appears, and an Enter
+  already on its way down must not join a meeting — the invite's URL — that the user has not
+  read yet; it can also map between the two clicks of a double-click, whose second click must
+  not clear the alert unread. A click is judged at its press, because it only reports at the
+  release, which may come after the guard. Typing that goes on past the second is swallowed
+  too: a key within `keyQuietMs` (400 ms) of the last swallowed one belongs to the same burst,
+  and so does any autorepeat — a user still typing when the second ends must not join or
+  dismiss unread with the next keystroke. Escape is exempt from that extension, so the alert can
+  always be cleared deliberately once the first second is over. A negative age (the wall clock
+  stepped back since `open()`) ends the guard, so no clock correction can lock input out.
+  `open()` restamps the time for a queued follow-up alert, which re-arms the guard and forgets
+  the burst.
 - Every way the overlay closes (`opened` → false: a key, a click, auto-dismiss, the host's
-  `hide()`) calls `service.stopSound()`, so Esc silences the alarm too. `service` is the plugin's
-  own Service.qml instance, which the host injects into a declared `property var service`.
+  `hide()`) calls `service.stopSound(alertId)`, so Esc silences the alarm too — this alert's
+  alarm only: an older alert reaching its hard dismiss must not cut short the sound of one that
+  fired meanwhile, and the service checks the owner (a call without an id, from the IPC
+  dismiss or an older Alert.qml, stops any sound). `service` is the plugin's own Service.qml
+  instance, which the host injects into a declared `property var service`.
+- A payload without a `start` (and not `test: true`) is not a meeting: the bar's positional
+  panel hotkey reaches the overlay with `"{}"`, because shell.qml routes every summon of a plugin
+  that declares an overlay kind here. `open()` refuses it before writing anything, so an alert
+  already on screen stays as it is, and unloads a closed overlay only after the host's delivery
+  loop (a zero-interval timer): a `dismiss()` inside the loop would destroy the item under the
+  host, and a real payload right behind the empty one in the same loop must still open. One
+  exception: the host keeps the payload of a summon that was hidden while Alert.qml loaded
+  (see firing step 5) and delivers it right ahead of the next summon, so an alert that just
+  opened from it may be one the service has given up on. An empty payload therefore asks
+  `service.alertWanted(alertId)` (missing on a service before 1.3.0: the alert stays), and an
+  alert that is not wanted leaves the screen at once (`opened` false) and unloads after the
+  loop.
+- The D7 budgets below (inhibitor 180 s, hard dismiss 600 s) and the auto-dismiss run from
+  `openedAtMs` against the wall clock. A backward step (seen by the 1 Hz timer as
+  `Date.now() < nowMs`) moves `openedAtMs` back by the step, so the time elapsed since `open()`
+  is kept: a clock correction cannot stretch either budget — two hours for an RTC kept in local
+  time, with the inhibitor held all along. A forward jump (a suspend) still counts in full.
 - `IdleInhibitor { enabled: true; window: <this PanelWindow> }` while open, but **released after
   at most 180 s** even if the overlay is still up: an alert nobody dismissed (the user is not at
   the desk) must not keep the machine awake indefinitely. This is the overlay's own inhibitor,
@@ -483,7 +532,18 @@ file talks to the outside world.
 - **Timing (critical)**: one repeating `Timer { interval: 1000 }` that recomputes everything from
   `Date.now()` wall clock each tick. No long one-shot timers, no `systemd-run --on-active`
   (CLOCK_MONOTONIC, paused across suspend → fires late). If the wall clock jumped more than 15 s
-  between ticks (suspend/resume or a clock correction), force a fetch immediately.
+  between ticks (suspend/resume or a clock correction), force a fetch immediately. After a
+  backward step every stamp a throttle measures from lies in the future — `lastFetchAtSec`,
+  `lastFetchStartedAtSec`, the notify helper's start, `lastLockProbeSec`, the pending lock
+  probe, `saveRetryAtSec`, `lastPruneAtSec`, each queue entry's `summonedAtSec` — and interval
+  fetches, both watchdogs, lock probing, re-summons and save retries would stall until the clock
+  caught up (two hours for an RTC kept in local time): `rebaseStamps` pulls them back to now. On
+  any jump the last lock answer is dropped (`lockKnownAtSec = 0`); it predates the jump. A lock
+  probe or a notify helper running across a jump did not run for the time the clock skipped,
+  so their timeouts start over at the jump instead of reaping them as hung, and the probe's
+  answer is not taken (`lockProbeStale`): it may describe the session before the sleep, and a
+  fail-open "unlocked" from it would summon the alert under the lock. The next tick asks
+  again. A fetch from before a suspend is the opposite case and is reaped on purpose (firing).
 - **Fetch**: `Process` running `/usr/bin/python3 <pluginDir>/bin/omeetingbar-fetch` — resolve the
   plugin dir with `String(Qt.resolvedUrl("bin/omeetingbar-fetch")).replace(/^file:\/\//, "")`.
   Always the absolute `/usr/bin/python3`, never a bare `python3` (mise/pyenv shims lack `gi`).
@@ -503,6 +563,12 @@ file talks to the outside world.
   watchdog a single hung fetcher holds the re-entrancy guard forever and the cache silently stops
   updating. Note the watchdog is a backstop, not the fix for a slow backend: see the
   `wait_for_connected_seconds` note below, and remember the `ics` backend talks to the network.
+- **Notify watchdog**: toasts go out through one helper at a time, so a helper that never ends
+  would hold every later toast back for the rest of the session. The helper ends itself after
+  30 s (`SIGALRM`); one still running after 40 s is terminated and killed at 50 s, and its
+  `exited` drops the job and starts the next. A helper that fails to start emits no `exited` at
+  all (see the environment facts): `runningChanged` with `running` false while a job is still
+  current drops that job instead (logged once as `notify-failed: not started`).
 - **Version and updates**: `omarchy plugin update` fast-forwards the plugin's git checkout and
   ends with `omarchy-shell shell rescanPlugins`; the plugin registry's file watcher triggers the
   same reload when the files change. A reload destroys and recreates the service
@@ -510,8 +576,8 @@ file talks to the outside world.
   component cache: `finishPluginReload` clears it only if `Qt.clearComponentCache` exists, and
   Qt 6.11 has none. So after an update `manifest.version` names the installed version while the
   old `Service.qml` and `Widget.qml` code runs on until `omarchy restart shell` (which Omarchy
-  refuses while the session is locked); in-memory state such as summon attempts starts over,
-  and the state file carries the rest. `codeVersion`, a
+  refuses while the session is locked); in-memory state such as summon attempts and the
+  notify queue starts over, and the state file carries the rest. `codeVersion`, a
   constant in `Service.qml`, is the only thing that says which code is running. `status` reports
   `version` (`codeVersion`), `installedVersion` and `restartNeeded`, and every fetch gets
   `OMEETINGBAR_SERVICE=<codeVersion>` added to the inherited environment: the fetcher is read
@@ -522,13 +588,27 @@ file talks to the outside world.
   files that were not cached yet when the update landed — `Alert.qml` if no alert, test or
   preview has been shown since the shell started, `Popup.qml` if the agenda was never opened —
   load as new code beside the old `Service.qml` and `Widget.qml`, so a release must keep them
-  compatible with the previous version's alert payload and popup bindings.
-- **Firing** every alertable event (invariant 1) with `start - now <= alert_lead_seconds` and
+  compatible with the previous version's alert payload and popup bindings. They also run
+  against the previous version's JavaScript: the engine caches `Strings.js` and `Providers.js`
+  for its whole life (measured with Quickshell 0.3.1 / Qt 6.11.2: a never-loaded component gets
+  the new QML with the old JS imports), so a new key there reads as its raw name and a new
+  function is missing, and `open()` would throw. New QML may use a new key or JS function only
+  behind a fallback or a `typeof` check; check each release's QML against the previous tag's JS.
+- **Firing** every alertable event (invariant 1) with `start - now <= alert_lead_seconds` (at
+  least `zeroLengthMinLeadSeconds`, 5 s, for a zero-length occurrence: see the config) and
   `now - start <= grace_seconds` whose id is not in `notified` — all of them on the same tick,
-  not only the earliest, bounded at 8 per tick. All-day events are skipped here unconditionally
-  (invariant 4). Not during the first `fireHoldSeconds` (10 s) after a clock jump while the forced
-  fetch is still running: the cache then predates the sleep, and a meeting cancelled or moved
-  while the machine slept must not wake the display, notify and ring.
+  not only the earliest, bounded at `maxFiresPerTick` (8) per tick. All-day events are skipped
+  here unconditionally (invariant 4). Not during the first `fireHoldSeconds` (30 s: after any
+  longer sleep that fetch is refresh-due and may spend up to 25 s in `refresh_sync`) after a
+  clock jump until a fetch started after the jump has finished: the cache then predates the
+  sleep, and a meeting cancelled or moved while the machine slept must not wake the display,
+  notify and ring. A fetch that ran across the suspend is refused as the re-run and reaped by
+  the watchdog (its age counts the sleep); the re-run is retried every tick inside the hold
+  (`jumpRefetchPending`), and the hold covers that wait too, so the reaped fetch cannot lift it
+  on its way out. The queue's payloads predate the sleep as much as the cache does, so in the
+  same window no queued alert is summoned for the first time either (`deferredReason`
+  "refreshing"): an alert queued under the lock before a suspend, for a meeting cancelled
+  meanwhile, must not be shown — and wake the display — before that fetch can withdraw it.
   1. persist the id to `notified` in the state file first (so a crash cannot cause a re-fire loop),
   2. if `notify`: a critical toast through `bin/omeetingbar-notify`, run as a child `Process`
      one at a time (`notifyQueue`) with the payload written to its **stdin** — title, body,
@@ -541,18 +621,29 @@ file talks to the outside world.
      Omarchy's daemon reads (`urgency` byte, `omarchy-glyph`, `omarchy-exec-argv` as a JSON
      string) and `app_name` `omarchy-action` (the daemon's DND bypass), and prints the
      notification id, which lands in the toast's `nid`. Without Gio it falls back to
-     `omarchy-notification-send` with the content-free `safe` text (the word "Meeting" and the
-     time range). Past the helper the text is out of the plugin's hands: Omarchy's daemon saves
+     `omarchy-notification-send -p` with the content-free `safe` text (the word "Meeting" and
+     the time range) and the same click action, and prints the id too, so such a toast still
+     joins and is still taken down at the end; a
+     sender that fails or hangs (15 s) exits 2 like a failed D-Bus call. The body is the time
+     range plus the location, or else the calendar name — nothing relative: the critical toast
+     stays up until the meeting ends, so "starts in 1 minute" would still read so at 14:40, and
+     "now" would greet a resume four minutes late. Past the helper the text is out of the
+     plugin's hands: Omarchy's daemon saves
      every toast it shows (`persistPopupFile`) by handing summary, body and click argv as one
      JSON string to a short-lived `bash -c` job as an argument, so title and location, or the
      calendar name, are briefly readable in that job's `/proc/<pid>/cmdline`, and the popup file
      keeps them (see the event cache). `notify_details: false` sends "Termin"/"Meeting" with the
-     countdown and the time range instead. The click argv carries no URL either way, so the join
+     time range instead. The click argv carries no URL either way, so the join
      URL never reaches the daemon. `omeetingbar-join <id> <grace>` reads URL, start and end from
      the 0600 cache when clicked and opens the URL with `omarchy-launch-browser` until the
      meeting ends, before its start too (`end`; for a zero-length occurrence `start + grace`, the
      same window its toast lives; a grace that is not a plain decimal 0–3600 means 300); after
-     that, or when the event is gone from the cache, a click just closes the toast. So the URL
+     that, or when the event is gone from the cache, a click just closes the toast — and so
+     does a click on a meeting declined since (`declined` in the cache), unless `skip_declined`
+     is explicitly off in `omeetingbar.json` (`false`, `"off"`, `"no"`, `0`: the plugin's
+     boolean rule, read with `jq` from exactly one JSON object as the service's `JSON.parse`
+     reads it, numbers the way JavaScript's `String()` writes them), the same rule the alert
+     follows. So the URL
      never appears on a command line, nor in Omarchy's persisted notification files, before the
      browser launch itself. The legacy form `omeetingbar-join <url> <end>` is still accepted for
      one or two releases, with its 1.0.x rules (https, no whitespace or backslash, nothing once a
@@ -560,20 +651,34 @@ file talks to the outside world.
      update, and toasts Omarchy restores from disk, still call it that way. Location and
      calendar name are markup-escaped (`& < >`) because Omarchy renders the body as
      `StyledText`; the headline is plain text there and needs none. Only the first
-     `maxToastsPerTick` (3) meetings due in one tick get their own toast; the rest share one
-     summary toast ("N weitere Termine", no join link, tracked under its own id until the last of
-     them ends) — N same-minute invites must not mean N critical, never-expiring toasts,
-  3. if `sound` is non-empty and the file exists: `pw-play <file>` as a child `Process`, not
-     detached, so closing the overlay can stop it; a sound still playing is not restarted by a
-     second meeting in the same minute,
+     `maxToastsPerBurst` (3) meetings of a burst get their own toast — a burst being the ticks
+     whose fire loop hit `maxFiresPerTick`, and the tick that ends them; the rest share one
+     summary toast ("N weitere Termine", body "Nicht einzeln gemeldet · siehe Agenda", no join
+     link, tracked under its own id until the last of them ends), sent once the burst is over.
+     A single meeting past the budget gets its own toast instead: a summary for one saves no
+     toast and loses the join link. N invites for the same minute must not mean N critical,
+     never-expiring toasts,
+  3. if `sound` resolves to a file (see the config): `timeout -k 5 60 pw-play <file>` as a
+     child `Process`, not detached, so closing the overlay can stop it, and capped
+     (`soundCapSeconds`) so a stalled player cannot mute every later alert until a restart; a
+     sound still playing is not restarted by a second meeting in the same minute. The sound
+     belongs to the alert that started it (`soundOwner`): the overlay's `stopSound(id)` stops
+     that one only, the IPC dismiss any,
   4. append the payload to the state file's `queue` in every case and start a lock probe. The
      queue is capped at `maxQueueLength` (8): a ninth alert waiting is a flood, not a schedule,
      and is recorded as `failed` without blanking the screen. `drainQueue` summons the head
      (`shell.summon(manifest.id, JSON.stringify(payload))`) only once a lock answer at most
      `lockStaleSeconds` old says the session is unlocked — nothing draws over `WlSessionLock` —
      and as long as `untilSec` has not passed; `shown` is recorded only on a witness (see the
-     state file). Right before the head's first summon, past that fresh "unlocked" answer, it
-     wakes the display if `wake_display`: `omarchy-brightness-display on` (NOT
+     state file). A probe that brings no answer within `lockProbeTimeoutSeconds` (5 s) — hung,
+     or never started at all, which emits no `exited` — counts as "unlocked", so a broken probe
+     is never what keeps the alert off the screen. The 5 s run from the first unanswered request
+     (`lockProbePendingSinceSec`), not from the latest: a probe is asked for again every 2 s, and
+     a timeout measured from that would never expire. Right before the head's first summon,
+     past that fresh "unlocked" answer — a sure one, `false` from a probe that exited cleanly
+     (`lockAnswerSure`); a probe given up on lets the alert through but is no answer that the
+     session is unlocked — it wakes the display if `wake_display`:
+     `omarchy-brightness-display on` (NOT
      `hyprctl dispatch dpms on` — that dispatcher no longer exists in Hyprland 0.56). Never under
      the lock: a wake there lights the panels, and Omarchy's one-shot blank timer never turns
      them off again. Re-summons leave the display alone (the attempt count is not persisted, so
@@ -586,7 +691,19 @@ file talks to the outside world.
      its own reasons. A withdrawn alert also takes its toast down (`withdrawToast`: the recorded
      toast's `end` is pulled to now, and the next tick's toast cleanup replaces it by
      notification id, see *Toast cleanup*), so no live join link is left behind for a meeting
-     that is off.
+     that is off. The toast outlives its alert, so the same healthy cache takes down the toast
+     of any meeting that is gone, or declined while `skip_declined` is on, also after its alert
+     was shown and closed. Not `isAlertable()` there, which would take down the toast of a long
+     meeting past its grace window; summary toasts carry no link and stay. A queue head that was
+     summoned but not confirmed yet may still be loading: before such a head is dequeued —
+     withdrawn, past its grace window, or given up as unconfirmed — `cancelPendingSummon` hides
+     the overlay, which cancels the load; otherwise the host would deliver the withdrawn
+     meeting's payload once Alert.qml has loaded, and `open()` would show it. Never from
+     `overlayShown`, where a hide would break the next payload of the same delivery loop. The
+     host's `hide()` keeps that payload, though, and delivers it right ahead of the next summon:
+     a real payload behind it takes the screen, and an empty one asks `alertWanted(id)` — true
+     for an id still in the queue, for a test or preview summoned since, and false after the
+     IPC dismiss (`lastSummonKind` "dismissed") — so the withdrawn alert leaves at once.
 - **Bounds on calendar input**: `normalizeEvents` keeps at most `maxEvents` (512) occurrences,
   chosen by the fetcher's relevance rule (`capByRelevance`, see *Bounds* under the fetcher; ties
   broken by start, then id, since Qt's JS sort is not stable; the service's `grace_seconds` is
@@ -602,7 +719,9 @@ file talks to the outside world.
   beendet" / "Meeting ended", empty body and an expiry of `toastReplaceExpireMs` (1500 ms). That
   is only a request: Omarchy shows a low-urgency toast for at least 5 s (`lowPopupDuration`, its
   floor), then lets it expire into the notification history — rewritten by the replacement, so
-  that history entry carries no meeting content. The entry is then forgotten.
+  that history entry carries no meeting content. The entry stays until that replacement has run
+  (sent, answered `gone`, or failed): the notify queue lives in memory, so after a remount that
+  lost it the next tick sends the replacement again from the state file.
   - Why replace: a freedesktop `CloseNotification(id)` leaves an Omarchy popup on screen
     (measured on 4.x: the server object closes, the popup row stays), and the only IPC that
     closes one — `omarchy-shell notifications dismiss "<summary substring>"` — would put the
@@ -611,20 +730,33 @@ file talks to the outside world.
     a new notification and show a stray "Meeting ended". The helper therefore checks Omarchy's
     popup state directory (`~/.local/state/omarchy/notifications/<timestamp>-<id>.json` exists
     while a toast is on screen) and answers `gone` without sending; an unknown layout reads as
-    "open", so the replace is still sent.
-  - A toast without an id — the helper failed or fell back to `omarchy-notification-send`
-    without Gio (which reports none), or the entry was recorded under another shell process
-    (`toastsShellPid`), i.e. before a shell restart — is forgotten without a dismiss, so such
-    toasts, like those from before a reboot (below), are not taken down. It still closes by
-    click (`omeetingbar-join`, which checks the end itself) or by right click, which Omarchy maps
-    to "close without action". Every title is tracked, including empty ones; headlines are kept
-    for state only and are never used to dismiss.
-  - Nothing is replaced during the first 30 s after the service starts, so a hot reload (same
-    shell process, same ids) does not race Omarchy's asynchronous restore of its toasts. The
-    state file is tmpfs, so after a reboot nothing is recorded; `omeetingbar-join` is the fallback.
+    "open", so the replace is still sent. Omarchy restores popups after a shell restart under
+    their old ids, and the next daemon numbers from 1 again, so a recycled id can match an old
+    restored file: the replace payload carries `sent_ms` (the entry's `sent`), and the helper
+    counts only files whose name starts no more than 5 s before it (the prefix is the daemon's
+    millisecond timestamp). Any file in the directory named another way is a layout the helper
+    does not know, and reads as "open" too.
+  - A toast without an id — the helper failed, or the entry was recorded under another shell
+    process (`toastsShellPid`), i.e. before a shell restart — is forgotten without a dismiss
+    unless the helper is sending it right now (a slow helper can report the id after the
+    meeting was withdrawn, and that id must still land on the entry); a first send still
+    waiting in the queue is dropped with it, so a meeting that is over or off gets no toast at
+    all. Toasts forgotten this way, like those from before a reboot (below), are not taken
+    down. It still closes by click
+    (`omeetingbar-join`, which checks the end itself) or by right click, which Omarchy maps to
+    "close without action". Every toast is tracked, including ones with an empty title; no title
+    is kept, and none is ever used to dismiss.
+  - Nothing holds the cleanup back after a start: a hot reload keeps the shell process, its
+    toasts and their ids, and after a shell restart `toastsShellPid` has dropped the ids before
+    anything could be replaced. The state file is tmpfs, so after a reboot nothing is recorded;
+    `omeetingbar-join` is the fallback.
 - **Idle inhibitor**: hold one from `start - inhibit_lead_seconds` (default 600 s, see the config
-  semantics) until `start + grace_seconds` for the next event, so the session cannot lock/blank
-  into the alert. Implement as a 1x1 click-through `PanelWindow` (input mask empty /
+  semantics) until `start + grace_seconds` for the next alertable event, so the session cannot
+  lock/blank into the alert — but not for an event whose alert has been on screen for
+  `inhibitHandoverSeconds` (5 s; the overlay's own inhibitor takes over, for at most 180 s) or
+  has failed for good: an unattended session must be free to lock again, not stay unlocked
+  until `start + grace` (a `shown` stamp in the future, after a backward clock step, counts as
+  long ago). Implement as a 1x1 click-through `PanelWindow` (input mask empty /
   `WlrKeyboardFocus.None`) carrying `IdleInhibitor`, created only while needed. Quickshell 0.3.1
   exposes `Quickshell.Wayland.IdleInhibitor` with `enabled` and `window`; the omarchy idle service
   runs `IdleMonitor { respectInhibitors: true }`, so this genuinely suppresses blank+lock. Do **not**
@@ -650,6 +782,19 @@ file talks to the outside world.
   `canberra-gtk-play` and `sound-theme-freedesktop` are installed.
 - QML errors from plugins land in `journalctl --user -t omarchy-shell` and
   `/run/user/1000/quickshell/by-id/<id>/log.qslog` (`quickshell log -f`).
+- Quickshell 0.3.1 `Process`, measured on 2026-10-05 offscreen: a normal run emits `started`,
+  then `exited` (inside which `running` already reads false), then `runningChanged`. A program
+  that fails to start emits only `runningChanged` with `running` false — no `started`, no
+  `exited`. Restarting the process inside `exited` works; the `runningChanged` that follows
+  then reads `running` true. After `running = false` the property still reads true until the
+  process is gone, and `exited` reports the signal (code 15, crash status). Wrapped in
+  `timeout`, a terminated child reads the same way, an expired timeout as a normal exit 124 —
+  but a player that catches SIGTERM and exits by itself reports its own normal exit code, which
+  is why a stopped sound is recognised by a flag (`soundStopRequested`), not by its exit.
+- Hyprland 0.56's Lua config takes `no_screen_share` in `hl.layer_rule` as well as in window
+  rules (`/usr/share/hypr/stubs/hl.meta.lua`, `HL.LayerRuleSpec`). Omarchy's toasts are the layer
+  namespace `omarchy-notifications`, the alert's is `omeetingbar-alert`; the user's personal
+  rules go at the end of `~/.config/hypr/hyprland.lua`.
 - Saving any file under `~/.config/omarchy/plugins/` triggers a plugin reload, but — measured on
   2026-09-10 on this machine — that reload does **not** replace the running third-party *service*
   instance with the new code: `omarchy-shell omeetingbar status` kept returning the old schema after

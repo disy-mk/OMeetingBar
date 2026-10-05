@@ -10,7 +10,7 @@ a string). Prints the notification id (uint32) on stdout.
 
   {"summary": "...", "body": "...", "glyph": "...", "urgency": "critical",
    "exec": ["<plugin>/bin/omeetingbar-join", "<event id>", "<grace seconds>"],  # optional
-   "replaces_id": 0, "expire_ms": -1,                                         # optional
+   "replaces_id": 0, "expire_ms": -1, "sent_ms": 0,                          # optional
    "safe": {"summary": "Meeting", "body": "14:00-14:30"}}                     # fallback text
 
 Why stdin: omarchy-notification-send and busctl take the summary, the body and
@@ -21,14 +21,22 @@ Replace mode (`replaces_id` > 0) is how the service takes a toast down once the
 meeting is over: the critical toast becomes a low-urgency one with a short
 expiry, which Omarchy's daemon lets expire. A toast the user already closed is
 left alone -- re-using its id would create a new one -- which is checked
-against Omarchy's popup state directory when that directory exists.
+against Omarchy's popup state directory when that directory exists. `sent_ms`
+is when the service sent the toast: popup files older than that belong to an
+earlier daemon, whose restored popups keep ids the new one hands out again.
 
 Without python-gobject (Gio) the helper falls back to omarchy-notification-send
-with the content-free `safe` text only and prints no id.
+with the content-free `safe` text only, and the same click action. It prints
+the id there too, and exits 2 when the sender fails, like a failed D-Bus call.
+
+The service runs one helper at a time, so this one never lives longer than
+ALARM_SECONDS: a hung bus or sender would hold every later toast back.
 """
 import glob
 import json
 import os
+import re
+import signal
 import subprocess
 import sys
 
@@ -37,6 +45,14 @@ import sys
 APP_NAME = "omarchy-action"
 URGENCY = {"low": 0, "normal": 1, "critical": 2}
 POPUP_STATE_DIR = os.path.expanduser("~/.local/state/omarchy/notifications")
+# Omarchy's popup files: "<ms timestamp>-<notification id>.json"
+# (NotificationLogic.popupFileName); history/ and images/ are subdirectories.
+POPUP_NAME = re.compile(r"^(\d+)-(\d+)\.json$")
+ALARM_SECONDS = 30
+FALLBACK_TIMEOUT_SECONDS = 15
+# Omarchy stamps a popup file when the daemon takes the toast, a moment after
+# the service's send time; a little slack keeps that from reading as older.
+SENT_SLACK_MS = 5000
 
 
 def read_payload():
@@ -70,6 +86,16 @@ def expire_ms(payload):
     return value if isinstance(value, int) and not isinstance(value, bool) else -1
 
 
+def sent_ms(payload):
+    value = payload.get("sent_ms", 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    try:
+        return max(int(value), 0)
+    except (ValueError, OverflowError):  # NaN, infinity
+        return 0
+
+
 def hints_for(payload, variant):
     """The a{sv} hints as {name: Variant}; `variant` is GLib.Variant (passed in
     so this stays testable without gi)."""
@@ -83,13 +109,25 @@ def hints_for(payload, variant):
     return hints
 
 
-def toast_still_open(notification_id):
-    """False only when Omarchy's popup directory exists and holds no file for
-    this id (its files are named <timestamp>-<id>.json while a toast is on
-    screen). An unknown layout reads as "open", so a replace is still sent."""
+def toast_still_open(notification_id, since_ms=0):
+    """False only when Omarchy's popup directory is in its known layout -- one
+    <ms timestamp>-<id>.json per toast on screen -- and holds no file for this
+    id. With `since_ms`, a file stamped more than SENT_SLACK_MS before it is
+    another toast: Omarchy restores popups after a restart under their old ids,
+    and the new daemon numbers from 1 again. Anything else -- no directory, any
+    file named in another way -- is a layout this helper does not know, and
+    reads as "open", so a replace is still sent."""
     if not os.path.isdir(POPUP_STATE_DIR):
         return True
-    return bool(glob.glob(os.path.join(POPUP_STATE_DIR, "*-%d.json" % notification_id)))
+    names = [os.path.basename(path) for path in glob.glob(os.path.join(POPUP_STATE_DIR, "*.json"))]
+    matches = [POPUP_NAME.match(name) for name in names]
+    if not all(matches):
+        return True
+    for match in matches:
+        stamp, nid = int(match.group(1)), int(match.group(2))
+        if nid == notification_id and (not since_ms or stamp >= since_ms - SENT_SLACK_MS):
+            return True
+    return False
 
 
 def send(payload):
@@ -106,11 +144,13 @@ def send(payload):
 
 def fallback(payload):
     """No Gio: the content-free text only, through Omarchy's own sender. The
-    argv then carries a word like "Meeting" and a time range, nothing private."""
+    argv then carries a word like "Meeting" and a time range, nothing private.
+    Prints the notification id (-p) like send(), so the toast can be replaced
+    once the meeting is over; returns 2 when the sender fails or hangs."""
     safe = payload.get("safe") if isinstance(payload.get("safe"), dict) else {}
     summary = text(safe, "summary") or "Meeting"
     body = text(safe, "body")
-    argv = ["omarchy-notification-send", "-u", text(payload, "urgency", "critical")]
+    argv = ["omarchy-notification-send", "-p", "-u", text(payload, "urgency", "critical")]
     glyph = text(payload, "glyph")
     if glyph:
         argv += ["-g", glyph]
@@ -118,23 +158,41 @@ def fallback(payload):
     if rid:
         argv += ["-r", str(rid), "-t", str(max(expire_ms(payload), 0))]
     argv += [summary, body]
-    subprocess.run(argv, check=False, stdout=subprocess.DEVNULL)
+    # The click action carries the join script, the event id and the grace
+    # window -- no URL, nothing from the invite -- so it may travel here too.
+    # --exec takes the rest of the line, so it comes last.
+    click = exec_argv(payload)
+    if click:
+        argv += ["--exec"] + click
+    try:
+        done = subprocess.run(argv, check=False, stdout=subprocess.PIPE,
+                              timeout=FALLBACK_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write("omeetingbar-notify: fallback %s\n" % type(exc).__name__)
+        return 2
+    answer = done.stdout.decode("ascii", "replace").strip()
+    if done.returncode != 0 or not answer.isdigit():
+        sys.stderr.write("omeetingbar-notify: fallback exit %d\n" % done.returncode)
+        return 2
+    print(answer)
+    return 0
 
 
 def main():
+    # SIGALRM's default action ends the process: the service's queue moves on.
+    signal.alarm(ALARM_SECONDS)
     payload = read_payload()
     if payload is None:
         sys.stderr.write("omeetingbar-notify: expected one JSON object on stdin\n")
         return 1
     rid = replaces_id(payload)
-    if rid and not toast_still_open(rid):
+    if rid and not toast_still_open(rid, sent_ms(payload)):
         print("gone")
         return 0
     try:
         import gi  # noqa: F401  -- only to decide between D-Bus and the fallback
     except ImportError:
-        fallback(payload)
-        return 0
+        return fallback(payload)
     try:
         print(send(payload))
     except Exception as exc:  # GLib.Error, D-Bus timeouts: type name only, never content

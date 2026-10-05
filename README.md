@@ -26,10 +26,11 @@ around it.
   before the alert is shown — never under the lock screen.
 - **Notifications that clean up after themselves** — when a meeting ends, its notification is
   replaced by a short "Meeting ended" (Omarchy shows it for at least 5 s), so you do not come
-  back from a call taken on your phone to a stack of stale ones. A click joins until the
-  meeting ends, also before it starts; afterwards it just closes the toast. A right click
-  always just closes. Toasts sent before a shell restart or reboot (or through the fallback
-  without `python-gobject`) are not taken down; they close on click.
+  back from a call taken on your phone to a stack of stale ones; the same happens as soon as a
+  meeting is cancelled or declined. A click joins until the meeting ends, also before it
+  starts; afterwards it just closes the toast, and so it does for a meeting you have declined.
+  A right click always just closes. Toasts sent before a shell restart or reboot are not taken
+  down; they close on click.
 - **Video providers** — join links from Google Meet, Microsoft Teams, Zoom, Webex, Jitsi
   (meet.jit.si, 8x8.vc), Whereby, GoTo Meeting, Slack Huddles and Discord are recognised in the
   invite's conference data, location or description. Meet, Teams, Slack and Discord show their
@@ -79,6 +80,8 @@ The fullscreen alert, a minute before the next meeting:
   `evolution-data-server`, `gnome-online-accounts`, `gnome-online-accounts-gtk`
   (the standalone account dialog — no GNOME session or `gnome-control-center` needed),
   `python-gobject` (already on Omarchy). About 11 packages / 70 MiB on a stock install.
+- On every backend `python-gobject` is what lets a meeting's notification carry its title and
+  location; without it the notification says "Meeting" and the time range only.
 - Sound: `pipewire-audio` (`pw-play`) and `sound-theme-freedesktop` — both on Omarchy already.
 
 ## Install
@@ -156,12 +159,12 @@ save.
 | `auto_dismiss_seconds` | `90` | The alert closes itself; `0` keeps it until dismissed (hard cap 10 min). |
 | `colors.running` | `#FF9500` | Colour for a running meeting — bar entry and alert countdown. `#rrggbb` only. |
 | `colors.upcoming` | `#00BEFF` | Colour for an upcoming meeting. |
-| `inhibit_lead_seconds` | `600` | Hold a Wayland idle inhibitor from this long before start until `start + grace`, so the session cannot lock into the alert. |
+| `inhibit_lead_seconds` | `600` | Hold a Wayland idle inhibitor from this long before start, so the session cannot lock into the alert — until the alert has been on screen for 5 s (the alert then holds the session for at most 3 min itself) or `start + grace` has passed. |
 | `grace_seconds` | `300` | A meeting whose start is at most this long ago still alerts (suspend, lock). Older ones never do. |
-| `sound` | `…/alarm-clock-elapsed.oga` | Played with `pw-play`. Empty string = silent. |
+| `sound` | `…/alarm-clock-elapsed.oga` | An audio file, played with `pw-play` for at most 60 s. An absolute path or `~/…`; `""` or `false` = silent, `null` = the default. A path that is no file shows up in the log as `sound-missing`. |
 | `language` | `"auto"` | `"de"`, `"en"` or `"auto"` (session locale: `de*` → German, else English). Bar, popup, alert, notifications and the fetcher's messages follow it; dates and weekday names too. Times stay 24 h. |
 | `notify` | `true` | Also send a critical notification (bypasses DND) through `bin/omeetingbar-notify`, which gets the text on stdin rather than as an argument (Omarchy's daemon still passes it to a bash job when it saves the toast; see privacy). Once the meeting is over it is replaced by a short "Meeting ended". `false` = no notification at all. |
-| `notify_details` | `true` | The notification shows the title plus the location (or the calendar name). `false` = a toast without title, location or calendar name: only "Meeting"/"Termin", the countdown and the time range. See privacy. |
+| `notify_details` | `true` | The notification shows the title, the time range and the location (or the calendar name). `false` = a toast without title, location or calendar name: only "Meeting"/"Termin" and the time range. See privacy. |
 | `wake_display` | `true` | `omarchy-brightness-display on` once, right before the alert is shown — never under the lock screen. |
 | `skip_all_day` | `true` | Keep all-day entries out of the cache. All-day entries never alert either way. |
 | `skip_declined` | `true` | Declined invitations never alert but are listed, struck through, in the agenda. `false` treats them like any other meeting. |
@@ -177,10 +180,11 @@ save.
 - **Left click** the bar entry → agenda popup. **Right/middle click** → refresh.
 - In the popup: `↑`/`↓` or `j`/`k` move, `Enter` joins the selected meeting, `Esc` closes,
   `Tab` switches to the neighbouring panel.
-- In the alert: `Enter` or `Space` joins, `Esc` (or any other key, or a click) dismisses.
-  Either way the sound stops. Keys and clicks in the first second after it appears are
-  ignored, so input already on its way can neither join a meeting you have not read yet nor
-  clear the alert unread.
+- In the alert: `Enter` joins, `Esc` (or any other key, or a click) dismisses. Either way the
+  sound stops. Keys and clicks in the first second after it appears are ignored, and so is
+  typing that goes on past it (keys less than 0.4 s apart), so input already on its way can
+  neither join a meeting you have not read yet nor clear the alert unread. `Esc` always works
+  once that first second is over.
 - On a meeting notification: click joins until the meeting ends, also before it starts
   (afterwards it only closes); right click always just closes.
 - From a keybinding or script:
@@ -233,22 +237,35 @@ o.bind("SUPER + CTRL + M", "Meeting agenda", "omarchy-shell omeetingbar-agenda t
   "Meeting ended" reaches Omarchy's history without content; one you closed or clicked earlier
   keeps its text there — on disk under `~/.local/state/omarchy/notifications/history/`, the
   newest 10, across reboots (`omarchy-shell notifications clear` empties it). Set
-  `notify_details` to `false` to send toasts without meeting content (only "Meeting"/"Termin",
-  the countdown and the time range), or `notify` to `false` to send none. The join URL never
-  reaches the daemon.
+  `notify_details` to `false` to send toasts without meeting content (only "Meeting"/"Termin"
+  and the time range), or `notify` to `false` to send none. The join URL never reaches the
+  daemon.
+- The fullscreen alert covers every monitor, and a screen share shows it — title, calendar
+  and location included — like everything else on a shared monitor; the same goes for the
+  toasts. On Hyprland 0.56 you can keep the alert out of every share by adding this to the
+  end of `~/.config/hypr/hyprland.lua`; the share then shows a black surface where the alert
+  is:
+
+  ```lua
+  hl.layer_rule({ match = { namespace = "^omeetingbar-alert$" }, no_screen_share = true })
+  ```
+
+  The same rule for `"^omarchy-notifications$"` blacks out every toast in a share, not only
+  this plugin's; `notify_details: false` keeps meeting content out of the toasts instead.
 - The plugin's own processes never carry calendar content in their arguments, where any local
   user could read it from `/proc`: notifications go to a small helper over stdin, the click
   action carries only the event id and the grace window, and the join link leaves the 0600
   cache only when the browser is launched with it. Without `python-gobject` the helper falls
-  back to a content-free toast (time only).
+  back to a content-free toast (the word "Meeting" and the time range).
 - Only `https://` join URLs are ever handed to the browser; every component re-checks this.
-- The fullscreen alert ignores keys and clicks for its first second, so input in flight can
-  neither join a meeting from an invite you have not seen nor clear the alert unread. Alerts
-  are bounded: at most 8 wait in the queue, at most 3 meetings per minute get their own
-  notification (the rest share one), at most 512 occurrences are read from the cache.
+- The fullscreen alert ignores keys and clicks for its first second, and typing that goes on
+  past it, so input in flight can neither join a meeting from an invite you have not seen nor
+  clear the alert unread. Alerts are bounded: at most 8 wait in the queue; of meetings due
+  together the first 3 get their own notification and the rest share one (a fourth alone still
+  gets its own); at most 512 occurrences are read from the cache.
 - `install.sh` never elevates privileges. It prints the `pacman` command for you to run.
 - Plugins run unsandboxed inside `omarchy-shell`. Read the code before enabling it — it is
-  about 7,900 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
+  about 8,400 lines of QML, Python and shell, and `docs/SPEC.md` explains every decision.
 
 ## How it works
 
@@ -269,11 +286,13 @@ Bar (türkis = steht an, orange = läuft), per Linksklick eine Agenda für heute
 Timeline, und **eine Minute vor dem Meeting ein Vollbild-Alarm**, der den Bildschirm belegt —
 weil man normale Benachrichtigungen im Tunnel nicht wahrnimmt. `Enter` tritt bei, `Esc`
 schließt und stoppt den Ton. Zum Meeting-Ende wird die Meeting-Notification durch ein kurzes
-"Meeting beendet" ersetzt (Omarchy zeigt es mindestens 5 s); Notifications von vor einem
-Shell-Neustart oder Reboot (oder aus dem Fallback ohne `python-gobject`) bleiben stehen. Ein
-Klick tritt bei, bis das Meeting endet (auch schon vor Beginn), danach schließt er nur; ein
-Rechtsklick schließt immer nur. Die Notification zeigt Titel und Ort (sonst den Kalendernamen);
-mit `notify_details: false` nur "Termin", Countdown und Uhrzeit.
+"Meeting beendet" ersetzt (Omarchy zeigt es mindestens 5 s), ebenso sobald ein Termin abgesagt
+oder abgelehnt wird; Notifications von vor einem Shell-Neustart oder Reboot bleiben stehen. Ein
+Klick tritt bei, bis das Meeting endet (auch schon vor Beginn), danach schließt er nur, ebenso
+bei einem abgelehnten Termin; ein Rechtsklick schließt immer nur. Die Notification zeigt Titel,
+Uhrzeit und Ort (sonst den Kalendernamen); mit `notify_details: false` nur "Termin" und die
+Uhrzeit. Wer den Bildschirm teilt, kann den Alarm per Hyprland-Regel aus der Freigabe nehmen
+(siehe "Security and privacy").
 
 Installation: `omarchy plugin add https://github.com/disy-mk/OMeetingBar.git`, dann
 `./install.sh` im Plugin-Ordner ausführen; es druckt den `pacman`-Befehl für die noch

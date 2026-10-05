@@ -22,10 +22,11 @@ Item {
 
   property bool opened: false
   // Every way the alert leaves the screen — Esc, joining, auto-dismiss, an IPC
-  // dismiss — ends the alarm sound with it.
+  // dismiss — ends its alarm sound with it; not another alert's, which may
+  // have started meanwhile (the service checks the owner).
   onOpenedChanged: {
     if (!root.opened && root.service && typeof root.service.stopSound === "function")
-      root.service.stopSound()
+      root.service.stopSound(root.alertId)
   }
 
   // ---------------------------------------------------------- payload
@@ -39,8 +40,9 @@ Item {
   property string url: ""
   property string calendar: ""
   property string location: ""
-  // Queue id of the alert on screen, echoed back to the service as the witness
-  // that it rendered (Service.overlayShown). Empty for previews and tests.
+  // Id of the alert on screen ("test" for the test alert), echoed back to the
+  // service as the witness that it rendered (Service.overlayShown, which
+  // counts queued alerts only) and as the owner of its sound.
   property string alertId: ""
   // UI language, resolved by the service from omeetingbar.json and the session
   // locale and carried in the payload; a summon without it (test, preview from
@@ -52,6 +54,12 @@ Item {
   // are swallowed, so input already on its way can neither join a meeting nor
   // clear the alert unread.
   readonly property int keyGuardMs: 1000
+  // Typing that goes on past the window is swallowed too: a key within this
+  // long of the last swallowed one belongs to the same burst, and so does a
+  // key's autorepeat. Escape is exempt once keyGuardMs is over, so the alert
+  // can always be cleared deliberately.
+  readonly property int keyQuietMs: 400
+  property real lastGuardedKeyMs: 0
   property int autoDismissSeconds: 90
   // Defaults, so a hand-made summon without a colours block still renders.
   property string runningColorName: "#FF9500"
@@ -246,6 +254,27 @@ Item {
     try { payload = JSON.parse(payloadJson || "{}") } catch (e) { payload = ({}) }
     if (!payload || typeof payload !== "object") payload = ({})
 
+    // A payload without a start is not a meeting. The bar's positional panel
+    // hotkey (SUPER+CTRL+N on a right-section slot, or `shell togglePanelAt`)
+    // reaches this overlay with "{}", because shell.qml routes every summon of
+    // a plugin that declares an overlay kind here — and blanking every monitor
+    // for nothing is the one thing this surface must never do. It is refused
+    // before anything is written, so an alert already on screen stays as it
+    // is, and the unload waits until the host's delivery loop is through: a
+    // real payload right behind it in the same loop opens normally, and a
+    // dismiss() inside the loop would destroy this item under the host. A test
+    // payload is explicit and still shows. One exception for an open alert:
+    // the host keeps the payload of a summon that was hidden while this file
+    // loaded and delivers it right ahead of the next summon -- so the alert
+    // that just opened may be one the service has given up on (a meeting
+    // withdrawn meanwhile, an IPC dismiss). It leaves the screen at once and
+    // unloads after the loop, like an empty summon on a closed overlay.
+    if (!(root.numberOr(payload.start, 0) > 0) && payload.test !== true) {
+      if (root.opened && !root.stillWanted()) root.opened = false
+      if (!root.opened) idleUnload.restart()
+      return
+    }
+
     root.title = root.cleanText(payload.title)
     root.startEpoch = root.numberOr(payload.start, 0)
     root.endEpoch = root.numberOr(payload.end, 0)
@@ -274,16 +303,7 @@ Item {
     // timers, no leftover state from the previous payload.
     root.nowMs = Date.now()
     root.openedAtMs = root.nowMs
-    // A payload without a start is not a meeting. The bar's positional panel
-    // hotkey (SUPER+CTRL+N on a right-section slot, or `shell togglePanelAt`)
-    // reaches this overlay with "{}", because shell.qml routes every summon of
-    // a plugin that declares an overlay kind here — and blanking every monitor
-    // for nothing is the one thing this surface must never do. A test payload
-    // is explicit and still shows.
-    if (!(root.startEpoch > 0) && !root.isTest) {
-      root.dismiss()
-      return
-    }
+    root.lastGuardedKeyMs = 0
     root.dismissProgress = 1
     root.inhibitHeld = true
     root.opened = true
@@ -291,6 +311,12 @@ Item {
     // has even loaded; the overlay itself is the witness that it is on screen.
     if (root.service && typeof root.service.overlayShown === "function")
       root.service.overlayShown(root.alertId)
+  }
+
+  // A service from before 1.3.0 cannot tell, and the alert stays as it is.
+  function stillWanted() {
+    if (!root.service || typeof root.service.alertWanted !== "function") return true
+    return root.service.alertWanted(root.alertId) === true
   }
 
   function close() {
@@ -326,6 +352,37 @@ Item {
     return age >= 0 && age < root.keyGuardMs
   }
 
+  // What a key press does: "pass" (a bare modifier, never an answer to the
+  // alert), "swallow" (inside the guard, or still part of typing that began
+  // before it ended), "join" (Return or Enter) or "dismiss" (any other key).
+  // Space does not join: it is the key most likely to be in flight while the
+  // user is typing.
+  function keyAction(key, isAutoRepeat) {
+    if (key === Qt.Key_Shift || key === Qt.Key_Control || key === Qt.Key_Alt
+      || key === Qt.Key_Meta || key === Qt.Key_AltGr || key === Qt.Key_CapsLock)
+      return "pass"
+    var now = Date.now()
+    var sinceGuarded = now - root.lastGuardedKeyMs
+    var typing = isAutoRepeat === true || (key !== Qt.Key_Escape && root.lastGuardedKeyMs > 0
+      && sinceGuarded >= 0 && sinceGuarded < root.keyQuietMs)
+    if (root.inputGuarded() || typing) {
+      root.lastGuardedKeyMs = now
+      return "swallow"
+    }
+    return key === Qt.Key_Return || key === Qt.Key_Enter ? "join" : "dismiss"
+  }
+
+  // A backward clock step would stretch both D7 budgets, the auto-dismiss and
+  // the input guard by its size -- two hours for an RTC kept in local time,
+  // with the inhibitor held all along. The time elapsed since open() is kept
+  // instead; a forward jump (a suspend) still counts in full.
+  function advanceClock() {
+    var now = Date.now()
+    if (now < root.nowMs) root.openedAtMs -= root.nowMs - now
+    root.nowMs = now
+    root.enforceLimits()
+  }
+
   // Wall-clock enforcement of the two D7 budgets, driven by the 1 Hz tick (which
   // runs whenever the overlay is up, including with auto_dismiss 0): the
   // inhibitor is released first, the overlay is torn down last.
@@ -341,9 +398,17 @@ Item {
     interval: 1000
     repeat: true
     running: root.opened
+    onTriggered: root.advanceClock()
+  }
+
+  // See open(): an empty payload unloads the overlay once the host's delivery
+  // loop is through, unless a real one arrived behind it.
+  Timer {
+    id: idleUnload
+    interval: 0
+    repeat: false
     onTriggered: {
-      root.nowMs = Date.now()
-      root.enforceLimits()
+      if (!root.opened) root.dismiss()
     }
   }
 
@@ -436,19 +501,15 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
-          // Bare modifiers are never an answer to the alert, so they are left
-          // alone; every other key clears it, join keys after launching.
-          if (event.key === Qt.Key_Shift || event.key === Qt.Key_Control
-            || event.key === Qt.Key_Alt || event.key === Qt.Key_Meta
-            || event.key === Qt.Key_AltGr || event.key === Qt.Key_CapsLock)
-            return
+          // Every key but a bare modifier clears the alert, join keys after
+          // launching. open() restamps openedAtMs for a queued follow-up alert
+          // too, which re-arms the input guard: an Enter meant for the
+          // previous alert must not join the next one.
+          var action = root.keyAction(event.key, event.isAutoRepeat)
+          if (action === "pass") return
           event.accepted = true
-          // open() restamps openedAtMs for a queued follow-up alert too, which
-          // re-arms the input guard: an Enter meant for the previous alert must
-          // not join the next one.
-          if (root.inputGuarded()) return
-          if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) root.join()
-          else root.dismiss()
+          if (action === "join") root.join()
+          else if (action === "dismiss") root.dismiss()
         }
       }
 

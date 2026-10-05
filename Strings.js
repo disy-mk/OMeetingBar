@@ -92,9 +92,8 @@ var table = {
     statusFetchFailed: "Kalenderabruf fehlgeschlagen",
     statusNoneInWindow: "Keine Termine im Vorschaufenster",
     statusReady: "Bereit",
-    starts: "Beginnt %1",
     moreMeetings: "%1 weitere Termine",
-    moreMeetingsBody: "Beginnen in Kürze · nicht einzeln gemeldet",
+    moreMeetingsBody: "Nicht einzeln gemeldet · siehe Agenda",
     meetingEnded: "Meeting beendet",
     testMeeting: "Testtermin",
     testCalendar: "Test"
@@ -181,9 +180,8 @@ var table = {
     statusFetchFailed: "Calendar fetch failed",
     statusNoneInWindow: "No meetings in the lookahead window",
     statusReady: "Ready",
-    starts: "Starts %1",
     moreMeetings: "%1 more meetings",
-    moreMeetingsBody: "Starting shortly · not listed individually",
+    moreMeetingsBody: "Not listed individually · see the agenda",
     meetingEnded: "Meeting ended",
     testMeeting: "Test meeting",
     testCalendar: "Test"
